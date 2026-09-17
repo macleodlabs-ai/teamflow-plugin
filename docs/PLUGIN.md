@@ -1,0 +1,348 @@
+# Claude Code plugin workflow
+
+TeamFlow is deliberately zero-touch during normal development.
+
+## Lifecycle
+
+```text
+SessionStart
+  → restore tenant-scoped project binding
+  → inspect branch/latest commit for an issue key
+  → expose bundled Atlassian / Linear / GitHub MCP
+
+UserPromptSubmit
+  → inspect prompt locally for an explicit issue reference
+  → improve binding confidence
+  → inject only the selected tracker and issue key as context
+
+PostToolUse / PostToolUseFailure (async)
+  → classify tool locally
+  → derive LOCAL_DEV / LOCAL_TEST / LOCAL_AUDIT / MERGE
+  → derive DEPLOY_DEV / DEV_TEST / DEV_AUDIT / DEV_VERIFIED
+  → test/audit failure creates explicit reworkFrom stage
+  → sanitize + deduplicate
+  → POST the current state to the service as one report
+
+TaskCompleted / SubagentStart / SubagentStop
+  → update summary/subagent count
+
+Stop
+  → publish idle state
+
+SessionEnd
+  → local-only cleanup; no network work
+```
+
+## Install lifecycle
+
+Recommended:
+
+```bash
+npm run plugin:install
+npm run plugin:uninstall
+```
+
+`scripts/plugin-lifecycle.mjs` wraps Claude Code's marketplace/plugin CLI. TeamFlow hooks, skills and tracker MCP config are plugin-owned, not copied into arbitrary repository settings. Therefore plugin uninstall removes the active integration as one unit.
+
+Optional uninstall flags:
+
+- `--remove-marketplace` removes the MacleodLabs marketplace registration.
+- `--purge-data` removes `~/.local/share/teamflow`.
+- `--purge-config` removes `~/.config/teamflow`, including the signed-in session.
+
+Purge is never implicit.
+
+## Signing in
+
+Onboarding is two steps: install the plugin, then run `/teamflow:login` once.
+
+```text
+/teamflow:login
+  → GET /v1/capabilities for the hosted UI's issuer and client id
+  → authorization code with PKCE (S256), loopback redirect on 127.0.0.1
+  → browser opens; the developer signs in
+  → POST /v1/members/identity with the ID token, claiming the seat
+  → refresh token written to ~/.config/teamflow/session.json at 0600
+  → access token held in memory, refreshed five minutes before expiry
+```
+
+The authorize request asks for the sign-in scopes the service publishes, `openid email profile`, plus the paid-API scope it names separately in `auth.api_scope`. Both are needed on one token: the same credential identifies the developer and then calls `/v1/report`. Duplicates are dropped, so an override that already names the API scope does not ask for it twice.
+
+The seat binding is not optional. A member who has just signed in holds a token from the pool and nothing else, so the service cannot yet tell which seat is theirs, and an unbound access token authenticates as nobody. The ID token is what claims the seat: it is the one artifact that proves a given subject owns a given verified email. It happens before anything is written, because a session whose token authenticates as nobody is worse than no session, and it is idempotent, so signing in again is free. A service that does not run the orgs module answers 404 and sign-in continues without it.
+
+Nothing but the refresh token reaches the disk. A refresh token is revocable and scoped to one machine; an access token on disk would be a bearer secret with an hour of life and no way to take it back.
+
+The loopback listener binds the first free port in 52480-52489. Every one of those is registered as a callback URL on the app client, so the range cannot grow without a deploy. The `state` returned by the identity provider must match the one this process sent, or the code is discarded unredeemed: it belongs to somebody else's sign-in.
+
+`/teamflow:logout` deletes the session file. `/teamflow:status` and `/teamflow:doctor` print `signed in as <email>, org <name>` from `GET /v1/account`.
+
+| Config key | Env | Purpose |
+| --- | --- | --- |
+| `serviceUrl` | `TEAMFLOW_SERVICE_URL` | the service to report to; defaults to `https://teamflow.macleodlabs.com` |
+| `authIssuer` | `TEAMFLOW_AUTH_ISSUER` | override the hosted UI the service publishes, to sign in against a preview stack |
+| `authClientId` | `TEAMFLOW_AUTH_CLIENT_ID` | the app client to use with that issuer |
+| `authScopes` | | override the sign-in scopes the service publishes |
+| `authApiScope` | | override the paid-API scope the service publishes |
+| `serviceTimeoutMs` | | per-request timeout, default 5000 |
+
+### CI signs in per job
+
+A workflow with `permissions: id-token: write` needs no stored secret. `runtime-report.mjs` asks GitHub for an OIDC token naming the repository, workflow and ref, and trades it at `POST /v1/token` for a one-hour access token. `.github/workflows/teamflow-runtime-example.yml` is the whole pattern.
+
+Two things have to be true first.
+
+**The audience is `https://teamflow.macleodlabs.com`.** The service checks it, because an audience nobody checks accepts a token minted for somebody else's service, which any workflow in any repository can obtain. The reporter uses that value without being told. It is tied to the hosted origin rather than to `serviceUrl`, so pointing a job at a preview stack does not change what its token is addressed to. A service that sets `orgs.oidc_audience` publishes the value in force at `GET /v1/repos`, and `oidcAudience` (`TEAMFLOW_OIDC_AUDIENCE`) follows it.
+
+**The repository is registered once, by an owner.** `/teamflow:repos add <owner/repo>` does it from Claude Code; `POST /v1/repos` is the same thing by hand. Without it, any repository's CI that could reach the right audience would mint tokens against any account, so the exchange answers `repository_not_registered` until an owner has said which account the repository belongs to. `/teamflow:repos list` shows what is registered and the audience in force. Registration needs the owner's own credential, so it is `owner_only` for everyone else, and `repository_taken` when another organisation has claimed it.
+
+A failed exchange is logged on stderr and the job carries on with whatever credential is left. Reporting never fails a build.
+
+### Non-interactive fallback
+
+An environment that can neither open a browser nor mint an OIDC token can set `apiKey` (`TEAMFLOW_API_KEY`) instead. It is the last credential tried: a session, then an access token handed in directly, then the key. A signed-in developer stops sending a long-lived secret the moment there is something better.
+
+`/teamflow:doctor` warns when a session has expired or been revoked and reporting has quietly demoted to the key.
+
+## Reporting transport
+
+| Config key | Env | Purpose |
+| --- | --- | --- |
+| `dataUri` | `TEAMFLOW_DATA_URI` | **legacy**: `s3://bucket/data` for installs that write to S3 directly |
+| `awsProfile` | `TEAMFLOW_AWS_PROFILE` | **legacy**: AWS profile for the S3 path |
+
+Any service credential selects the service transport; `dataUri` alone selects S3. With neither, reporting is skipped and nothing is queued.
+
+### Service transport
+
+Every report is one `POST /v1/report`:
+
+```text
+Authorization:   Bearer <access token>
+Idempotency-Key: <sha256 of the report's content, excluding updatedAt>
+Content-Type:    application/json
+
+{ "kind": "issue" | "runtime", "slot": "<slot>", "payload": { ... } }
+```
+
+The auth header is not hard-coded. `credential(config)` in `plugin/scripts/core.mjs` is the one place that turns config into a header, and every service call asks it rather than reading a field. It refreshes the session's access token when one is needed, and falls back through the order above.
+
+The outbox stores no credential. A queued report resolves one when it is finally sent, which is the only way a one-hour token survives an hour offline.
+
+`slot` is present only for `kind: "runtime"`. The service validates the payload against the privacy allowlist, drops any field it does not recognise, lists what it dropped in `dropped_fields`, and writes the document under the tenant its own credential names. One accepted report costs one credit.
+
+Two fields the reporter deliberately does **not** send: `tenantId`, because the account behind the credential owns the tenant, and a payload-level `slot`, because the envelope already carries it where the service can check it against the known slots.
+
+The actor rollup (`actors/<id>.json`) has no service equivalent yet. The allowlist knows two kinds, `issue` and `runtime`, so on the service transport the plugin publishes the issue report only.
+
+### Answers and failure
+
+| Answer | What the reporter does |
+| --- | --- |
+| 2xx | done. An identical re-post comes back `replay: true` and is not charged again |
+| 402 | the organisation is out of credits. Logged once per session, never queued, never blocking |
+| 429 | rate limited. Queued and retried after `Retry-After`, or after a backoff of 15s doubling to a five-minute cap |
+| other 4xx | the service refused the report. Not retried: the same body cannot get a different answer, and one bad report must not dam the good ones behind it |
+| 5xx, timeout, offline | queued and retried on the next flush, with the idempotency key it was queued with |
+
+429 is the one retryable 4xx. The limit is 120 requests a minute for the whole account, shared by a Claude session, its subagents and CI, so it is reachable in ordinary use: nothing is wrong with the report, the caller simply arrived too fast, and the same body posted later is accepted. A queued report records `attempts` and `notBefore`; a flush skips anything not yet due, and a retry that is refused again is rewritten in place rather than re-queued, so a stale full-state document cannot sort to the back of the queue and overwrite a fresher one. `Retry-After` is honoured as seconds or as an HTTP-date, capped at five minutes, because a reporter that sleeps longer than that has stopped reporting.
+
+The outbox lives at `<plugin data>/outbox` and is drained, up to five at a time, after each successful report. Reporting is observability: no failure of it ever blocks Claude Code, a hook or CI.
+
+### Legacy S3 transport
+
+Unchanged. With `dataUri` and no service credential, every reporter resolves `tenantId` from config / `TEAMFLOW_TENANT_ID` and writes tenant-scoped objects directly:
+
+```text
+data/tenants/acme/issues/ACME-42.json
+data/tenants/acme/actors/steve.json
+data/tenants/acme/runtime/ACME-42/ci.json
+data/tenants/acme/runtime/ACME-42/audit-dev.json
+```
+
+This prevents two clients with the same issue key or actor identifier from colliding. On the service transport the tenant prefix comes from the credential instead, and `tenantId` is local bookkeeping only.
+
+## Issue trackers
+
+TeamFlow binds to one tracker per project. The stage machine, reporting contract and dashboard are unchanged; only the key shape and the link differ.
+
+| Config key | Env | Purpose |
+| --- | --- | --- |
+| `tracker` | `TEAMFLOW_TRACKER` | `jira` (default), `linear` or `github` |
+| `jiraBaseUrl` | `TEAMFLOW_JIRA_BASE_URL` | Jira site, linked as `<jiraBaseUrl>/browse/<KEY>` |
+| `linearWorkspace` | `TEAMFLOW_LINEAR_WORKSPACE` | Linear workspace slug, linked as `https://linear.app/<workspace>/issue/<KEY>` |
+| `githubRepo` | `TEAMFLOW_GITHUB_REPO` | `owner/repo`; derived from `git remote get-url origin` (https and ssh) when absent |
+
+Canonical keys:
+
+- Jira and Linear share the shape `[A-Z][A-Z0-9]{1,11}-\d+` and are stored upper case. The configured tracker decides how such a key is labelled and linked.
+- GitHub keys are `<repo>#<n>` (repo name only, for example `daemon-core#123`) so they stay unique inside a tenant. `project` is the repo name.
+
+### Detection sources
+
+| Form | Where | Accepted when |
+| --- | --- | --- |
+| `DAEMON-142` / `ENG-42` | prompt, task, branch, commit | always; labelled with the configured tracker |
+| `linear.app/<ws>/issue/ENG-42/...` | prompt, task, Linear MCP result | always; supplies the workspace when `linearWorkspace` is unset |
+| `<site>/browse/DAEMON-142` | prompt, task, Atlassian MCP result | always |
+| `github.com/<owner>/<repo>/issues/<n>` | prompt, task, GitHub MCP result | always |
+| `owner/repo#123` | prompt, task, commit | always |
+| `#123`, `fixes #123`, `closes #123` | prompt, commit | `tracker` is `github` and a repo is resolvable |
+| `123-anything`, `issue-123`, `gh-123`, `feature/123-anything` | git branch | `tracker` is `github` and a repo is resolvable |
+| `gh issue view <n>` / `gh issue create <n>` | Bash command, honours `--repo` | always |
+
+### Binding by hand
+
+`/teamflow:bind` accepts `DAEMON-142`, `ENG-42`, `#123`, `owner/repo#123` or any of the three issue URL forms, normalises to the canonical key and records the tracker. A bare `#123` needs `githubRepo` or a GitHub origin remote. Anything else is rejected with the accepted forms.
+
+`/teamflow:doctor` reports the transport, the service account and its credits, the configured tracker, the resolved issue source and whether that tracker's bundled MCP server is visible; authenticate it once through `/mcp`.
+
+## Ticket binding confidence
+
+| Source | Confidence |
+| --- | ---: |
+| Manual `/teamflow:bind` | 1000 |
+| Atlassian, Linear or GitHub tool result, `gh issue` command | 110 |
+| User prompt | 100 |
+| Claude task | 98 |
+| Git branch | 95 |
+| Latest commit | 80 |
+
+Substantive work makes an automatic binding sticky. A manual bind can override it.
+
+## Audit semantics
+
+- local tests pass → `LOCAL_TEST`
+- local audit passes → `LOCAL_AUDIT`
+- local audit fails → `LOCAL_REWORK`, `reworkFrom=LOCAL_AUDIT`
+- dev tests pass → `DEV_TEST` (not verified yet)
+- dev audit passes → `DEV_VERIFIED`
+- dev audit fails → `DEV_REWORK`, `reworkFrom=DEV_AUDIT`
+
+The dashboard uses `reworkFrom` to draw the loop from the exact failed gate.
+
+## Background reporters
+
+Deterministic sidecars support:
+
+- `ci`
+- `audit-local`
+- `deploy`
+- `dev-test`
+- `audit-dev`
+- `security`
+
+Example:
+
+```bash
+node plugin/scripts/runtime-report.mjs \
+  --jira ACME-42 \
+  --slot audit-dev \
+  --kind audit \
+  --label "Dev architecture audit" \
+  --stage DEV_AUDIT \
+  --status running \
+  --summary "Auditing deployed acceptance evidence"
+```
+
+The reporter posts `{ "kind": "runtime", "slot": "audit-dev", "payload": ... }` to the service, signing in per job when it runs in GitHub Actions. `--tenant` is legacy and applies only to the S3 transport. Background reporter failure always exits successfully so observability cannot break delivery.
+
+## Reporting by hand
+
+`teamflow report` posts one stage transition from any shell, through the
+same transport with the same credential. It exists so a tool that is not
+Claude Code can move a ticket: an IDE task, a git hook, an npm script, a
+run configuration.
+
+```bash
+npx -y github:macleodlabs-ai/teamflow-plugin report --issue DAEMON-142 \
+  --stage LOCAL_TEST --status success --summary "42 tests, 0 failing"
+```
+
+`--issue` accepts everything `/teamflow:bind` accepts. `--stage` is one
+of the thirteen stages and is checked locally, so a typo costs a message
+rather than a refused report. `--dry-run` prints the envelope without
+posting it, and `teamflow report --help` lists every flag.
+
+Two differences from the plugin worth knowing:
+
+- **Each invocation is one report and one credit.** The plugin skips an
+  unchanged heartbeat because it compares against the state it last
+  sent; a CLI run has no such state and always carries the clock. Call
+  it at a transition, not on a timer.
+- **It reports the ticket's own document**, the same object the plugin
+  owns. A background job that owns a sidecar should keep using
+  `runtime-report.mjs` instead, so the two do not contend.
+
+A bad argument exits 2 and names it. Everything else, a refused, queued,
+rate-limited or unreachable service, exits 0, because a reporting
+failure must never break a push or a build.
+
+## The package, and where it is published
+
+`plugin/` is mirrored flat to the public repository
+[macleodlabs-ai/teamflow-plugin](https://github.com/macleodlabs-ai/teamflow-plugin)
+by `npm run plugin:publish` (`scripts/publish-plugin.sh`), which tags
+each push with the version in `plugin/package.json`. That repository is
+both the Claude Code marketplace and the thing `npx -y
+github:macleodlabs-ai/teamflow-plugin` fetches, so one push serves both
+install paths.
+
+It is deliberately not a registry install. The package keeps the name
+`@macleodlabs/teamflow` so a later npmjs publish changes nothing, but
+npmjs needs an interactive browser login and GitHub Packages needs a
+token even to read a public package, so neither can back a bare `npx
+-y`. A public git repository can, and needs no account at all.
+
+Its `teamflow` bin is `plugin/scripts/cli.mjs`: the same script the
+plugin's own skills call. That is what makes the skills portable,
+because a skill body can name a command that exists whether or not
+Claude Code is running.
+
+| Subcommand | |
+| --- | --- |
+| `login`, `logout`, `status`, `bind`, `unbind`, `sync`, `doctor`, `repos` | the eight the plugin's skills wrap |
+| `report` | one stage transition, from any shell |
+| `skills install --for <tool>` | put these skills in front of another agent |
+
+## Portable skills
+
+Every skill in `plugin/skills/*/SKILL.md` is an Agent Skill: frontmatter
+with `name` and `description`, a body with the exact command. The body
+names the tool-agnostic form,
+
+```bash
+npx -y github:macleodlabs-ai/teamflow-plugin status
+```
+
+and then names the plugin fast path, `node
+"${CLAUDE_PLUGIN_ROOT}/scripts/cli.mjs" status`, which is the same
+command without the npx round trip and is what Claude Code uses. The
+slash commands are unchanged: the skill's `name` is still its directory,
+so `/teamflow:status` is still `/teamflow:status`.
+
+One command installs the same files into another tool:
+
+```bash
+npx -y github:macleodlabs-ai/teamflow-plugin skills install --for cursor
+```
+
+A tool that discovers `SKILL.md` files gets them copied, prefixed
+`teamflow-` so they do not collide in a shared skills directory. A tool
+that only reads a rules file gets that rules file generated from the
+same `SKILL.md` sources at install time, which is why there is no second
+copy of the instructions to keep in step. The per-tool paths and formats
+are in [CLIENTS.md](CLIENTS.md).
+
+## Other IDEs and agent tools
+
+Claude Code is the only fully automatic client. Everywhere else the
+skills are installed and running them is still the agent's decision.
+Per-tool install, sign-in and configuration for Cursor, Windsurf, VS
+Code with Copilot, Cline, JetBrains, Zed, Claude Desktop, Codex CLI,
+Gemini CLI and Aider are in [CLIENTS.md](CLIENTS.md).
+
+## Privacy
+
+Sent: tenant ID, tracker name, issue key/link, short issue title/status when exposed, parent keys, actor, repo/branch, normalized stage/status, concise derived summary, loop/rework metadata, compact evidence and timestamps.
+
+Never sent: prompts, transcripts, file contents, diffs, raw commands, raw tool results, secrets, issue descriptions/comments/attachments, raw CI/test logs.
