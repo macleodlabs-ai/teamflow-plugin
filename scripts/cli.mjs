@@ -32,11 +32,13 @@ import {
 const TRACKER_MCP = { jira: 'atlassian', linear: 'linear', github: 'github' };
 const USAGE = `teamflow \u2014 delivery reporting for TeamFlow
 
-  teamflow login | logout          sign in once, or remove the session
+  teamflow login [--org <id>]      sign in once, naming an org if asked for one
+  teamflow logout                  remove the session
+  teamflow org [switch <id>]       which organisation this session reports to
   teamflow status                  who is signed in, what is bound, what was sent
   teamflow bind <issue> | unbind   name the ticket by hand, or stop
   teamflow sync                    publish the current state now
-  teamflow doctor                  transport, account, credits, tracker MCP
+  teamflow doctor                  transport, account, credits, tracker MCP and connections
   teamflow repos [list|add]        register a repository for CI OIDC
   teamflow admin code [create|list|revoke]  invite codes, for superadmins
   teamflow report --issue ... --stage ...   report one stage transition
@@ -58,6 +60,58 @@ function print(value) {
   process.stdout.write(typeof value === 'string' ? value + '\n' : JSON.stringify(value, null, 2) + '\n');
 }
 
+/**
+ * The org's tracker connections, as `GET /v1/members/trackers` lists them.
+ *
+ * Two of the answers are not failures and have to be told apart from the ones
+ * that are. `trackers_disabled` is a deployment that does not run the module,
+ * which is every deployment until it does; a CI token or a service key is not
+ * an org account and has nothing to list. Both would read as "none connected"
+ * if only the status code were looked at, and doctor would then warn a team
+ * about a tracker they could not have connected.
+ *
+ * The credential is whatever `credential()` resolves — a signed-in access
+ * token, or the API key. An ID token would be refused: the service's verifier
+ * accepts `token_use: access` and nothing else.
+ */
+async function trackerConnections(config) {
+  const cred = await credential(config);
+  if (!cred) return { ok: false, reason: 'no service credential; run /teamflow:login' };
+  try {
+    const response = await fetch(`${serviceUrl(config)}/v1/members/trackers`, {
+      headers: { [cred.header]: cred.value },
+      signal: AbortSignal.timeout(Number(config.serviceTimeoutMs || 5000)),
+    });
+    let body;
+    try { body = await response.json(); } catch { body = undefined; }
+    const code = body?.error || body?.code;
+    if (response.status === 404 && code === 'not_an_org_account') {
+      return { ok: false, reason: 'this credential is not an org account, so it has no tracker connections' };
+    }
+    if (response.status === 404) return { ok: true, connections: [] };
+    if (!response.ok) return { ok: false, reason: body?.message || body?.detail || code || `service returned ${response.status}` };
+    const list = Array.isArray(body) ? body : body?.trackers;
+    return { ok: true, connections: Array.isArray(list) ? list : [] };
+  } catch (error) {
+    return { ok: false, reason: error instanceof Error ? error.message : String(error) };
+  }
+}
+
+// One connection, on one line: which tracker, what it is filtered to, when it
+// last delivered and what went wrong last time, because those are the four
+// things somebody asks when issues are not appearing.
+function trackerLine(connection = {}) {
+  const parts = [String(connection.provider || 'unknown')];
+  if (connection.filter) parts.push(`filter ${connection.filter}`);
+  parts.push(connection.last_delivery_at ? `last delivery ${connection.last_delivery_at}` : 'nothing delivered yet');
+  if (connection.last_error) parts.push(`last error: ${connection.last_error}`);
+  return parts.join(' · ');
+}
+
+function connectedProviders(connections) {
+  return new Set(connections.map((connection) => String(connection.provider || '').toLowerCase()));
+}
+
 // "signed in as <email>, org <account>", as much of it as is known.
 function identity(email, account) {
   if (email && account) return `signed in as ${email}, org ${account}`;
@@ -70,12 +124,21 @@ async function status() {
   const state = latestSessionForCwd(cwd);
   const session = auth.readSession();
   const probe = credentialKind(config) ? await fetchAccount(config) : undefined;
+  // The other half of the picture: the skill reports what happens to the
+  // code, and these are the trackers allowed to report what happens to the
+  // issue. Asked for only when there is a credential to ask with.
+  const trackers = credentialKind(config) ? await trackerConnections(config) : undefined;
   print({
     tenantId: tenantId(config),
     actor: actor(config, info),
     repository: info.repository,
     branch: info.branch,
     tracker: state?.binding?.tracker || trackerOf(config),
+    trackerConnections: trackers
+      ? (trackers.ok
+        ? (trackers.connections.length ? trackers.connections.map(trackerLine) : ['none connected'])
+        : [`not listed: ${trackers.reason}`])
+      : undefined,
     jiraKey: state?.binding?.key,
     bindingSource: state?.binding?.source,
     stage: state?.stage,
@@ -195,6 +258,37 @@ async function doctor() {
       if (probe.account?.plan_expires_at) report.planCreditsExpireAt = probe.account.plan_expires_at;
       if (probe.account?.credits === 0) report.warning = 'no credits left; reports are refused with 402 until the subscription renews or the account is topped up';
     }
+
+    // Which trackers may report what happens to the issue. A repo whose keys
+    // come from a tracker nobody connected still reports fine — the skill is
+    // the driver — but nothing that happens in Jira, Linear or GitHub will
+    // ever reach the board, and the only symptom is issues that never appear.
+    const trackers = await trackerConnections(config);
+    if (!trackers.ok) {
+      report.trackerConnections = [`not listed: ${trackers.reason}`];
+    } else {
+      const connected = connectedProviders(trackers.connections);
+      report.trackerConnections = trackers.connections.length
+        ? trackers.connections.map(trackerLine)
+        : ['none connected'];
+      const warnings = [];
+      if (!connected.has(tracker)) {
+        warnings.push(`this repo reports ${tracker} issues, but the org has connected no ${tracker} tracker, `
+          + `so ${tracker} updates (created, assigned, done, cancelled) never reach the board. `
+          + `Connect one at ${serviceUrl(config)}/members/ and see docs/TRACKERS.md.`);
+      }
+      // What the last report actually carried, which is the thing a person
+      // can check against what they see on the board.
+      const seen = latestSessionForCwd(cwd)?.binding;
+      if (seen?.tracker && seen.tracker !== tracker && !connected.has(seen.tracker)) {
+        warnings.push(`the last report was for ${seen.key || 'an issue'} from ${seen.tracker}, `
+          + `which the org has not connected either.`);
+      }
+      trackers.connections
+        .filter((connection) => connection.last_error)
+        .forEach((connection) => warnings.push(`the ${connection.provider} connection's last delivery failed: ${connection.last_error}`));
+      if (warnings.length) report.trackerWarnings = warnings;
+    }
   } else {
     // Legacy S3 reporting: the AWS CLI and the bucket are the transport.
     const aws = safeExec('aws', ['--version'], { timeout: 2000 });
@@ -208,16 +302,64 @@ async function doctor() {
   print(report);
 }
 
+// --org <id> off any argument list. The chooser prints the ids, so this is
+// how a non-interactive run answers the question a second time.
+function orgFlag(list) {
+  const at = list.indexOf('--org');
+  return at === -1 ? undefined : list[at + 1];
+}
+
 async function login() {
-  const result = await auth.login(config);
+  const result = await auth.login(config, {
+    account: orgFlag(args),
+    // Only a terminal can be asked. A hook, a CI job or a piped run gets the
+    // list printed and the flag to pass instead of a prompt nobody answers.
+    chooseAccount: process.stdin.isTTY ? (accounts) => auth.promptForAccount(accounts) : undefined,
+  });
+  if (result.ambiguous) {
+    throw new Error('TeamFlow signed you in, but that address holds a seat on more than one organisation:\n'
+      + `${auth.organisationLines(result.accounts)}\n`
+      + 'Run `teamflow login --org <id>` with the one to report to.');
+  }
   if (!result.ok) {
     throw new Error(`TeamFlow sign-in failed: ${result.reason}${result.authorizeUrl ? `\nOpen this URL by hand and try again: ${result.authorizeUrl}` : ''}`);
   }
   const probe = await fetchAccount(config);
-  const org = result.account || (probe.ok ? probe.account?.account : undefined);
+  const org = result.accountName || result.account || (probe.ok ? probe.account?.account : undefined);
   print(`TeamFlow signed in${result.email ? ` as ${result.email}` : ''}${org ? `, org ${org}` : ''}. `
     + `Reporting now uses a one-hour access token refreshed in the background; `
     + `the refresh token is at ${auth.sessionPath()} and /teamflow:logout removes it.`);
+}
+
+// `teamflow org`, and `teamflow org switch <id>`.
+//
+// The ID token is what both routes take: the seat belongs to the verified
+// address, not to the scope the access token carries.
+async function org() {
+  const [action, target] = args;
+  const token = await auth.adminIdToken(config);
+  if (!token.ok) throw new Error(`TeamFlow could not read your organisation: ${token.reason}`);
+
+  if (action === 'switch') {
+    if (!target) throw new Error('Usage: teamflow org switch <id>. `teamflow org` lists the ids.');
+    const moved = await auth.switchOrg(config, token.token, target);
+    if (!moved.ok) throw new Error(`TeamFlow could not switch to ${target}: ${moved.reason}`);
+    auth.rememberOrg(moved.account, moved.name);
+    print(`TeamFlow now reports to ${moved.name || moved.account}. `
+      + 'Reports from this machine are credited to that organisation from now on.');
+    return;
+  }
+  if (action) throw new Error('Usage: teamflow org, or teamflow org switch <id>.');
+
+  const me = await auth.listOrgs(config, token.token);
+  if (!me.ok) throw new Error(`TeamFlow could not read your organisation: ${me.reason}`);
+  const others = (me.accounts || []).filter((entry) => entry.id !== me.account);
+  print(`Reporting to ${me.name || me.account} [${me.account}]`
+    + `${[me.role, me.plan].filter(Boolean).join(', ') ? ` \u2014 ${[me.role, me.plan].filter(Boolean).join(', ')}` : ''}\n`
+    + (others.length
+      ? `You also hold a seat on:\n${auth.organisationLines(others)}\n`
+        + 'Switch with `teamflow org switch <id>`.'
+      : 'That is the only organisation your address holds a seat on.'));
 }
 
 async function repos() {
@@ -283,6 +425,7 @@ try {
   else if (command === 'login') await login();
   else if (command === 'logout') logout();
   else if (command === 'repos') await repos();
+  else if (command === 'org') await org();
   else if (command === 'help' || command === '--help' || command === '-h') print(USAGE);
   else throw new Error(`Unknown TeamFlow command: ${command}\n\n${USAGE}`);
 } catch (error) {

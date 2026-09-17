@@ -15,6 +15,8 @@ It opens the TeamFlow sign-in page in the user's browser and waits for them to f
 
 This is the whole of TeamFlow onboarding. Reporting then uses a one-hour access token refreshed in the background, and only a revocable refresh token is stored on this machine.
 
+If the address holds a seat on more than one organisation, the command asks which one on a terminal and prints the list with their ids anywhere else. When it prints the list and stops, ask the user which organisation they want, then run the same command with `--org <id>`. The org skill switches afterwards.
+
 If the command fails it prints the reason. When it also prints a URL, the browser could not be opened automatically: give the user that URL to open by hand, then have them run the command again.
 
 Inside Claude Code the plugin is already on disk, so

@@ -41,6 +41,7 @@ The legacy transport writes the same documents straight to S3 at the paths below
 /data/tenants/<tenant>/runtime/<ISSUE-KEY>/dev-test.json
 /data/tenants/<tenant>/runtime/<ISSUE-KEY>/audit-dev.json
 /data/tenants/<tenant>/runtime/<ISSUE-KEY>/security.json
+/data/tenants/<tenant>/runtime/<ISSUE-KEY>/tracker.json
 ```
 
 `<ISSUE-KEY>` is the canonical key: `DAEMON-142` for Jira, `ENG-42` for Linear, `daemon-core#123` (repo name plus number) for GitHub Issues.
@@ -72,7 +73,8 @@ Each writer owns a deterministic object:
 - audit jobs own `audit-local.json` or `audit-dev.json`;
 - deployment owns `deploy.json`;
 - deployed tests own `dev-test.json`;
-- scanners own `security.json`.
+- scanners own `security.json`;
+- the tracker webhook owns `tracker.json`; `/v1/report` refuses that slot by name, because the webhook proves who sent a delivery with an HMAC signature and a report only proves who holds the tenant's API key.
 
 The browser merges sidecars by execution ID. Independent background jobs therefore do not contend with Claude's primary ticket state.
 

@@ -74,6 +74,32 @@ Nothing but the refresh token reaches the disk. A refresh token is revocable and
 
 The loopback listener binds the first free port in 52480-52489. Every one of those is registered as a callback URL on the app client, so the range cannot grow without a deploy. The `state` returned by the identity provider must match the one this process sent, or the code is discarded unredeemed: it belongs to somebody else's sign-in.
 
+### More than one organisation
+
+An address can hold a live seat on several organisations, and the service refuses to guess which one a sign-in is for: `POST /v1/members/identity` answers `409 ambiguous_seat` with the organisations, their role and their plan. Binding to the wrong one credits the developer's reports to the wrong organisation, and nothing downstream can undo that.
+
+```text
+teamflow login
+  → 409 ambiguous_seat
+  → on a terminal: the organisations as a numbered list, and one question
+  → anywhere else (a hook, CI, a pipe): the same list, then
+    "run `teamflow login --org <id>`"
+  → POST /v1/members/identity with {id_token, account}
+```
+
+`teamflow login --org <id>` skips the question. An id the address holds no seat on is refused `no_seat` and nothing is written — a session bound to no seat looks configured and 401s on every report.
+
+The session file gains `account` and `accountName` beside the refresh token, so `teamflow org` can say where reports go without a round trip. Nothing else about the file changes: still no access token, still no ID token, still 0600.
+
+```bash
+teamflow org                      # the organisation reports go to, and the others
+teamflow org switch <id>          # POST /v1/members/switch, per person not per session
+```
+
+`teamflow org` reads `GET /v1/members/me` with the ID token as the bearer — the access token names a seat, and this has to answer for the address, which is what the other organisations are found by. A switch moves the binding on the seat itself, so every signed-in dashboard and CLI on that address follows it; reports already published stay where they were published.
+
+Somebody already bound to one organisation who names another at login is switching, and the service says so rather than moving billing quietly: identity answers `409 already_bound_elsewhere`, and the plugin retries the same intent against `/v1/members/switch`.
+
 `/teamflow:logout` deletes the session file. `/teamflow:status` and `/teamflow:doctor` print `signed in as <email>, org <name>` from `GET /v1/account`.
 
 | Config key | Env | Purpose |

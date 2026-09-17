@@ -243,7 +243,9 @@ function openInBrowser(url) {
 
 // --- login ----------------------------------------------------------
 
-export async function login(config = {}, { openUrl = openInBrowser, timeoutMs = LOGIN_TIMEOUT_MS } = {}) {
+export async function login(config = {}, {
+  openUrl = openInBrowser, timeoutMs = LOGIN_TIMEOUT_MS, account, chooseAccount,
+} = {}) {
   const auth = await discoverAuth(config);
   if (!auth.ok) return auth;
 
@@ -296,7 +298,22 @@ export async function login(config = {}, { openUrl = openInBrowser, timeoutMs = 
     // Bind before anything is written. A session whose access token
     // authenticates as nobody is worse than no session: reporting
     // would look configured and silently 401 on every report.
-    const bound = await bindIdentity(config, exchanged.body.id_token);
+    let bound = await bindIdentity(config, exchanged.body.id_token, account);
+    // Seats on several organisations is a question. The tokens are already
+    // in hand, so it is asked here and answered with a second bind rather
+    // than by starting the whole sign-in again.
+    if (bound.ambiguous && chooseAccount) {
+      const chosen = await chooseAccount(bound.accounts);
+      if (chosen) bound = await bindIdentity(config, exchanged.body.id_token, chosen);
+    }
+    if (bound.ambiguous) {
+      return {
+        ok: false,
+        ambiguous: true,
+        accounts: bound.accounts,
+        reason: 'that address holds a seat on more than one organisation',
+      };
+    }
     if (!bound.ok) {
       return { ok: false, reason: `signed in, but the service would not bind this identity to a seat: ${bound.reason}` };
     }
@@ -309,10 +326,14 @@ export async function login(config = {}, { openUrl = openInBrowser, timeoutMs = 
       tokenUrl: auth.tokenUrl,
       refreshToken: exchanged.body.refresh_token,
       email,
+      // Which organisation this session is bound to, so `teamflow org` and
+      // `teamflow status` can say so without a round trip.
+      account: bound.account,
+      accountName: bound.name,
       createdAt: new Date().toISOString(),
     });
     rememberToken(exchanged.body, exchanged.body.refresh_token, email);
-    return { ok: true, email, issuer: auth.issuer, account: bound.account, bound: bound.bound };
+    return { ok: true, email, issuer: auth.issuer, account: bound.account, accountName: bound.name, bound: bound.bound };
   } finally {
     await server.close();
   }
@@ -326,28 +347,142 @@ export async function login(config = {}, { openUrl = openInBrowser, timeoutMs = 
 //
 // Idempotent, and skipped entirely by a service that does not run the
 // orgs module, which answers 404 and needs no binding at all.
-export async function bindIdentity(config, idToken) {
+export async function bindIdentity(config, idToken, account) {
+  const bound = await seatCall(config, '/v1/members/identity', idToken, account);
+  // Identity will not move a person quietly, because moving them moves who
+  // is billed for their calls. Somebody already in one organisation who
+  // named another is switching, so the same intent goes to the route that
+  // says so out loud.
+  if (bound.boundElsewhere && account) return switchOrg(config, idToken, account);
+  return bound;
+}
+
+// The other half of the same exchange: an already-bound address moving to
+// another organisation it holds a seat on. Same evidence, same answers --
+// only the route differs, so the caller reads one result shape either way.
+export async function switchOrg(config, idToken, account) {
+  if (!account) return { ok: false, reason: 'name the organisation to switch to' };
+  return seatCall(config, '/v1/members/switch', idToken, account);
+}
+
+async function seatCall(config, route, idToken, account) {
   if (!idToken) return { ok: false, reason: 'the identity provider returned no ID token' };
   let response;
   try {
-    response = await fetch(`${serviceUrl(config)}/v1/members/identity`, {
+    response = await fetch(`${serviceUrl(config)}${route}`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ id_token: idToken }),
+      // `account` only when one has been chosen: a service that predates the
+      // chooser sees exactly the request it saw before.
+      body: JSON.stringify({ id_token: idToken, ...(account ? { account } : {}) }),
       signal: AbortSignal.timeout(Number(config.serviceTimeoutMs || 10000)),
     });
   } catch (error) {
     return { ok: false, reason: `service unreachable: ${error instanceof Error ? error.message : String(error)}` };
   }
-  if (response.status === 404 || response.status === 405) {
+  let body;
+  try { body = await response.json(); } catch { body = undefined; }
+  // Not a failure: the address has seats on several live organisations and
+  // the service is asking which one. The caller answers with an account.
+  if (response.status === 409 && body?.error === 'ambiguous_seat') {
+    return { ok: false, ambiguous: true, accounts: body.accounts || [] };
+  }
+  if (response.status === 409 && body?.error === 'already_bound_elsewhere') {
+    return {
+      ok: false,
+      boundElsewhere: true,
+      account: body.account,
+      accounts: body.accounts || [],
+      reason: `that address is already bound to ${body.account || 'another organisation'}; switch instead of binding again`,
+    };
+  }
+  // A service that does not run the orgs module has no such route and says
+  // nothing about why. One that does run it names the reason -- `no_seat` on
+  // an organisation the address is not a member of -- and that is a refusal,
+  // not an absent feature.
+  if ((response.status === 404 || response.status === 405)
+    && !body?.error && !body?.message && !body?.detail) {
     return { ok: true, bound: false, reason: 'this service does not bind members to seats' };
+  }
+  if (!response.ok) {
+    return { ok: false, status: response.status, reason: body?.message || body?.detail || body?.error || `identity binding returned ${response.status}` };
+  }
+  return { ok: true, bound: true, account: body?.account, name: body?.name, member: body?.member };
+}
+
+// Record which organisation the stored session is bound to, after a switch.
+// Nothing here is a credential: the refresh token is untouched, so the
+// session keeps working whether or not this write lands.
+export function rememberOrg(account, name) {
+  const session = readSession();
+  if (!session) return false;
+  saveSession({ ...session, account, accountName: name });
+  return true;
+}
+
+// The binding in force and what else this address could be bound to. The ID
+// token, not the access token: the list belongs to the verified address
+// rather than to the scope.
+export async function listOrgs(config, idToken) {
+  if (!idToken) return { ok: false, reason: 'not signed in; run /teamflow:login' };
+  let response;
+  try {
+    response = await fetch(`${serviceUrl(config)}/v1/members/me`, {
+      headers: { Authorization: `Bearer ${idToken}` },
+      signal: AbortSignal.timeout(Number(config.serviceTimeoutMs || 10000)),
+    });
+  } catch (error) {
+    return { ok: false, reason: `service unreachable: ${error instanceof Error ? error.message : String(error)}` };
   }
   let body;
   try { body = await response.json(); } catch { body = undefined; }
   if (!response.ok) {
-    return { ok: false, status: response.status, reason: body?.message || body?.detail || body?.error || `identity binding returned ${response.status}` };
+    return { ok: false, status: response.status, reason: body?.message || body?.detail || body?.error || `the service answered ${response.status}` };
   }
-  return { ok: true, bound: true, account: body?.account, member: body?.member };
+  return {
+    ok: true,
+    account: body?.account,
+    name: body?.name,
+    role: body?.role,
+    plan: body?.plan,
+    accounts: body?.accounts || [],
+  };
+}
+
+// --- naming an organisation on a terminal ----------------------------
+//
+// Shared by `teamflow login` and `teamflow org` so the numbering a person
+// reads is the numbering they can answer with, whichever command printed it.
+
+export function organisationLines(accounts, current) {
+  return accounts.map((org, index) => {
+    const detail = [org.role, org.plan].filter(Boolean).join(', ');
+    const mark = current && org.id === current ? ' (current)' : '';
+    return `  ${index + 1}. ${org.name || org.id} [${org.id}]${detail ? ` \u2014 ${detail}` : ''}${mark}`;
+  }).join('\n');
+}
+
+// A number as printed, or the account id itself. Anything else is nothing:
+// guessing at a half-typed name would bind the wrong organisation.
+export function pickAccount(accounts, answer) {
+  const value = String(answer ?? '').trim();
+  if (!value) return undefined;
+  if (/^\d+$/.test(value)) return accounts[Number(value) - 1]?.id;
+  return accounts.find((org) => org.id === value)?.id;
+}
+
+// Asks, once, on a terminal. Streams are arguments so a test can drive it
+// without a pty, and so a non-TTY caller simply never calls it.
+export async function promptForAccount(accounts, { input = process.stdin, output = process.stdout } = {}) {
+  const { createInterface } = await import('node:readline/promises');
+  const rl = createInterface({ input, output });
+  try {
+    output.write(`Your address holds a seat on ${accounts.length} organisations:\n${organisationLines(accounts)}\n`);
+    const answer = await rl.question('Which one? Enter a number or an org id: ');
+    return pickAccount(accounts, answer);
+  } finally {
+    rl.close();
+  }
 }
 
 function rememberToken(body, refreshToken, email) {
