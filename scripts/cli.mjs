@@ -38,10 +38,14 @@ const USAGE = `teamflow \u2014 delivery reporting for TeamFlow
   teamflow sync                    publish the current state now
   teamflow doctor                  transport, account, credits, tracker MCP
   teamflow repos [list|add]        register a repository for CI OIDC
+  teamflow admin code [create|list|revoke]  invite codes, for superadmins
   teamflow report --issue ... --stage ...   report one stage transition
   teamflow skills install --for <tool>      install these skills into another tool
+  teamflow hooks status | install           report automatically from that tool
+  teamflow hook --for <tool>                the hook entry itself; tools call this
 
-\`teamflow report --help\` and \`teamflow skills --help\` list their own flags.`;
+\`teamflow report --help\`, \`teamflow skills --help\`, \`teamflow hooks --help\`
+and \`teamflow admin code --help\` list their own flags.`;
 
 const BIND_USAGE = 'Usage: /teamflow:bind <issue>. Accepted: DAEMON-142, ENG-42, #123, owner/repo#123, or a Jira/Linear/GitHub issue URL. A bare #123 needs githubRepo configured or a GitHub origin remote.';
 
@@ -134,7 +138,13 @@ async function sync() {
 }
 
 async function doctor() {
-  const claude = safeExec('claude', ['mcp', 'list'], { cwd, timeout: 5000 });
+  // TEAMFLOW_CLAUDE_BIN lets a test point this at a stub. A real
+  // `claude` started from a test with HOME redirected cannot find the
+  // login keychain, shows macOS's "a keychain cannot be found" dialog
+  // and writes a fallback credentials file into the developer's config
+  // directory; that happened.
+  const claudeBin = process.env.TEAMFLOW_CLAUDE_BIN || 'claude';
+  const claude = safeExec(claudeBin, ['mcp', 'list'], { cwd, timeout: 5000 });
   const tracker = trackerOf(config);
   const server = TRACKER_MCP[tracker];
   const mcpVisible = new RegExp(server, 'i').test(claude.stdout + claude.stderr);
@@ -247,9 +257,24 @@ try {
   if (command === 'report') {
     const { main } = await import('./report-cli.mjs');
     process.exit(await main(args));
+  } else if (command === 'admin') {
+    // Owns its exit codes too: 2 when the service refuses the caller,
+    // so a script can tell "not a superadmin" from "call failed".
+    const { main } = await import('./admin.mjs');
+    process.exit(await main(args, config));
   } else if (command === 'skills') {
     const { main } = await import('./skills.mjs');
     process.exit(await main(args));
+  } else if (command === 'hook') {
+    // The hook entry a Cursor, Copilot, Windsurf, Cline, Gemini CLI or
+    // Codex hook config calls. It owns its exit code absolutely: always
+    // 0, whatever happened, because every one of those tools reads a
+    // non-zero hook as a reason to stop or to warn the developer.
+    const { main } = await import('./hook-cli.mjs');
+    await main(args);
+  } else if (command === 'hooks') {
+    const { main } = await import('./hooks.mjs');
+    process.exit(await main(args, { cwd, config }));
   } else if (command === 'status') await status();
   else if (command === 'bind') bind();
   else if (command === 'unbind') unbind();

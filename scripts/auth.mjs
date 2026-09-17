@@ -353,6 +353,12 @@ export async function bindIdentity(config, idToken) {
 function rememberToken(body, refreshToken, email) {
   cached = {
     token: body.access_token,
+    // The ID token rides along with the access token: same cache, same
+    // expiry, same refresh, and the same never-on-disk rule. The admin
+    // routes want it because only the ID token carries the verified
+    // email claim that `admin.superadmins` is matched against; an
+    // access token names a subject and a scope and nothing else.
+    idToken: body.id_token,
     // Only what the provider told us. Guessing an hour for a token
     // that lives fifteen minutes means every fourth report is a 401.
     expiresAt: Date.now() + (Number(body.expires_in) || 3600) * 1000,
@@ -369,7 +375,7 @@ export async function accessToken(config = {}) {
   if (!session) return { ok: false, reason: 'not signed in; run /teamflow:login' };
   const refresh = fingerprint(session.refreshToken);
   if (cached && cached.refresh === refresh && cached.expiresAt - REFRESH_MARGIN_MS > Date.now()) {
-    return { ok: true, token: cached.token, expiresAt: cached.expiresAt, email: session.email, refreshed: false };
+    return { ok: true, token: cached.token, idToken: cached.idToken, expiresAt: cached.expiresAt, email: session.email, refreshed: false };
   }
   const refreshed = await tokenRequest(session.tokenUrl, {
     grant_type: 'refresh_token',
@@ -387,7 +393,28 @@ export async function accessToken(config = {}) {
   const email = claimsOf(refreshed.body.id_token).email || session.email;
   if (email !== session.email) saveSession({ ...session, refreshToken: nextRefresh, email });
   rememberToken(refreshed.body, nextRefresh, email);
-  return { ok: true, token: cached.token, expiresAt: cached.expiresAt, email, refreshed: true };
+  return { ok: true, token: cached.token, idToken: cached.idToken, expiresAt: cached.expiresAt, email, refreshed: true };
+}
+
+// The credential the admin routes take. Same session, same refresh, one
+// hour of life -- the only difference is which of the two tokens the
+// provider issued is sent. Everything else in the plugin keeps using
+// the access token, because everything else is authorised by scope.
+//
+// Cognito only returns an ID token on the openid scope. A session that
+// was granted without it refreshes fine and still cannot call an admin
+// route, so say that rather than sending a header the service will
+// answer 403 to.
+export async function adminIdToken(config = {}) {
+  const token = await accessToken(config);
+  if (!token.ok) return token;
+  if (!token.idToken) {
+    return {
+      ok: false,
+      reason: 'this session has no ID token; sign in again with `teamflow login` so the openid scope is granted',
+    };
+  }
+  return { ok: true, token: token.idToken, email: token.email, expiresAt: token.expiresAt };
 }
 
 // --- GitHub Actions OIDC --------------------------------------------

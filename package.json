@@ -8,7 +8,7 @@
     "type": "git",
     "url": "git+https://github.com/macleodlabs-ai/teamflow-plugin.git"
   },
-  "homepage": "https://teamflow.macleodlabs.com",
+  "homepage": "https://codercat.io",
   "bin": {
     "teamflow": "scripts/cli.mjs"
   },

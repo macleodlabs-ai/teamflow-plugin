@@ -78,7 +78,7 @@ The loopback listener binds the first free port in 52480-52489. Every one of tho
 
 | Config key | Env | Purpose |
 | --- | --- | --- |
-| `serviceUrl` | `TEAMFLOW_SERVICE_URL` | the service to report to; defaults to `https://teamflow.macleodlabs.com` |
+| `serviceUrl` | `TEAMFLOW_SERVICE_URL` | the service to report to; defaults to `https://codercat.io` |
 | `authIssuer` | `TEAMFLOW_AUTH_ISSUER` | override the hosted UI the service publishes, to sign in against a preview stack |
 | `authClientId` | `TEAMFLOW_AUTH_CLIENT_ID` | the app client to use with that issuer |
 | `authScopes` | | override the sign-in scopes the service publishes |
@@ -91,7 +91,7 @@ A workflow with `permissions: id-token: write` needs no stored secret. `runtime-
 
 Two things have to be true first.
 
-**The audience is `https://teamflow.macleodlabs.com`.** The service checks it, because an audience nobody checks accepts a token minted for somebody else's service, which any workflow in any repository can obtain. The reporter uses that value without being told. It is tied to the hosted origin rather than to `serviceUrl`, so pointing a job at a preview stack does not change what its token is addressed to. A service that sets `orgs.oidc_audience` publishes the value in force at `GET /v1/repos`, and `oidcAudience` (`TEAMFLOW_OIDC_AUDIENCE`) follows it.
+**The audience is `https://codercat.io`.** The service checks it, because an audience nobody checks accepts a token minted for somebody else's service, which any workflow in any repository can obtain. The reporter uses that value without being told. It is tied to the hosted origin rather than to `serviceUrl`, so pointing a job at a preview stack does not change what its token is addressed to. A service that sets `orgs.oidc_audience` publishes the value in force at `GET /v1/repos`, and `oidcAudience` (`TEAMFLOW_OIDC_AUDIENCE`) follows it.
 
 **The repository is registered once, by an owner.** `/teamflow:repos add <owner/repo>` does it from Claude Code; `POST /v1/repos` is the same thing by hand. Without it, any repository's CI that could reach the right audience would mint tokens against any account, so the exchange answers `repository_not_registered` until an owner has said which account the repository belongs to. `/teamflow:repos list` shows what is registered and the audience in force. Registration needs the owner's own credential, so it is `owner_only` for everyone else, and `repository_taken` when another organisation has claimed it.
 
@@ -102,6 +102,24 @@ A failed exchange is logged on stderr and the job carries on with whatever crede
 An environment that can neither open a browser nor mint an OIDC token can set `apiKey` (`TEAMFLOW_API_KEY`) instead. It is the last credential tried: a session, then an access token handed in directly, then the key. A signed-in developer stops sending a long-lived secret the moment there is something better.
 
 `/teamflow:doctor` warns when a session has expired or been revoked and reporting has quietly demoted to the key.
+
+## Superadmin invite codes
+
+An invite code lets one organisation start without paying. The service creates it with the seats and the complimentary period the code carries instead of a Stripe subscription, and `admin.superadmins` in `service.config.json` names who may issue one.
+
+```bash
+teamflow admin code create --email owner@acme.com --seats 5 --days 365 --note "Acme pilot"
+teamflow admin code list
+teamflow admin code revoke TF-XXXX-XXXX
+```
+
+`--email` is the organisation's admin and is required: the service emails them the code and its redeem link, and locks the code to that address, so anyone else redeeming it is turned away. The command prints the code and the link under the address it was sent to, as a fallback to paste into a message. `list` shows every code with its status — `unredeemed`, `redeemed` with the account that used it, or `expired` — and never the plaintext of a code already issued. `revoke` works only on a code nobody has used.
+
+**These three send the ID token, and nothing else does.** The service matches `admin.superadmins` against the verified email claim, which only the ID token carries; an access token names a subject and a scope, and the service answers 403 telling you to send the ID token instead. `auth.mjs` keeps the ID token beside the access token — same in-memory cache, same expiry, same refresh, never written to disk — and `adminIdToken` is the only way to reach it.
+
+Exit codes separate the two failures: **2** for a refusal, which is a caller who is not a superadmin, a service with no mailer configured, or a bad argument, and **1** for a call that did not get through, which includes not being signed in. A script that retries the second must not retry the first.
+
+The person who receives the code opens `https://codercat.io/signup/?code=TF-XXXX-XXXX`. The signup page prefills the code, puts the plan picker away, asks for the organisation name, the work email and an optional website, and posts to `POST /v1/signup/redeem`.
 
 ## Reporting transport
 
@@ -335,11 +353,140 @@ are in [CLIENTS.md](CLIENTS.md).
 
 ## Other IDEs and agent tools
 
-Claude Code is the only fully automatic client. Everywhere else the
-skills are installed and running them is still the agent's decision.
-Per-tool install, sign-in and configuration for Cursor, Windsurf, VS
-Code with Copilot, Cline, JetBrains, Zed, Claude Desktop, Codex CLI,
-Gemini CLI and Aider are in [CLIENTS.md](CLIENTS.md).
+Claude Code was the only automatic client for as long as it was the only
+one with a hook. Seven of the other ten have one now, and TeamFlow uses
+it: `teamflow skills install --for <tool>` writes that tool's hook
+configuration alongside its skills, and the hooks call `teamflow hook
+--for <tool>`, which translates that tool's payload into the shape
+`classifyTool` already reads.
+
+There is one classifier. An adapter in `plugin/scripts/adapters.mjs`
+renames fields and nothing else — it never decides a stage — so a
+`LOCAL_TEST` from Cursor and a `LOCAL_TEST` from Claude Code are the
+same report with the same summary. A second classifier would drift, and
+a stage that appeared in one tool and not the other would be wrong on
+the board long before anybody noticed.
+
+Per-tool install, sign-in and configuration are in
+[CLIENTS.md](CLIENTS.md). `plugin/scripts/tools.mjs` is the same
+information as data, one record per tool, and is what the site reads.
+
+### What is automatic, per tool
+
+Every URL below was read on 2026-09-17.
+
+| Tool | Level | Where the hooks go | Events TeamFlow subscribes to |
+| --- | --- | --- | --- |
+| Claude Code | hooks | in the plugin | `SessionStart`, `UserPromptSubmit`, `PostToolUse`, `PostToolUseFailure`, `TaskCompleted`, `SubagentStart`, `SubagentStop`, `Stop`, `SessionEnd` |
+| [Cursor](https://cursor.com/docs/agent/hooks) | hooks | `.cursor/hooks.json` | `afterFileEdit`, `postToolUse`, `postToolUseFailure`, `afterShellExecution`, `stop` |
+| [VS Code + Copilot](https://code.visualstudio.com/docs/copilot/customization/hooks) and [Copilot CLI](https://docs.github.com/en/copilot/reference/hooks-configuration) | hooks | `.github/hooks/teamflow.json` | `PostToolUse`, `Stop` (VS Code); `postToolUse`, `postToolUseFailure`, `agentStop` (CLI) |
+| [Windsurf](https://docs.devin.ai/desktop/cascade/hooks) | hooks | `.windsurf/hooks.json` | `post_write_code`, `post_run_command`, `post_cascade_response` |
+| [Cline](https://cline.bot/blog/cline-v3-36-hooks) | hooks | `.clinerules/hooks/PostToolUse` | `PostToolUse` |
+| [OpenAI Codex CLI](https://learn.chatgpt.com/docs/hooks) | hooks | `.codex/hooks.json` | `PostToolUse`, `Stop` |
+| [Gemini CLI](https://github.com/google-gemini/gemini-cli/blob/main/docs/hooks/reference.md) | hooks | `.gemini/settings.json` | `AfterTool`, `AfterAgent` |
+| [JetBrains Junie](https://junie.jetbrains.com/docs/junie-cli-hooks.html) | hooks | `~/.junie/config.json` | `PreToolUse`, `Stop` |
+| [Zed](https://zed.dev/docs/ai/agent-panel) | git hooks | `.git/hooks/` | `post-commit`, `post-merge`, `pre-push` |
+| [Aider](https://aider.chat/docs/usage/lint-test.html) | git hooks | `.git/hooks/` | `post-commit`, `post-merge`, `pre-push` |
+| [Claude Desktop](https://code.claude.com/docs/en/desktop) | rules | nothing on disk | none |
+
+**Cursor** is the closest thing to Claude Code here: it has a distinct
+`postToolUseFailure`, so a red test run reports `LOCAL_REWORK` rather
+than a green gate. `afterShellExecution` documents `command`, `output`
+and `duration` and no exit status, so TeamFlow only classifies it when
+Cursor does supply an exit code; the definite signal comes from
+`postToolUse` and `postToolUseFailure`.
+
+**Copilot** reads `.github/hooks/*.json` from both the VS Code agent and
+Copilot CLI, in two dialects of the same idea. One file registers both:
+VS Code's PascalCase event names beside Copilot CLI's camelCase ones. A
+tool never fires an event name it does not know, so the halves it does
+not recognise cost nothing. Copilot CLI's payload names no event at all
+and passes `toolArgs` as a JSON string, both of which the adapter
+handles.
+
+**Windsurf** puts everything under `tool_info` and, like Cursor,
+documents no exit status for `post_run_command`. Writes are reported;
+commands whose outcome is unknown are not.
+
+**Cline** has no hooks config file: the hook is an executable named
+exactly after the event, which is why the install writes
+`.clinerules/hooks/PostToolUse` and nothing else. Hooks also have to be
+switched on once in Settings → Features before Cline will run it.
+
+**Codex CLI** adopted Claude Code's hook shape field for field, down to
+`tool_input` and `tool_response`, so its adapter is almost a
+passthrough; only `apply_patch` needs a name mapping.
+
+**Gemini CLI** parses a hook's stdout as JSON, so TeamFlow's hook prints
+exactly `{}` and logs to stderr. Its tool names are `write_file`,
+`replace` and `run_shell_command`.
+
+**JetBrains Junie** fires `PreToolUse` and no `PostToolUse` at all, and
+only reads `~/.junie/config.json` — a project config is ignored unless
+Junie is passed `--config-location`. An intended edit is honestly
+`LOCAL_DEV` running, so that is reported. An intended test run is not
+evidence of anything, so it is dropped, and the gates need the git
+fallback. Junie CLI is what has hooks; JetBrains AI Assistant in the IDE
+has only two built-in actions (reformat, inspect) and no custom command
+hook.
+
+**Zed** has no agent hook a local command can subscribe to. The pull
+request that would have added `agent.hooks.pre_tool_use` was closed
+unmerged; the open discussion has no commitment behind it.
+
+**Aider** has no hook system either, but it commits after every edit by
+default, and `--no-verify` skips only `pre-commit` and `commit-msg`, so
+the `post-commit` hook still fires. In practice the git fallback tracks
+an Aider session closely.
+
+**Claude Desktop** has two halves. The Code tab reads the same settings
+files as the Claude Code CLI, so installing the plugin there gives it
+the full automatic path. The chat side runs no local command and has no
+hooks, which is why `--for claude-desktop` writes a rules document to
+paste into a Project rather than a config file.
+
+### The git fallback
+
+For a tool with no hook system, and for any team that would rather not
+depend on one:
+
+```bash
+npx -y github:macleodlabs-ai/teamflow-plugin hooks install --git
+```
+
+That writes three marked blocks into this repository's `.git/hooks`:
+
+| Hook | Reports |
+| --- | --- |
+| `post-commit` | `LOCAL_DEV`, work in progress |
+| `post-merge` | `MERGE` |
+| `pre-push` | `LOCAL_TEST`, or `LOCAL_REWORK` naming `LOCAL_TEST`, after running the configured test command |
+
+Reporting is then on commit rather than per tool call. It is coarser,
+and it happens whether or not a model remembered.
+
+`pre-push` does nothing until `testCommand` is set in `.teamflow.json`,
+because a push is not evidence that anything passed:
+
+```json
+{ "testCommand": "make check" }
+```
+
+With that set, the push runs `make check`, shows its output, reports the
+result, and pushes either way. Nothing TeamFlow installs can fail a git
+operation: each block ends in `|| true`. A command the built-in patterns
+would not recognise, like `make check`, is matched literally against
+`testCommand`, which is what makes a project like that reportable at
+all.
+
+An existing hook is kept: the block is appended and replaced in place on
+reinstall. If `core.hooksPath` points outside the repository — a machine
+that sets it globally — the install refuses rather than writing hooks
+into every repository you own.
+
+`teamflow hooks status` says, for the current repository, which of these
+tools it can see a sign of, whether their hooks are installed, what they
+cover, and whether `pre-push` has a test command to run.
 
 ## Privacy
 

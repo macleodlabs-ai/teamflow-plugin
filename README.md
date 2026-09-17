@@ -32,6 +32,11 @@ No hook files are separately injected into a developer repository, so there are 
 
 ## What happens automatically
 
+In Claude Code, from the plugin's own hooks. In Cursor, Copilot,
+Windsurf, Cline, Codex CLI, Gemini CLI and JetBrains Junie, from the
+hooks `skills install --for <tool>` writes for them. See "Reporting from
+anything else" below.
+
 1. `SessionStart` restores/detects a tenant-scoped issue binding from a manual override, prompt, branch or recent commit.
 2. The bundled Atlassian v2, Linear and GitHub MCP servers are available for issue context; authenticate the one you use once through `/mcp`.
 3. `PostToolUse` / `PostToolUseFailure` derive local dev/test/audit, merge, dev deploy/test/audit and rework stages.
@@ -49,6 +54,7 @@ No hook files are separately injected into a developer repository, so there are 
 - `/teamflow:unbind`
 - `/teamflow:sync`
 - `/teamflow:doctor`
+- `/teamflow:admin-code` (superadmins only: `admin code create --email owner@acme.com --seats 5 --days 365`, `admin code list`, `admin code revoke TF-XXXX-XXXX`)
 
 All are manual-only skills.
 
@@ -59,6 +65,8 @@ All are manual-only skills.
 Install the plugin, then run `/teamflow:login` once. That is the whole of onboarding. Reporting then uses a one-hour access token refreshed in the background; only a revocable refresh token is stored, at `~/.config/teamflow/session.json`, and `/teamflow:logout` removes it. `/teamflow:doctor` shows who is signed in, the org and its remaining credits.
 
 CI signs in per job with its GitHub Actions OIDC token and stores no secret. An owner registers each repository once with `/teamflow:repos add <owner/repo>`; until then that repository's exchange answers `repository_not_registered`.
+
+A superadmin can invite an organisation to start without paying: `teamflow admin code create --email owner@acme.com --seats 5 --days 365` has the service email that address a code and a redeem link. Those commands send the signed-in ID token, because the service matches its superadmin list against the verified email claim that only the ID token carries. See `docs/PLUGIN.md`.
 
 The rest is about the tracker:
 
@@ -95,9 +103,9 @@ Common `audit`, `lint`, `typecheck`, Semgrep and CodeQL commands are recognized 
 
 ## Reporting from anything else
 
-Claude Code is the only client where TeamFlow is automatic, because it is
-the only one with a hook that fires on every tool call. Every other tool
-gets the same skills, installed with one command:
+Claude Code was automatic for as long as it was the only tool with a
+hook. It is not any more, and one command installs the same thing
+everywhere:
 
 ```bash
 npx -y github:macleodlabs-ai/teamflow-plugin skills install --for cursor
@@ -106,9 +114,46 @@ npx -y github:macleodlabs-ai/teamflow-plugin skills install --for cursor
 `--for` takes `cursor`, `codex`, `gemini`, `copilot`, `windsurf`,
 `cline`, `zed`, `jetbrains`, `claude-desktop` and `aider`. It writes the
 skills where that tool discovers them, or generates the rules file it
-reads from the same `SKILL.md` sources, and registers the MCP server in
-that tool's own format. `--dry-run` shows the file list first. Per-tool
+reads from the same `SKILL.md` sources; registers the MCP server in that
+tool's own format; and, where the tool has a hook system, writes its
+hook configuration too. `--dry-run` shows the file list first. Per-tool
 detail is in `docs/CLIENTS.md`.
+
+Eight of the eleven clients report automatically:
+
+| Level | Tools |
+| --- | --- |
+| Hooks, per tool call | Claude Code, Cursor, VS Code + Copilot and Copilot CLI, Windsurf, Cline, Codex CLI, Gemini CLI, JetBrains Junie |
+| Git hooks, per commit | Zed, Aider, and anything else |
+| Rules only | Claude Desktop's chat side |
+
+The hooks call `teamflow hook --for <tool>`, which translates that
+tool's payload into the one shape `classifyTool` reads. There is one
+classifier, so a `LOCAL_TEST` from Cursor is the same report as a
+`LOCAL_TEST` from Claude Code. Every hook exits 0 and prints nothing
+that its tool could read as a denial: reporting can never block an edit,
+a command or a turn.
+
+Two tools deliberately report less than they could. Cursor's
+`afterShellExecution` and Windsurf's `post_run_command` document no exit
+status, and JetBrains Junie fires no `PostToolUse` at all, so a test run
+whose outcome is unknown is dropped rather than guessed at. A green
+`LOCAL_TEST` for a red suite would be worse than no report.
+
+For a tool with no hooks, and for a team that would rather not depend on
+one:
+
+```bash
+npx -y github:macleodlabs-ai/teamflow-plugin hooks install --git
+```
+
+`post-commit` reports `LOCAL_DEV`, `post-merge` reports `MERGE`, and
+`pre-push` runs the `testCommand` named in `.teamflow.json` and reports
+`LOCAL_TEST` or `LOCAL_REWORK`. Reporting is then on commit rather than
+per tool call. No block TeamFlow writes can fail a git operation.
+
+`teamflow hooks status` says what is installed in the current repository
+and what it covers.
 
 From a shell, with no model involved:
 

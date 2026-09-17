@@ -384,6 +384,12 @@ export function classifyTool(input, state, config) {
   const isDevAudit = DEV_AUDIT_RE.test(command) || Boolean(customDevAudit?.test(command));
   const isLocalAudit = !isDevAudit && (LOCAL_AUDIT_RE.test(command) || Boolean(customLocalAudit?.test(command)));
   const isDevTest = DEV_TEST_RE.test(command) || Boolean(customDevTest?.test(command));
+  // A repository whose suite is not `npm test` or `pytest` names it in
+  // `.teamflow.json` as `testCommand`. The git pre-push fallback runs
+  // exactly that command, so matching it literally is what lets a
+  // `make check` project report LOCAL_TEST at all.
+  const isLocalTest = TEST_RE.test(command)
+    || Boolean(config.testCommand && command.includes(String(config.testCommand).trim()));
 
   if (event === 'SubagentStart') return { summary: 'Subagent started', heartbeat: true };
   if (event === 'SubagentStop') return { summary: 'Subagent finished', heartbeat: true };
@@ -441,7 +447,7 @@ export function classifyTool(input, state, config) {
     return { stage: 'MERGE', status: failed ? 'failed' : 'waiting', summary: failed ? 'PR operation failed' : 'PR ready for merge', sticky: true, reworkFrom: failed ? 'MERGE' : undefined };
   }
 
-  if (TEST_RE.test(command)) {
+  if (isLocalTest) {
     return failed
       ? { stage: 'LOCAL_REWORK', status: 'failed', summary: 'Local tests failed', incrementLoop: true, reworkFrom: 'LOCAL_TEST', evidence: extractTestEvidence(input.tool_response || input.error), sticky: true }
       : { stage: 'LOCAL_TEST', status: 'success', summary: 'Local tests passed; awaiting audit', evidence: extractTestEvidence(input.tool_response), sticky: true, clearRework: true };
@@ -562,7 +568,7 @@ export function sanitizePayload(value) {
 // tenant, so a reporter needs no AWS credentials and no bucket policy.
 // The S3 path is unchanged for installs that predate the service.
 
-const DEFAULT_SERVICE_URL = 'https://teamflow.macleodlabs.com';
+const DEFAULT_SERVICE_URL = 'https://codercat.io';
 
 export function serviceUrl(config = {}) {
   return String(config.serviceUrl || DEFAULT_SERVICE_URL).replace(/\/+$/, '');

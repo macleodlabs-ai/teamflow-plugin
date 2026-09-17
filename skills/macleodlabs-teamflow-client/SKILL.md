@@ -12,11 +12,11 @@ read it from the service first.
 ## Procedure
 
 1. Read the contract. Call the `macleodlabs_teamflow_capabilities` tool, or
-   GET https://teamflow.macleodlabs.com/v1/capabilities.
+   GET https://codercat.io/v1/capabilities.
 2. Build the request from the published schema. Include
    `idempotency_key` (any unique string) so retries are safe.
 3. Call the `macleodlabs_teamflow_call` tool with the request. Over REST:
-   POST https://teamflow.macleodlabs.com/v1/report
+   POST https://codercat.io/v1/report
    with headers `X-Api-Key` and `Idempotency-Key`.
 4. Read `status` before anything else. Billing statuses are listed
    in capabilities. INVALID and TOO_LARGE are free: fix the request

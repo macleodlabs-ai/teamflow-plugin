@@ -16,7 +16,11 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-const SERVICE_URL = 'https://teamflow.macleodlabs.com';
+import { installHooks } from './hooks.mjs';
+import { capability } from './tools.mjs';
+import { mergeJson, writeBlock, writeFile, writeTomlTable } from './write.mjs';
+
+const SERVICE_URL = 'https://codercat.io';
 const MCP_URL = `${SERVICE_URL}/mcp`;
 // Customers install from the public GitHub mirror, not from npmjs. The
 // package is still named @macleodlabs/teamflow so a later npm publish
@@ -28,8 +32,6 @@ const PACKAGE = 'github:macleodlabs-ai/teamflow-plugin';
 const RUN = `npx -y ${PACKAGE}`;
 const MARKETPLACE = 'macleodlabs-ai/teamflow-plugin';
 
-const BEGIN = '<!-- BEGIN teamflow -->';
-const END = '<!-- END teamflow -->';
 
 export function skillsDir() {
   return path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', 'skills');
@@ -72,7 +74,7 @@ export function readSkills(dir = skillsDir()) {
 
 // The rules document every non-skill tool gets. Built from the same
 // SKILL.md files, so adding a skill adds a line here and nowhere else.
-export function rulesDocument(skills, { mcp = true } = {}) {
+export function rulesDocument(skills, { mcp = true, automation = 'rules', covers } = {}) {
   const commands = skills
     .filter((s) => s.frontmatter.command)
     .map((s) => `| \`${RUN} ${s.frontmatter.command}\` | ${s.description} |`)
@@ -82,11 +84,43 @@ export function rulesDocument(skills, { mcp = true } = {}) {
     ? 'call the TeamFlow MCP tool `macleodlabs_teamflow_call`, or run the command below if the MCP server is not configured'
     : 'run the command below';
 
+  // A tool whose hooks are installed reports on its own. Telling its
+  // agent to report as well would not make the board better: it would
+  // charge the team twice for the same fact, and the second report
+  // would be the one written from memory.
+  const automatic = {
+    hooks: `## Reporting here is automatic
+
+TeamFlow hooks are installed for this tool and cover ${covers || 'every finished tool call'}.
+They report each stage as it happens, with nobody asked to remember.
+
+**Do not report by hand.** Do not narrate tool calls for reporting, and
+do not run \`report\` after a test run or a merge: the hook already did,
+and a second report is a second credit for the same fact. The stage
+vocabulary below is there so you can read the board, and for the rare
+transition no tool call can show.
+
+`,
+    'git-hooks': `## Reporting here is on commit
+
+This tool has no hook TeamFlow can attach to, so the repository's git
+hooks report instead: a commit reports \`LOCAL_DEV\`, a merge reports
+\`MERGE\`, and a push reports \`LOCAL_TEST\` when a test command is
+configured. That is coarser than a report per tool call, and it happens
+whether or not you remember.
+
+Report by hand for the transitions git cannot see — a deploy, a dev
+test, an audit — and not for the three above.
+
+`,
+    rules: '',
+  }[automation] || '';
+
   return `# TeamFlow
 
 This team tracks delivery stages in TeamFlow. Keep the board true.
 
-## Report at each stage transition
+${automatic}## Report at each stage transition
 
 When you know the work has reached a new stage, ${call}:
 
@@ -134,95 +168,6 @@ ${skills.filter((s) => s.frontmatter.command).map((s) => `### ${s.name}\n\n${s.b
 }
 
 // --- writers ---------------------------------------------------------
-
-function ensureDir(file) {
-  fs.mkdirSync(path.dirname(file), { recursive: true });
-}
-
-function writeFile(file, text, written) {
-  ensureDir(file);
-  const before = fs.existsSync(file) ? fs.readFileSync(file, 'utf8') : undefined;
-  if (before === text) {
-    written.push({ file, action: 'unchanged' });
-    return;
-  }
-  fs.writeFileSync(file, text);
-  written.push({ file, action: before === undefined ? 'created' : 'updated' });
-}
-
-// A marked block inside a file somebody else also writes to. Replaced in
-// place on reinstall, so the user's own instructions above and below it
-// survive and TeamFlow's half never doubles up.
-function writeBlock(file, text, written) {
-  ensureDir(file);
-  const block = `${BEGIN}\n${text.trim()}\n${END}\n`;
-  const before = fs.existsSync(file) ? fs.readFileSync(file, 'utf8') : '';
-  const marked = new RegExp(`${BEGIN}[\\s\\S]*?${END}\\n?`);
-  const after = marked.test(before)
-    ? before.replace(marked, block)
-    : (before ? `${before.replace(/\n*$/, '\n')}\n${block}` : block);
-  if (after === before) {
-    written.push({ file, action: 'unchanged' });
-    return;
-  }
-  fs.writeFileSync(file, after);
-  written.push({ file, action: before ? 'updated' : 'created' });
-}
-
-// Merge one server into a config file the user shares with every other
-// MCP server they have. Never rewrites the file wholesale.
-function mergeJson(file, patch, written) {
-  ensureDir(file);
-  let current = {};
-  let before;
-  if (fs.existsSync(file)) {
-    before = fs.readFileSync(file, 'utf8');
-    try {
-      current = JSON.parse(before);
-    } catch {
-      written.push({ file, action: 'skipped', reason: 'existing file is not valid JSON; merge it by hand' });
-      return;
-    }
-  }
-  const merged = deepMerge(current, patch);
-  const text = `${JSON.stringify(merged, null, 2)}\n`;
-  if (text === before) {
-    written.push({ file, action: 'unchanged' });
-    return;
-  }
-  fs.writeFileSync(file, text);
-  written.push({ file, action: before === undefined ? 'created' : 'updated' });
-}
-
-function deepMerge(base, patch) {
-  const out = Array.isArray(base) ? [...base] : { ...base };
-  for (const [key, value] of Object.entries(patch)) {
-    out[key] = value && typeof value === 'object' && !Array.isArray(value)
-      && out[key] && typeof out[key] === 'object' && !Array.isArray(out[key])
-      ? deepMerge(out[key], value)
-      : value;
-  }
-  return out;
-}
-
-// TOML, for Codex's config. A table written as a marked block rather
-// than parsed: a real TOML round trip would reformat the whole file and
-// lose the user's comments.
-function writeTomlTable(file, table, body, written) {
-  ensureDir(file);
-  const block = `# BEGIN teamflow\n[${table}]\n${body.trim()}\n# END teamflow\n`;
-  const before = fs.existsSync(file) ? fs.readFileSync(file, 'utf8') : '';
-  const marked = /# BEGIN teamflow\n[\s\S]*?# END teamflow\n?/;
-  const after = marked.test(before)
-    ? before.replace(marked, block)
-    : (before ? `${before.replace(/\n*$/, '\n')}\n${block}` : block);
-  if (after === before) {
-    written.push({ file, action: 'unchanged' });
-    return;
-  }
-  fs.writeFileSync(file, after);
-  written.push({ file, action: before ? 'updated' : 'created' });
-}
 
 // Inside the Claude Code plugin a skill is `status`, because that is what
 // makes the slash command `/teamflow:status`. Copied into a shared skills
@@ -416,6 +361,15 @@ export function install(tool, { root = process.cwd(), scope = 'project', dryRun 
   const written = [];
   const plan = (file) => written.push({ file, action: 'would write' });
 
+  // A tool with a hook system gets its hooks in the same breath as its
+  // skills, because a developer who installs TeamFlow into Cursor means
+  // "report my work", not "install a skill I will have to remember to
+  // use". This happens first because the rules document has to say
+  // whether reporting is already automatic here, and the files it
+  // wrote are still listed last, where a reader expects them.
+  const hooks = installHooks(tool, { root, dryRun });
+  const automation = capability(tool)?.automation || 'rules';
+
   if (spec.skills) {
     const target = spec.skills(root, scope === 'user');
     if (dryRun) for (const skill of skills) plan(path.join(target, externalName(skill.name), 'SKILL.md'));
@@ -426,7 +380,8 @@ export function install(tool, { root = process.cwd(), scope = 'project', dryRun 
     const file = spec.rules(root);
     if (dryRun) plan(file);
     else {
-      const doc = (spec.rulesFrontmatter || '') + rulesDocument(skills, { mcp: !spec.noMcp });
+      const doc = (spec.rulesFrontmatter || '')
+        + rulesDocument(skills, { mcp: !spec.noMcp, automation, covers: hooks.covers });
       // A file TeamFlow owns outright is written whole; a file the user
       // also writes in gets a marked block instead, so their own
       // instructions above and below it survive a reinstall.
@@ -442,12 +397,18 @@ export function install(tool, { root = process.cwd(), scope = 'project', dryRun 
     else if (target.toml) writeTomlTable(target.file, target.toml.table, target.toml.body, written);
   }
 
+  written.push(...hooks.written);
+
   return {
     tool,
     label: spec.label,
     scope,
     skills: skills.map((s) => (spec.skills ? externalName(s.name) : s.name)),
     written,
+    automation,
+    hooks: hooks.hooks
+      ? hooks.covers
+      : `no hook system; run \`${RUN} hooks install --git\` to report on commit, merge and push`,
     manual: spec.manual || [],
     note: spec.note,
   };
