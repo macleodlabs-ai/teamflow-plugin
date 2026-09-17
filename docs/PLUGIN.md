@@ -319,8 +319,11 @@ Claude Code is running.
 | Subcommand | |
 | --- | --- |
 | `login`, `logout`, `status`, `bind`, `unbind`, `sync`, `doctor`, `repos` | the eight the plugin's skills wrap |
+| `admin code` (`create`, `list`, `revoke`) | invite codes, for superadmins; the ninth skill wraps it |
 | `report` | one stage transition, from any shell |
 | `skills install --for <tool>` | put these skills in front of another agent |
+| `hooks` (`status`, `install`) | what reports automatically in this repository, and the git fallback |
+| `hook --for <tool>` | the hook entry itself; a tool's hook configuration calls it |
 
 ## Portable skills
 

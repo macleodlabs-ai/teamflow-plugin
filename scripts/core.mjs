@@ -167,8 +167,27 @@ export function writeJson(file, value) {
   fs.renameSync(tmp, file);
 }
 
+/**
+ * Later layers win, but only where they actually say something.
+ *
+ * `Object.assign` cannot be used here: the environment layer is built by
+ * reading a dozen variables, and every one that is unset arrives as
+ * `undefined`. Assigned over the file layer that would erase the value the
+ * file had, which is how `.teamflow.json` came to contribute nothing on a
+ * machine with a clean environment. An unset override is silence, not an
+ * instruction to forget; an empty string is the same silence, because that
+ * is what an exported-but-blank variable looks like.
+ */
 function mergeConfig(...configs) {
-  return Object.assign({}, ...configs.filter(Boolean));
+  const merged = {};
+  for (const config of configs) {
+    if (!config) continue;
+    for (const [key, value] of Object.entries(config)) {
+      if (value === undefined || value === '') continue;
+      merged[key] = value;
+    }
+  }
+  return merged;
 }
 
 export function dataDir() {
@@ -188,10 +207,16 @@ export function sessionPath(sessionId) {
   return path.join(dataDir(), 'sessions', `${sessionId}.json`);
 }
 
+/**
+ * Three layers, least specific first: the global file, the project's own
+ * `.teamflow.json`, then the environment. `mergeConfig` keeps that order and
+ * skips the layers that are silent, so an unset variable leaves the file's
+ * answer standing and a set one replaces it.
+ */
 export function loadConfig(cwd) {
   const globalConfig = readJson(path.join(os.homedir(), '.config', 'teamflow', 'config.json'), {});
   const projectConfig = readJson(path.join(cwd, '.teamflow.json'), {});
-  const config = mergeConfig(globalConfig, projectConfig, {
+  return mergeConfig(globalConfig, projectConfig, {
     serviceUrl: process.env.TEAMFLOW_SERVICE_URL || undefined,
     apiKey: process.env.TEAMFLOW_API_KEY || undefined,
     authIssuer: process.env.TEAMFLOW_AUTH_ISSUER || undefined,
@@ -206,10 +231,6 @@ export function loadConfig(cwd) {
     githubRepo: process.env.TEAMFLOW_GITHUB_REPO || undefined,
     awsProfile: process.env.TEAMFLOW_AWS_PROFILE || undefined,
   });
-  for (const key of Object.keys(config)) {
-    if (config[key] === undefined || config[key] === '') delete config[key];
-  }
-  return config;
 }
 
 export function tenantId(config) {
