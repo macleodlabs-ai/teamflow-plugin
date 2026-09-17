@@ -1,11 +1,11 @@
 {
   "name": "teamflow",
   "description": "Automatically reports Jira, Linear or GitHub issue-led Claude Code delivery progress to TeamFlow",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "author": {
     "name": "MacleodLabs"
   },
-  "homepage": "https://github.com/macleodlabs-ai/teamflow",
-  "repository": "https://github.com/macleodlabs-ai/teamflow",
+  "homepage": "https://teamflow.macleodlabs.com",
+  "repository": "https://github.com/macleodlabs-ai/teamflow-plugin",
   "license": "Proprietary"
 }

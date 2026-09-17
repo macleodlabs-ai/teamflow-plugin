@@ -6,8 +6,7 @@
   "license": "UNLICENSED",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/macleodlabs-ai/teamflow.git",
-    "directory": "plugin"
+    "url": "git+https://github.com/macleodlabs-ai/teamflow-plugin.git"
   },
   "homepage": "https://teamflow.macleodlabs.com",
   "bin": {
