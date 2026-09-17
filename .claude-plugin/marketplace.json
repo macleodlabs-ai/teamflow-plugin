@@ -1,0 +1,14 @@
+{
+  "name": "macleodlabs",
+  "description": "TeamFlow for Claude Code",
+  "owner": {
+    "name": "MacleodLabs"
+  },
+  "plugins": [
+    {
+      "name": "teamflow",
+      "source": "./",
+      "description": "Zero-touch Jira delivery reporting for TeamFlow"
+    }
+  ]
+}
