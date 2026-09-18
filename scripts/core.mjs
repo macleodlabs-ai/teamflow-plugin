@@ -344,6 +344,26 @@ export function chooseBinding(state, candidates) {
   return state.binding;
 }
 
+// --- title and status from a tool result -----------------------------
+//
+// A bound ticket should not need a hand-written report to get its name
+// onto the board. The agent has usually just looked the issue up —
+// through the Atlassian MCP, the Linear MCP, a GitHub MCP tool or
+// `gh issue view` — and that result already carries the two fields the
+// board wants.
+//
+// The three trackers agree on nothing: Jira says `summary` and wraps
+// status in an object, Linear says `title` and wraps state in a
+// different object, GitHub says `title` and a bare `state`, and `gh`
+// prints tab-separated fields. So there is one seam,
+// `enrichFromToolResult(tracker, result)`, and one small parser behind
+// it per tracker. A fourth tracker is a fourth parser and nothing else.
+//
+// docs/REPORTING_CONTRACT.md is the hard limit: the issue key, its
+// link, a short title and a short status. No parser reads a body, a
+// description or a comment, and the `gh` text parser stops at the `--`
+// separator for exactly that reason.
+
 function stringField(obj, names) {
   if (!obj || typeof obj !== 'object') return undefined;
   for (const name of names) {
@@ -358,25 +378,176 @@ function stringField(obj, names) {
   return undefined;
 }
 
-export function enrichFromAtlassian(state, input, config) {
-  if (!/atlassian|jira/i.test(input.tool_name || '')) return state;
-  const response = input.tool_response;
-  const key = extractJiraKey(JSON.stringify(response ?? '')) || state.binding?.key;
-  if (!key || key !== state.binding?.key) return state;
-  const title = stringField(response, ['summary', 'title', 'name']);
-  const jiraStatus = stringField(response, ['statusName', 'status', 'state']);
-  const url = stringField(response, ['browseUrl', 'webUrl', 'url']);
-  const parentKey = extractJiraKey(stringField(response, ['parentKey', 'parent']) || '');
+// A status arrives either as a string ("In Progress", "OPEN") or as the
+// object each of these APIs wraps it in ({ name: 'In Progress' }).
+function labelField(obj, names) {
+  if (!obj || typeof obj !== 'object') return undefined;
+  for (const name of names) {
+    const value = obj[name];
+    if (typeof value === 'string' && value.trim()) return value.trim();
+    if (value && typeof value === 'object') {
+      const label = stringField(value, ['name', 'label', 'displayName', 'title']);
+      if (label) return label;
+    }
+  }
+  for (const value of Object.values(obj)) {
+    if (value && typeof value === 'object') {
+      const found = labelField(value, names);
+      if (found) return found;
+    }
+  }
+  return undefined;
+}
+
+function numberField(obj, names) {
+  if (!obj || typeof obj !== 'object') return undefined;
+  for (const name of names) {
+    const value = obj[name];
+    if (typeof value === 'number' && Number.isInteger(value)) return String(value);
+    if (typeof value === 'string' && /^\d+$/.test(value.trim())) return value.trim();
+  }
+  for (const value of Object.values(obj)) {
+    if (value && typeof value === 'object') {
+      const found = numberField(value, names);
+      if (found) return found;
+    }
+  }
+  return undefined;
+}
+
+function parseJsonish(text) {
+  const trimmed = String(text ?? '').trim();
+  if (!trimmed.startsWith('{') && !trimmed.startsWith('[')) return undefined;
+  try {
+    const parsed = JSON.parse(trimmed);
+    return parsed && typeof parsed === 'object' ? parsed : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+// A tool result is an object from an MCP server, a JSON string, or the
+// plain text a shell command printed — sometimes wrapped in `stdout`.
+function payloads(result) {
+  if (typeof result === 'string') return { object: parseJsonish(result), text: result };
+  if (result && typeof result === 'object') {
+    const stdout = typeof result.stdout === 'string' ? result.stdout : undefined;
+    return { object: parseJsonish(stdout) || result, text: stdout };
+  }
+  return {};
+}
+
+function jiraIssue(result) {
+  const { object } = payloads(result);
+  if (!object) return undefined;
+  return {
+    key: extractJiraKey(JSON.stringify(object)),
+    title: stringField(object, ['summary', 'title', 'name']),
+    status: labelField(object, ['statusName', 'status', 'state']),
+    url: stringField(object, ['browseUrl', 'webUrl', 'url']),
+    parentKey: extractJiraKey(stringField(object, ['parentKey', 'parent']) || ''),
+  };
+}
+
+function linearIssue(result) {
+  const { object } = payloads(result);
+  if (!object) return undefined;
+  const text = JSON.stringify(object);
+  const fromUrl = text.match(LINEAR_URL_RE);
+  return {
+    key: extractJiraKey(stringField(object, ['identifier', 'key']) || '')
+      || (fromUrl ? fromUrl[2].toUpperCase() : extractJiraKey(text)),
+    title: stringField(object, ['title', 'name']),
+    status: labelField(object, ['state', 'status', 'stateName']),
+    url: stringField(object, ['url', 'issueUrl', 'webUrl']),
+  };
+}
+
+// `gh issue view <n>` with no --json prints tab-separated fields and
+// then `--` and the body. Everything from the separator on is the
+// issue description, which is not ours to read or to send.
+function githubText(text) {
+  const head = String(text).split(/^--$/m)[0];
+  const field = (name) => head.match(new RegExp(`^${name}:\\t(.*)$`, 'mi'))?.[1]?.trim() || undefined;
+  const title = field('title');
+  const status = field('state');
+  if (!title && !status) return undefined;
+  return { title, status, number: field('number') };
+}
+
+function githubIssue(result) {
+  const { object, text } = payloads(result);
+  if (object) {
+    const json = JSON.stringify(object);
+    const fromUrl = json.match(GITHUB_URL_RE);
+    const found = {
+      key: fromUrl ? `${fromUrl[2].toLowerCase()}#${fromUrl[3]}` : undefined,
+      number: fromUrl?.[3] || numberField(object, ['number', 'issueNumber', 'issue_number']),
+      title: stringField(object, ['title']),
+      status: labelField(object, ['state', 'status']),
+      url: stringField(object, ['html_url', 'htmlUrl', 'url', 'webUrl']),
+    };
+    if (found.title || found.status) return found;
+  }
+  return text ? githubText(text) : undefined;
+}
+
+// One parser per tracker, and the seam every caller goes through.
+export const TRACKER_PARSERS = { jira: jiraIssue, linear: linearIssue, github: githubIssue };
+
+export function enrichFromToolResult(tracker, result) {
+  const parse = TRACKER_PARSERS[tracker];
+  if (!parse || result === undefined || result === null) return undefined;
+  const found = parse(result);
+  if (!found) return undefined;
+  const fields = {
+    key: found.key,
+    number: found.number,
+    title: found.title?.slice(0, 180),
+    status: found.status?.slice(0, 80),
+    url: /^https?:\/\//i.test(found.url || '') ? found.url : undefined,
+    parentKeys: found.parentKey ? [found.parentKey] : undefined,
+  };
+  return fields.title || fields.status || fields.url ? fields : undefined;
+}
+
+// Which tracker just answered. The tool's own name says it, except for
+// `gh issue view`, which arrives as a Bash command like any other.
+export function toolTracker(input = {}) {
+  const tool = input.tool_name || '';
+  if (/atlassian|jira/i.test(tool)) return 'jira';
+  if (/linear/i.test(tool)) return 'linear';
+  if (/github/i.test(tool)) return 'github';
+  if (tool === 'Bash' && GH_ISSUE_RE.test(commandOf(input))) return 'github';
+  return undefined;
+}
+
+// Enrichment only ever describes the ticket already bound. A result
+// about some other issue is somebody else's ticket and is dropped: a
+// wrong title on the board is worse than no title.
+function sameIssue(binding, fields) {
+  if (!binding?.key) return false;
+  if (fields.key) return fields.key === binding.key;
+  // `gh` names the issue by number; the canonical key is <repo>#<n>.
+  return Boolean(fields.number && binding.key.endsWith(`#${fields.number}`));
+}
+
+export function enrichBinding(state, input) {
+  const tracker = toolTracker(input);
+  if (!tracker) return state;
+  const fields = enrichFromToolResult(tracker, input.tool_response);
+  if (!fields || !sameIssue(state.binding, fields)) return state;
+  const previous = state.jira || {};
   return {
     ...state,
     jira: {
-      ...(state.jira || {}),
-      key,
-      title: title?.slice(0, 180) || state.jira?.title,
-      status: jiraStatus?.slice(0, 80) || state.jira?.status,
-      url: /^https?:\/\//i.test(url || '') ? url : state.jira?.url,
-      parentKeys: parentKey ? [parentKey] : state.jira?.parentKeys,
-    }
+      ...previous,
+      key: state.binding.key,
+      title: fields.title || previous.title,
+      status: fields.status || previous.status,
+      url: fields.url || previous.url,
+      parentKeys: fields.parentKeys || previous.parentKeys,
+    },
   };
 }
 

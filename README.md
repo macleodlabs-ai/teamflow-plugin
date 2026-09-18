@@ -101,6 +101,12 @@ Local Test → Local Audit → Merge → CI → Deploy Dev → Dev Test → Dev 
 
 Common `audit`, `lint`, `typecheck`, Semgrep and CodeQL commands are recognized locally. Dev audit detection supports `audit-dev` / `dev-audit` style commands. Repositories can set custom `localAuditPattern`, `devTestPattern` and `devAuditPattern` regexes.
 
+When the agent looks the bound ticket up — the Atlassian MCP, the Linear
+MCP, a GitHub MCP tool or `gh issue view` — its title and status go on
+the board with no report typed by hand. One seam,
+`enrichFromToolResult(tracker, result)`, one parser per tracker, and the
+reporting contract unchanged: title and status only, never a body.
+
 ## Reporting from anything else
 
 Claude Code was automatic for as long as it was the only tool with a
@@ -139,6 +145,15 @@ Two tools deliberately report less than they could. Cursor's
 status, and JetBrains Junie fires no `PostToolUse` at all, so a test run
 whose outcome is unknown is dropped rather than guessed at. A green
 `LOCAL_TEST` for a red suite would be worse than no report.
+
+A repository is shared between Macs and Windows machines, so a tool that
+documents a Windows form of a hook gets a second shim,
+`.teamflow/hooks/<tool>.ps1`, calling the same entry with the same
+fail-open rules. Copilot CLI and Windsurf each take a `powershell` field
+beside `command`; Cursor has no such field and runs `command` through
+the platform shell, so both shims are registered and the `.ps1` execs
+`true` under a POSIX shell so only one of the two ever reports. See
+"Windows and PowerShell" in `docs/PLUGIN.md`.
 
 For a tool with no hooks, and for a team that would rather not depend on
 one:

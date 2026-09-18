@@ -240,6 +240,35 @@ Canonical keys:
 
 `/teamflow:doctor` reports the transport, the service account and its credits, the configured tracker, the resolved issue source and whether that tracker's bundled MCP server is visible; authenticate it once through `/mcp`.
 
+### Trackers
+
+Two sources write to a ticket and the plugin owns one of them. The skill reports what happens to the **code** — edits, tests, audits, merges, builds, deploys, verification — which is every stage from `LOCAL_DEV` through `DEV_VERIFIED` plus `LOCAL_REWORK` and `DEV_REWORK`. A tracker webhook reports what happens to the **issue**: that it exists, who has it, which column it sits in, whether it is done.
+
+What the webhooks contribute, and nothing beyond it:
+
+- **existence** — an issue created this morning sits in the backlog column (`JIRA`) before anybody opens an editor, and the real ticket replaces it at the first report; a cancelled or deleted issue leaves the columns and keeps its history;
+- **completion** — the tracker's "done" moves the ticket to `READY_PROD` and sets `deliveredAt`, and a reopen after done is drawn as `DEV_REWORK` with `reworkFrom: READY_PROD`;
+- **metadata** — title, assignee, status name and labels, which overwrite whatever the plugin guessed from a branch name. The status name is a tooltip, never a column: "Ready for QA" is one team's name for another team's stage.
+
+What a tracker event may never do is set a delivery stage the skill owns. It never moves a ticket backwards or sideways inside `LOCAL_DEV`..`DEV_VERIFIED`, so Jira saying "In Progress" about a ticket the skill already has in `DEV_TEST` is Jira being behind, and the ticket does not move. Nothing is inferred from silence either: no event, no change.
+
+No hook changes when a tracker is connected, and nothing stops when one breaks. With every connection dead the board draws exactly what the plugin and the background reporters report, which is what it drew before trackers existed. A connection is made once per organisation by an owner on the members page, not in this plugin's config.
+
+`teamflow status` prints one line per connection under `trackerConnections` — the provider, its project, team or repository filter, when it last delivered and its last error, which are the four things anybody asks when issues are not appearing:
+
+```text
+teamflow status
+  trackerConnections:
+    jira · filter DAEMON · last delivery 2026-09-17T11:00:00Z
+    github · filter macleodlabs/teamflow · nothing delivered yet
+```
+
+`none connected` is an organisation that has connected nothing. `not listed: <reason>` is an answer that was not a listing — no service credential, a credential that is not an org account, or a deployment that does not run the trackers module — and it is deliberately not reported as "none connected", because a team cannot be warned about a tracker they were never able to connect.
+
+`teamflow doctor` prints the same lines and adds `trackerWarnings`: one when this repository reports keys from a provider the organisation has not connected (the common case, whose only symptom is issues that never appear), one when the last report's tracker is another unconnected provider, and one per connection whose last delivery failed. Reporting still works in every one of those cases; what is missing is the issue's half of the picture.
+
+`docs/TRACKERS.md` is the reference: who decides what, the mapping table both sides test, the Jira, Linear and GitHub setup walkthroughs, and the order to check things in when a ticket does not appear.
+
 ## Ticket binding confidence
 
 | Source | Confidence |
@@ -252,6 +281,29 @@ Canonical keys:
 | Latest commit | 80 |
 
 Substantive work makes an automatic binding sticky. A manual bind can override it.
+
+### Title and status from a tool result
+
+A bound ticket gets its name on the board without a hand-written report.
+When the agent looks the issue up — through the Atlassian MCP, the
+Linear MCP, a GitHub MCP tool or `gh issue view` — that result is put
+through one seam, `enrichFromToolResult(tracker, result)` in
+`plugin/scripts/core.mjs`, with one parser per tracker:
+
+| Tracker | Read from | Title | Status |
+| --- | --- | --- | --- |
+| Jira | Atlassian MCP result | `summary`, or `title` | `status`, plain or wrapped in `{ name }` |
+| Linear | Linear MCP result | `title` | `state`, plain or wrapped in `{ name }` |
+| GitHub | GitHub MCP result, or `gh issue view` output | `title` | `state` |
+
+Only the bound ticket is enriched. A result naming another key, or
+another repository's `#17`, is dropped: a wrong title on the board is
+worse than no title. Title is cut at 180 characters and status at 80.
+
+The reporting contract is the hard limit. Key, link, short title and
+short status, and nothing else — no description, no comment, no body.
+The `gh issue view` parser stops at the `--` separator for exactly that
+reason, because everything after it is the issue body.
 
 ## Audit semantics
 
@@ -473,6 +525,38 @@ files as the Claude Code CLI, so installing the plugin there gives it
 the full automatic path. The chat side runs no local command and has no
 hooks, which is why `--for claude-desktop` writes a rules document to
 paste into a Project rather than a config file.
+
+### Windows and PowerShell
+
+Every hook config is committed, so the repository is shared between the
+Mac and the Windows halves of a team and both have to report. A
+`#!/bin/sh` shim run by PowerShell reports from neither, so the install
+writes a second shim, `.teamflow/hooks/<tool>.ps1`, for each tool whose
+vendor documents a Windows form. It calls the same entry, `teamflow hook
+--for <tool>` through `npx` when `teamflow` is not on PATH, and exits 0
+whatever happens, exactly like the POSIX one.
+
+| Tool | Windows form | What the config says |
+| --- | --- | --- |
+| Copilot CLI | a `powershell` field beside `command` | one entry naming both shims |
+| Windsurf | a `powershell` field beside `command` | one entry naming both shims |
+| Cursor | none; `command` runs through the platform shell | two entries per event, one shim each |
+| Cline, Codex CLI, Gemini CLI, Junie | none documented | POSIX shim only |
+
+Cursor is the awkward one. It has no Windows field, and a single command
+string cannot be right for both `sh` and PowerShell, so both shims are
+registered and the platform decides which one it can run. The `.ps1`
+starts with `#!/usr/bin/env true`, which is not a mistake: a POSIX shell
+handed that file execs `true`, ignores the PowerShell below it and exits
+0 silently, so on macOS and Linux exactly one of the two entries reports
+and the board never double-counts. PowerShell reads the same line as a
+comment. The reverse — PowerShell handed the `.sh` — logs one ignorable
+"not recognized" per tool call and reports nothing, because nothing in a
+`.sh` file can be made invisible to PowerShell.
+
+Nothing is invented for the four tools whose vendors document no Windows
+form. A field their parser rejects would be worse than none, and the git
+fallback below covers a Windows developer using one of them.
 
 ### The git fallback
 

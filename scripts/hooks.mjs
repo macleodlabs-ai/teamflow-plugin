@@ -143,8 +143,8 @@ export function gitHooksInstalled(root = process.cwd()) {
 // question of where `teamflow` actually lives has one answer that has
 // to be re-asked on every machine the repository is checked out on.
 // One small script answers both, and the hook configs stay trivial.
-export function shimPath(root, tool) {
-  return path.join(root, '.teamflow', 'hooks', `${tool}.sh`);
+export function shimPath(root, tool, ext = 'sh') {
+  return path.join(root, '.teamflow', 'hooks', `${tool}.${ext}`);
 }
 
 // What goes in the config file, as opposed to where the file is
@@ -154,8 +154,8 @@ export function shimPath(root, tool) {
 // a hook command as relative to the project root — Cursor's own example
 // is `.cursor/hooks/format.sh` — and Gemini CLI names the root
 // explicitly as $GEMINI_PROJECT_DIR.
-export function shimRef(tool) {
-  const relative = `.teamflow/hooks/${tool}.sh`;
+export function shimRef(tool, ext = 'sh') {
+  const relative = `.teamflow/hooks/${tool}.${ext}`;
   return tool === 'gemini' ? `$GEMINI_PROJECT_DIR/${relative}` : relative;
 }
 
@@ -176,13 +176,70 @@ exit 0
 `;
 }
 
+// The same shim for a Windows developer, because these repositories are
+// shared. Cursor, Copilot CLI and Windsurf each document a Windows or
+// PowerShell form of a hook command; the other four do not, and nothing
+// is written for them rather than guessing at a field their parser
+// would reject.
+//
+// The shebang line is deliberate and is not dead weight. Cursor has no
+// Windows field: its `command` runs through whatever shell the platform
+// gives it, so both shims are named in `.cursor/hooks.json` and each
+// platform hands one of them to the wrong interpreter. A POSIX shell
+// handed this file execs `/usr/bin/env true`, which ignores the body and
+// exits 0, so the wrong shim is silent on macOS and Linux instead of a
+// page of syntax errors. PowerShell reads the same line as a comment.
+export const WINDOWS_TOOLS = new Set(['cursor', 'copilot', 'windsurf']);
+
+export function powershellShim(tool) {
+  return `#!/usr/bin/env true
+# TeamFlow delivery reporting for ${tool} on Windows. Written by
+# \`teamflow hooks install --for ${tool}\`; delete this file to stop.
+#
+# The shebang above is what makes this file safe for a POSIX shell to
+# run: it execs \`true\`, which ignores everything below. PowerShell
+# reads that line as a comment and runs the rest.
+#
+# Observability, never a gate. This script exits 0 whatever happens, so
+# a TeamFlow outage, a missing node or an unreachable network can never
+# block an edit, a command or a turn.
+try {
+  if (Get-Command teamflow -ErrorAction SilentlyContinue) {
+    teamflow hook --for ${tool}
+  } else {
+    npx -y ${PACKAGE} hook --for ${tool}
+  }
+} catch { }
+exit 0
+`;
+}
+
+// Both shims for a tool that has a Windows form, as install targets.
+function shims(root, tool) {
+  const targets = [{ file: shimPath(root, tool), script: shimScript(tool) }];
+  if (WINDOWS_TOOLS.has(tool)) {
+    targets.push({ file: shimPath(root, tool, 'ps1'), script: powershellShim(tool) });
+  }
+  return targets;
+}
+
 // One entry as each tool spells it. Cursor and Windsurf take a bare
 // `command`; VS Code's Copilot, Copilot CLI and Gemini CLI take an
 // object with `type: "command"`.
+//
+// Copilot CLI and Windsurf both document a sibling `powershell` field
+// carrying the Windows form of the same hook, so an entry for either of
+// them names both shims and the tool picks. Cursor documents no such
+// field — its `command` goes to the platform shell — so Cursor gets two
+// entries per event instead and the shims sort themselves out; see
+// powershellShim().
 const entry = {
-  bare: (command) => ({ command }),
+  bare: (command, extra = {}) => ({ command, ...extra }),
   typed: (command, extra = {}) => ({ type: 'command', command, ...extra }),
 };
+
+// The Windows half of an entry, for the tools that name a field for it.
+const windows = (tool) => ({ powershell: shimRef(tool, 'ps1') });
 
 // The hook configuration each tool reads, from the vendor documentation
 // read on 2026-09-17. The URLs are in tools.mjs beside each record.
@@ -193,22 +250,26 @@ const entry = {
 // after-event at all; see its adapter for what that costs.
 export const HOOK_SPECS = {
   cursor: (root) => {
-    const sh = shimPath(root, 'cursor');
-    const ref = shimRef('cursor');
+    // Two entries per event, one shim each. Cursor runs `command`
+    // through the platform shell, so a repository shared between a Mac
+    // and a Windows machine cannot name one file and be right on both.
+    // On POSIX the .ps1 execs `true` and reports nothing, so exactly one
+    // of the two ever reports and the board never double-counts.
+    const both = () => [entry.bare(shimRef('cursor')), entry.bare(shimRef('cursor', 'ps1'))];
     return {
       covers: 'file edits, finished tool calls, finished shell commands and turn end',
       targets: [
-        { file: sh, script: shimScript('cursor') },
+        ...shims(root, 'cursor'),
         {
           file: path.join(root, '.cursor', 'hooks.json'),
           json: {
             version: 1,
             hooks: {
-              afterFileEdit: [entry.bare(ref)],
-              postToolUse: [entry.bare(ref)],
-              postToolUseFailure: [entry.bare(ref)],
-              afterShellExecution: [entry.bare(ref)],
-              stop: [entry.bare(ref)],
+              afterFileEdit: both(),
+              postToolUse: both(),
+              postToolUseFailure: both(),
+              afterShellExecution: both(),
+              stop: both(),
             },
           },
         },
@@ -223,22 +284,25 @@ export const HOOK_SPECS = {
   // that both of them read is what makes a single install cover the
   // IDE and the CLI.
   copilot: (root) => {
-    const sh = shimPath(root, 'copilot');
     const ref = shimRef('copilot');
+    // `powershell` is Copilot CLI's own field for the Windows form of a
+    // hook. VS Code's half of this file does not document it and ignores
+    // the extra key, so one entry shape serves both dialects.
+    const hook = () => [entry.typed(ref, windows('copilot'))];
     return {
       covers: 'finished tool calls and turn end, in VS Code and in Copilot CLI',
       targets: [
-        { file: sh, script: shimScript('copilot') },
+        ...shims(root, 'copilot'),
         {
           file: path.join(root, '.github', 'hooks', 'teamflow.json'),
           json: {
             version: 1,
             hooks: {
-              PostToolUse: [entry.typed(ref)],
-              Stop: [entry.typed(ref)],
-              postToolUse: [entry.typed(ref)],
-              postToolUseFailure: [entry.typed(ref)],
-              agentStop: [entry.typed(ref)],
+              PostToolUse: hook(),
+              Stop: hook(),
+              postToolUse: hook(),
+              postToolUseFailure: hook(),
+              agentStop: hook(),
             },
           },
         },
@@ -247,19 +311,19 @@ export const HOOK_SPECS = {
   },
 
   windsurf: (root) => {
-    const sh = shimPath(root, 'windsurf');
     const ref = shimRef('windsurf');
+    const hook = () => [entry.bare(ref, windows('windsurf'))];
     return {
       covers: 'finished edits, finished commands and Cascade response end',
       targets: [
-        { file: sh, script: shimScript('windsurf') },
+        ...shims(root, 'windsurf'),
         {
           file: path.join(root, '.windsurf', 'hooks.json'),
           json: {
             hooks: {
-              post_write_code: [entry.bare(ref)],
-              post_run_command: [entry.bare(ref)],
-              post_cascade_response: [entry.bare(ref)],
+              post_write_code: hook(),
+              post_run_command: hook(),
+              post_cascade_response: hook(),
             },
           },
         },
@@ -282,13 +346,12 @@ export const HOOK_SPECS = {
   // so this is the one config here that would be recognisable to
   // somebody who only knows plugin/hooks/hooks.json.
   codex: (root) => {
-    const sh = shimPath(root, 'codex');
     const ref = shimRef('codex');
     const matched = (matcher) => ({ matcher, hooks: [entry.typed(ref)] });
     return {
       covers: 'finished tool calls and turn end',
       targets: [
-        { file: sh, script: shimScript('codex') },
+        ...shims(root, 'codex'),
         {
           file: path.join(root, '.codex', 'hooks.json'),
           json: { hooks: { PostToolUse: [matched('*')], Stop: [{ hooks: [entry.typed(ref)] }] } },
@@ -322,13 +385,12 @@ export const HOOK_SPECS = {
   },
 
   gemini: (root) => {
-    const sh = shimPath(root, 'gemini');
     const ref = shimRef('gemini');
     const hook = { hooks: [entry.typed(ref, { name: 'teamflow', timeout: 10000 })] };
     return {
       covers: 'finished tool calls and turn end',
       targets: [
-        { file: sh, script: shimScript('gemini') },
+        ...shims(root, 'gemini'),
         {
           file: path.join(root, '.gemini', 'settings.json'),
           json: { hooks: { AfterTool: [hook], AfterAgent: [hook] } },

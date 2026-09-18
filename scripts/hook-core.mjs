@@ -14,7 +14,7 @@ import {
   chooseBinding,
   classifyTool,
   detectCandidates,
-  enrichFromAtlassian,
+  enrichBinding,
   loadConfig,
   publishState,
   readJson,
@@ -83,7 +83,7 @@ export async function handleEvent(input = {}) {
   const { candidates, info } = detectCandidates(input, cwd, state, config);
   state.binding = chooseBinding(state, candidates);
   const justBound = Boolean(state.binding?.key && state.binding.key !== beforeKey);
-  state = enrichFromAtlassian(state, input, config);
+  state = enrichBinding(state, input);
 
   if (event === 'SubagentStart') state.subagentCount = (state.subagentCount || 0) + 1;
   if (event === 'SubagentStop') state.subagentCount = Math.max(0, (state.subagentCount || 0) - 1);
