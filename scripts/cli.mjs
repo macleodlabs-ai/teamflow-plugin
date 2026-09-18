@@ -190,7 +190,7 @@ async function bind(argument = args.join(' ')) {
   });
   const state = latestSessionForCwd(cwd);
   if (state) {
-    state.binding = { key: ref.key, tracker: ref.tracker, repo: ref.repo, workspace: ref.workspace, confidence: 1000, source: 'manual', sticky: true };
+    state.binding = { key: ref.key, tracker: ref.tracker, repo: ref.repo, workspace: ref.workspace, confidence: 1000, source: 'manual', sticky: true, boundAt: new Date().toISOString() };
     if (found?.title || found?.status) {
       state.jira = { ...(state.jira || {}), key: ref.key, title: found.title, status: found.status };
     }

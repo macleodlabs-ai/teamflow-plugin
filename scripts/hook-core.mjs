@@ -18,6 +18,7 @@ import {
   loadConfig,
   publishState,
   readJson,
+  repositoryRoot,
   saveSession,
   sessionPath,
   tenantId,
@@ -73,10 +74,25 @@ export function claudeContext(event, state, justBound) {
 // decide what, if anything, to say on stdout.
 export async function handleEvent(input = {}) {
   const event = input.hook_event_name || 'Unknown';
-  const cwd = input.cwd || process.cwd();
   const sessionId = input.session_id || 'unknown-session';
+  const given = input.cwd || process.cwd();
+  const saved = readJson(sessionPath(sessionId));
+
+  // The repository root, never the directory the tool happened to run
+  // the hook from: the project id, the binding, `.teamflow.json` and
+  // the report's repository and branch are all derived from this one
+  // value, and a subdirectory in any of them is a ticket that stops
+  // moving. SessionEnd is the exception, and only because its 1.5s
+  // budget may not be spent on git: every earlier event in the session
+  // resolved the root and saved it, so shutdown reuses that answer and
+  // resolves only when there is no session on disk to reuse.
+  const cwd = event === 'SessionEnd' && saved?.cwd ? saved.cwd : repositoryRoot(given);
+  // The resolved root travels on the event, so anything reading the
+  // event rather than this function's `cwd` sees the same directory.
+  const resolved = { ...input, cwd };
+
   const config = loadConfig(cwd);
-  const previous = readJson(sessionPath(sessionId), newSession(sessionId, cwd));
+  const previous = saved ?? newSession(sessionId, cwd);
   let state = { ...previous, sessionId, cwd, ended: false, tenantId: tenantId(config) };
 
   // SessionEnd has a 1.5s default lifecycle budget. Keep it local and fast:
@@ -90,15 +106,15 @@ export async function handleEvent(input = {}) {
   }
 
   const beforeKey = state.binding?.key;
-  const { candidates, info } = detectCandidates(input, cwd, state, config);
+  const { candidates, info } = detectCandidates(resolved, cwd, state, config);
   state.binding = chooseBinding(state, candidates);
   const justBound = Boolean(state.binding?.key && state.binding.key !== beforeKey);
-  state = enrichBinding(state, input);
+  state = enrichBinding(state, resolved);
 
   if (event === 'SubagentStart') state.subagentCount = (state.subagentCount || 0) + 1;
   if (event === 'SubagentStop') state.subagentCount = Math.max(0, (state.subagentCount || 0) - 1);
 
-  const transition = classifyTool(input, state, config);
+  const transition = classifyTool(resolved, state, config);
   state = applyTransition(state, transition);
 
   if (event === 'SessionStart' && state.binding?.key) {

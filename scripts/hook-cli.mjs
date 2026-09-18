@@ -27,7 +27,7 @@
 
 import { ADAPTERS, PASSIVE_STDOUT } from './adapters.mjs';
 import { failOpen, handleEvent, readStdin } from './hook-core.mjs';
-import { loadConfig, safeExec } from './core.mjs';
+import { loadConfig, repositoryRoot, safeExec } from './core.mjs';
 
 export function parse(argv) {
   const options = {};
@@ -77,13 +77,17 @@ export async function run(argv = process.argv.slice(2), { cwd = process.cwd() } 
   if (passive) process.stdout.write(passive);
 
   const payload = await readStdin();
-  const config = loadConfig(cwd);
-  const context = { cwd, event: options.event, config };
-  if (tool === 'git' && options.event === 'pre-push') context.test = runTestCommand(config, cwd);
+  // The root, not wherever the shim was run from. These tools promise
+  // nothing about the working directory they hand a hook, and
+  // `.teamflow.json`, the project id and the binding all hang off it.
+  const root = repositoryRoot(cwd);
+  const config = loadConfig(root);
+  const context = { cwd: root, event: options.event, config };
+  if (tool === 'git' && options.event === 'pre-push') context.test = runTestCommand(config, root);
 
   const event = adapter(payload, context);
   if (!event) return;
-  await handleEvent({ cwd, ...event });
+  await handleEvent({ cwd: root, ...event });
 }
 
 export async function main(argv = process.argv.slice(2)) {

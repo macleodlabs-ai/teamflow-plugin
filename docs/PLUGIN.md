@@ -755,6 +755,23 @@ it: it lives at `~/.junie/teamflow-hook.sh`, where two levels up is the
 home directory's parent, and Junie's payload carries `cwd` and
 `project_path` to key the report on instead.
 
+The shim can only answer for the directory the *process* starts in, and
+an event that carries its own `cwd` overrides it — Cursor's
+`postToolUse` and Copilot's both name the edited file's directory, and
+Claude Code's own events name the subfolder a session was started in. So
+every hook entry resolves whatever directory it ends up with to the
+repository root before anything is derived from it: `repositoryRoot` in
+`plugin/scripts/core.mjs` runs `git rev-parse --show-toplevel`, cached
+per directory for the life of the process, and the root it returns is
+what the project id, the binding file, `.teamflow.json` and the report's
+repository and branch are all read from. Outside a repository, and on a
+machine with no git, the directory is its own answer: neither is an
+error, and a reporter that treated them as one would fail closed. The
+one event that does not ask is `SessionEnd`, which has a 1.5s budget and
+reuses the root the session already recorded. `teamflow bind` and
+`teamflow status` resolve the same way, so binding in a package
+directory and reporting from the root still name one project.
+
 ### What still needs a real run
 
 Everything above is from documentation or from a tool's own source. None
@@ -793,8 +810,10 @@ What to watch for per tool, beyond that:
   the check is that exactly one report lands per tool call and not two.
 - **Any of them, from a subdirectory**. Open the tool on a
   subdirectory of the repository rather than its root, edit a file, and
-  confirm `teamflow status` still names the repository. That is what
-  the shim's `cd` is for.
+  confirm `teamflow status` still names the repository. The shim's `cd`
+  and `repositoryRoot` cover the two halves of this between them, and a
+  failure here says which: a report against the subdirectory means the
+  resolver did not run, none at all means the shim did not.
 
 ### The git fallback
 

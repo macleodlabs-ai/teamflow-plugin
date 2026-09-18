@@ -221,8 +221,12 @@ export function projectId(cwd) {
   return crypto.createHash('sha256').update(path.resolve(cwd)).digest('hex').slice(0, 16);
 }
 
+// One binding per repository, not one per directory somebody happened
+// to be standing in. `teamflow bind` run in a package and a hook event
+// fired from that package's directory have to name the same file as the
+// root does, or the binding is written where nothing will look for it.
 export function projectBindingPath(cwd, config = {}) {
-  return path.join(dataDir(), 'bindings', tenantId(config), `${projectId(cwd)}.json`);
+  return path.join(dataDir(), 'bindings', tenantId(config), `${projectId(repositoryRoot(cwd))}.json`);
 }
 
 export function sessionPath(sessionId) {
@@ -277,6 +281,37 @@ export function tenantPath(config, relativePath) {
 // without a test having to build a repository in that state.
 function git(cwd, args) {
   return safeExec(process.env.TEAMFLOW_GIT_BIN || 'git', ['-C', cwd, ...args], { cwd, timeout: 2000 });
+}
+
+// Where the work actually lives, whatever directory an event names.
+//
+// `projectId` hashes a path, so a subdirectory is a different project:
+// a different binding, and a ticket that stops moving with nothing in
+// any log to say why. Several events cannot avoid naming one — Cursor's
+// afterFileEdit and Copilot's carry the file's directory, and Claude
+// Code's own carry a subfolder whenever the session was started in one
+// — so every identity derived from a path goes through this first.
+//
+// Cached per directory for the life of the process, because one hook
+// run asks more than once and a hook has milliseconds. Outside a
+// repository, and on a machine with no git, the directory is its own
+// answer: both are ordinary, neither is an error, and a reporter that
+// threw on either would be a reporter that failed closed.
+const REPOSITORY_ROOTS = new Map();
+
+export function repositoryRoot(cwd) {
+  const start = path.resolve(cwd || process.cwd());
+  const cached = REPOSITORY_ROOTS.get(start);
+  if (cached) return cached;
+  let root = start;
+  try {
+    const found = git(start, ['rev-parse', '--show-toplevel']);
+    if (found.ok && found.stdout) root = path.resolve(found.stdout);
+  } catch {
+    // safeExec does not throw, and nothing here may depend on that.
+  }
+  REPOSITORY_ROOTS.set(start, root);
+  return root;
 }
 
 export function gitInfo(cwd) {
@@ -451,6 +486,7 @@ export function candidate(key, confidence, source, ref = {}) {
   const normalized = normalizeIssueKey(key);
   if (!normalized) return undefined;
   const out = { key: normalized, confidence, source, tracker: ref.tracker || 'jira' };
+  if (ref.boundAt) out.boundAt = ref.boundAt;
   if (ref.repo) out.repo = ref.repo;
   if (ref.workspace) out.workspace = ref.workspace;
   return out;
@@ -468,7 +504,10 @@ export function issueCandidates(input = {}, info = {}, manual = undefined, confi
   };
 
   if (manual?.jiraKey) {
-    add({ key: manual.jiraKey, tracker: manual.tracker || tracker, repo: manual.repo, workspace: manual.workspace }, 1000, 'manual');
+    // boundAt travels with the candidate: it is how a `teamflow bind` run
+    // after this session started outranks the sticky binding the session
+    // already holds (see chooseBinding).
+    add({ key: manual.jiraKey, tracker: manual.tracker || tracker, repo: manual.repo, workspace: manual.workspace, boundAt: manual.boundAt }, 1000, 'manual');
   }
   add(detectIssueRef(input.prompt, config, info), 100, 'prompt');
   add(detectIssueRef(input.task_subject, config, info), 98, 'task');
@@ -513,6 +552,14 @@ export function chooseBinding(state, candidates) {
   if (!state.binding) return { ...best, sticky: false };
   if (state.binding.key === best.key) {
     return { ...state.binding, confidence: Math.max(state.binding.confidence || 0, best.confidence), source: best.confidence > (state.binding.confidence || 0) ? best.source : state.binding.source };
+  }
+  // An explicit `teamflow bind` made after this session's binding was
+  // chosen is the newest word from a person, and it wins over a sticky
+  // binding of equal confidence. Without this a session bound at start
+  // kept its first ticket all day while every later bind landed only in
+  // the project file: a day of work reported under one stale key.
+  if (best.source === 'manual' && (best.boundAt || '') > (state.binding.boundAt || '')) {
+    return { ...best, sticky: true };
   }
   if (state.binding.sticky && best.confidence < 1000) return state.binding;
   if (best.confidence > (state.binding.confidence || 0)) return { ...best, sticky: false };
@@ -1455,7 +1502,11 @@ export async function publishState(state, config, info, { force = false } = {}) 
   return { ok: Boolean(issueResult.ok && actorResult.ok), transport, issueResult, actorResult };
 }
 
+// Sessions record the repository root they were opened against, so the
+// question is asked in those terms too: `teamflow status` run three
+// directories down is still asking about the same session.
 export function latestSessionForCwd(cwd) {
+  cwd = repositoryRoot(cwd);
   const dir = path.join(dataDir(), 'sessions');
   if (!fs.existsSync(dir)) return undefined;
   const candidates = fs.readdirSync(dir)

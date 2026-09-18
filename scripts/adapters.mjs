@@ -24,7 +24,7 @@
 
 
 
-import { projectId } from './core.mjs';
+import { projectId, repositoryRoot } from './core.mjs';
 
 // A tool that has no session concept still needs a stable key, because
 // the session file is where the last published state lives and a fresh
@@ -32,7 +32,10 @@ import { projectId } from './core.mjs';
 // repository per tool is the right grain.
 export function sessionFor(tool, cwd, given) {
   if (given) return String(given).slice(0, 120);
-  return `${tool}-${projectId(cwd || process.cwd())}`;
+  // Per repository, which is why the root is resolved here too: an
+  // event naming a package directory would otherwise open a second
+  // session against the same work and republish the same stage forever.
+  return `${tool}-${projectId(repositoryRoot(cwd))}`;
 }
 
 // Claude Code's own names for the things every one of these tools has.
