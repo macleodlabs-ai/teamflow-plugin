@@ -2,6 +2,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import * as auth from './auth.mjs';
+import { claudeBinary } from './claude-bin.mjs';
 import {
   actor,
   credential,
@@ -220,13 +221,14 @@ async function sync() {
 }
 
 async function doctor() {
-  // TEAMFLOW_CLAUDE_BIN lets a test point this at a stub. A real
-  // `claude` started from a test with HOME redirected cannot find the
-  // login keychain, shows macOS's "a keychain cannot be found" dialog
-  // and writes a fallback credentials file into the developer's config
-  // directory; that happened.
-  const claudeBin = process.env.TEAMFLOW_CLAUDE_BIN || 'claude';
-  const claude = safeExec(claudeBin, ['mcp', 'list'], { cwd, timeout: 5000 });
+  // The real `claude` is only ever started through claude-bin.mjs, which
+  // refuses under a test runner or a redirected HOME (the keychain dialog
+  // and the stray credentials file, twice). When it refuses, the probe is
+  // reported as skipped with the reason rather than faked either way.
+  const { bin: claudeBin, reason: claudeSkipped } = claudeBinary();
+  const claude = claudeBin
+    ? safeExec(claudeBin, ['mcp', 'list'], { cwd, timeout: 5000 })
+    : { ok: false, stdout: '', stderr: '' };
   const tracker = trackerOf(config);
   const server = TRACKER_MCP[tracker];
   const mcpVisible = new RegExp(server, 'i').test(claude.stdout + claude.stderr);
@@ -238,6 +240,7 @@ async function doctor() {
   const transport = transportOf(config);
 
   const report = {
+    claudeProbe: claudeBin ? 'ran' : `skipped: ${claudeSkipped}`,
     node: process.version,
     gitRepository: info.repository || 'not detected',
     transport,
