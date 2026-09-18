@@ -54,7 +54,7 @@ Purge is never implicit.
 
 ## Signing in
 
-Onboarding is two steps: install the plugin, then run `/teamflow:login` once.
+The dashboard needs no plugin: open it and sign in with your email (Google, GitHub, a passkey or an emailed link). Connecting Claude Code is three commands inside a session: `/plugin marketplace add macleodlabs-ai/teamflow-plugin`, `/plugin install teamflow@macleodlabs`, then `/teamflow:login` once. An in-session install is active immediately on Claude Code 2.1.221 and later (older versions say to run `/reload-plugins`); a terminal install with `claude plugin install` needs `/reload-plugins` in the open session or a new one, which is what its "Restart to apply changes" means. The command exists only in Claude Code, the terminal tool: the Claude app and the website do not have it.
 
 ```text
 /teamflow:login
@@ -244,13 +244,29 @@ Binding is also where a title is learned: see below.
 
 `/teamflow:doctor` reports the transport, the service account and its credits, the configured tracker, the resolved issue source and whether that tracker's bundled MCP server is visible; authenticate it once through `/mcp`.
 
+### Picking the next ticket
+
+A session that never names an issue reports nothing, and nobody notices until the work is missing from the board. `/teamflow:next` (the `next` skill, `teamflow next` from any shell) is the other end of that: it takes the top-priority open ticket, assigns it in the tracker and binds it, so the hooks attribute everything after it. On `SessionStart` and `UserPromptSubmit` a session with nothing bound is told to run it, in one sentence.
+
+The rule is the same shape everywhere — the tracker's own priority, then the milestone or sprint, then age — and the pick is the first issue in that order that is **unassigned or already the user's**. An issue somebody else holds is skipped, so two people running it a minute apart get two different tickets.
+
+| Tracker | Order | Read through | Assigned with |
+| --- | --- | --- | --- |
+| GitHub | `priority:*` labels (`p0`/`p1`/`p2`, or `high`/`medium`/`low`), then an issue with a milestone before one without and the earlier due date first, then the oldest issue | `gh issue list --json number,title,labels,assignees,milestone,createdAt --state open` | `gh issue edit <n> --add-assignee @me` |
+| Linear | the `priority` field (Urgent, High, Medium, Low, then No priority), then the oldest created date | the Linear MCP server's `list_issues` | `save_issue` with assignee `me` |
+| Jira | the priority field (Highest down to Lowest), then the oldest created date | the Atlassian MCP server | the MCP server's assign call |
+
+`teamflow next` does the GitHub half itself, because `gh` is a credential the developer already has. For Linear and Jira the CLI has none and will not ask for one: adding tracker API tokens to the plugin config would put a second credential on every machine to answer a question the session's own MCP servers already answer, so the command prints the workflow to run instead. `teamflow next --dry-run` prints the ordering rule, the ordered list and the pick, and assigns and binds nothing.
+
+The pick is always stated with its reason on one line — the key, the title and the fields the order used — because a command that assigns somebody a ticket has to be arguable with.
+
 ### Trackers
 
 Two sources write to a ticket and the plugin owns one of them. The skill reports what happens to the **code** — edits, tests, audits, merges, builds, deploys, verification — which is every stage from `LOCAL_DEV` through `DEV_VERIFIED` plus `LOCAL_REWORK` and `DEV_REWORK`. A tracker webhook reports what happens to the **issue**: that it exists, who has it, which column it sits in, whether it is done.
 
 What the webhooks contribute, and nothing beyond it:
 
-- **existence** — an issue created this morning sits in the backlog column (`JIRA`) before anybody opens an editor, and the real ticket replaces it at the first report; a cancelled or deleted issue leaves the columns and keeps its history;
+- **existence** — an issue created this morning sits in the backlog column (`BACKLOG`) before anybody opens an editor, and the real ticket replaces it at the first report; a cancelled or deleted issue leaves the columns and keeps its history;
 - **completion** — the tracker's "done" moves the ticket to `READY_PROD` and sets `deliveredAt`, and a reopen after done is drawn as `DEV_REWORK` with `reworkFrom: READY_PROD`;
 - **metadata** — title, assignee, status name and labels, which overwrite whatever the plugin guessed from a branch name. The status name is a tooltip, never a column: "Ready for QA" is one team's name for another team's stage.
 
@@ -267,7 +283,7 @@ teamflow status
     github · filter macleodlabs/teamflow · nothing delivered yet
 ```
 
-`none connected` is an organisation that has connected nothing. `not listed: <reason>` is an answer that was not a listing — no service credential, a credential that is not an org account, or a deployment that does not run the trackers module — and it is deliberately not reported as "none connected", because a team cannot be warned about a tracker they were never able to connect.
+`none connected` is an organisation that has connected nothing. `not listed: <reason>` is an answer that was not a listing — no service credential, a credential that is not an org account, or a deployment with no tracker connections enabled — and it is deliberately not reported as "none connected", because a team cannot be warned about a tracker they were never able to connect.
 
 `teamflow doctor` prints the same lines and adds `trackerWarnings`: one when this repository reports keys from a provider the organisation has not connected (the common case, whose only symptom is issues that never appear), one when the last report's tracker is another unconnected provider, and one per connection whose last delivery failed. Reporting still works in every one of those cases; what is missing is the issue's half of the picture.
 
@@ -469,7 +485,7 @@ Claude Code is running.
 
 | Subcommand | |
 | --- | --- |
-| `login`, `logout`, `status`, `bind`, `unbind`, `sync`, `doctor`, `repos` | the eight the plugin's skills wrap |
+| `login`, `logout`, `status`, `bind`, `next`, `unbind`, `sync`, `doctor`, `repos` | the nine the plugin's skills wrap |
 | `admin code` (`create`, `list`, `revoke`) | invite codes, for superadmins; the ninth skill wraps it |
 | `report` | one stage transition, from any shell |
 | `skills install --for <tool>` | put these skills in front of another agent |

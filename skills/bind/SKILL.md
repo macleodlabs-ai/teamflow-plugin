@@ -19,5 +19,7 @@ npx -y github:macleodlabs-ai/teamflow-plugin bind "$ARGUMENTS"
 
 Return only the command result. The command rejects anything else with the accepted forms.
 
+If no issue has been named and the session is about to start work, run the `next` skill instead: it picks the top-priority open ticket that is unassigned or already the user's, assigns it and binds it.
+
 Inside Claude Code the plugin is already on disk, so
 `node "${CLAUDE_PLUGIN_ROOT}/scripts/cli.mjs" bind` is the same command without the npx round trip. Use it when `CLAUDE_PLUGIN_ROOT` is set.

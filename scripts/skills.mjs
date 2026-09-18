@@ -140,7 +140,7 @@ Report at these moments, and only these:
 - tests pass against dev -> \`DEV_TEST\`; an audit passes against dev ->
   \`DEV_AUDIT\`; both passed -> \`DEV_VERIFIED\`
 
-The other stages are \`JIRA\`, \`CI_BUILD\`, \`DEV_REWORK\` and \`READY_PROD\`.
+The other stages are \`BACKLOG\`, \`CI_BUILD\`, \`DEV_REWORK\` and \`READY_PROD\`.
 Statuses are \`running\`, \`success\`, \`waiting\`, \`blocked\`, \`failed\` and
 \`idle\`. \`--issue\` takes \`DAEMON-142\`, \`ENG-42\`, \`#123\`, \`owner/repo#123\`
 or an issue URL.

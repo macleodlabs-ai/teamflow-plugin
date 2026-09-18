@@ -40,7 +40,7 @@ import {
 // Checked here rather than at the service so a typo costs a message
 // instead of a refused report and a puzzled developer.
 const STAGES = [
-  'JIRA', 'LOCAL_DEV', 'LOCAL_TEST', 'LOCAL_AUDIT', 'LOCAL_REWORK',
+  'BACKLOG', 'LOCAL_DEV', 'LOCAL_TEST', 'LOCAL_AUDIT', 'LOCAL_REWORK',
   'MERGE', 'CI_BUILD', 'DEPLOY_DEV', 'DEV_TEST', 'DEV_AUDIT',
   'DEV_REWORK', 'DEV_VERIFIED', 'READY_PROD',
 ];

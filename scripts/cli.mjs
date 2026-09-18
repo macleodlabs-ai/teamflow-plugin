@@ -38,6 +38,7 @@ const USAGE = `teamflow \u2014 delivery reporting for TeamFlow
   teamflow org [switch <id>]       which organisation this session reports to
   teamflow status                  who is signed in, what is bound, what was sent
   teamflow bind <issue> | unbind   name the ticket by hand, or stop
+  teamflow next [--dry-run]        take the top-priority open ticket and bind it
   teamflow sync                    publish the current state now
   teamflow doctor                  transport, account, credits, tracker MCP and connections
   teamflow repos [list|add]        register a repository for CI OIDC
@@ -165,8 +166,8 @@ async function status() {
 // Naming the ticket is also the moment to learn what it is called: the
 // title is resolved once here and cached on the binding, so the first
 // report already carries it and no later one has to ask again.
-async function bind() {
-  const ref = parseBindArgument(args.join(' '), config, info);
+async function bind(argument = args.join(' ')) {
+  const ref = parseBindArgument(argument, config, info);
   if (!ref) throw new Error(BIND_USAGE);
   const found = await resolveIssueTitle(ref, config, info);
   writeJson(projectBindingPath(cwd, config), {
@@ -434,6 +435,12 @@ try {
     process.exit(await main(args, { cwd, config }));
   } else if (command === 'status') await status();
   else if (command === 'bind') await bind();
+  else if (command === 'next') {
+    // Owns its exit code: 0 even when it could not read the tracker,
+    // because what it prints then is the workflow to run instead.
+    const { main } = await import('./next.mjs');
+    process.exit(await main(args, { cwd, config, info, bind }));
+  }
   else if (command === 'unbind') unbind();
   else if (command === 'sync') await sync();
   else if (command === 'doctor') await doctor();

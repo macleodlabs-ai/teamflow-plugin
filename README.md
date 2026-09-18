@@ -52,17 +52,18 @@ anything else" below.
 - `/teamflow:status`
 - `/teamflow:bind DAEMON-142` (also `ENG-42`, `#123`, `owner/repo#123` or an issue URL)
 - `/teamflow:unbind`
+- `/teamflow:next` (take the top-priority open ticket, assign it in the tracker and bind it; `--dry-run` shows the order and the pick and changes nothing)
 - `/teamflow:sync`
 - `/teamflow:doctor`
 - `/teamflow:admin-code` (superadmins only: `admin code create --email owner@acme.com --seats 5 --days 365`, `admin code list`, `admin code revoke TF-XXXX-XXXX`)
 
-All are manual-only skills.
+All are manual-only skills except `/teamflow:next`, which a session with no ticket is told to run before it starts editing.
 
 ## Configuration
 
 `~/.config/teamflow/config.json`:
 
-Install the plugin, then run `/teamflow:login` once. That is the whole of onboarding. Reporting then uses a one-hour access token refreshed in the background; only a revocable refresh token is stored, at `~/.config/teamflow/session.json`, and `/teamflow:logout` removes it. `/teamflow:doctor` shows who is signed in, the org and its remaining credits.
+Inside a Claude Code session: `/plugin marketplace add macleodlabs-ai/teamflow-plugin`, `/plugin install teamflow@macleodlabs`, then `/teamflow:login` once (a terminal install needs `/reload-plugins` in the open session). That is the whole of onboarding for Claude Code; the dashboard signs in on its own with your email. Reporting then uses a one-hour access token refreshed in the background; only a revocable refresh token is stored, at `~/.config/teamflow/session.json`, and `/teamflow:logout` removes it. `/teamflow:doctor` shows who is signed in, the org and its remaining credits.
 
 CI signs in per job with its GitHub Actions OIDC token and stores no secret. An owner registers each repository once with `/teamflow:repos add <owner/repo>`; until then that repository's exchange answers `repository_not_registered`.
 

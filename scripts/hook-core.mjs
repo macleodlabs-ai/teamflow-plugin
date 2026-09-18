@@ -31,7 +31,7 @@ export function newSession(sessionId, cwd) {
   return {
     sessionId,
     cwd,
-    stage: 'JIRA',
+    stage: 'BACKLOG',
     status: 'running',
     summary: 'Issue work detected',
     loopCount: 0,
@@ -43,9 +43,19 @@ export function newSession(sessionId, cwd) {
 // The additional context Claude Code injects into the turn. Only Claude
 // Code asks for it; every other tool gets nothing on stdout, because
 // stdout is how most of them are told to deny an action.
+// A session with no ticket reports nothing at all, and nobody notices
+// until the work is missing from the board. One sentence, because this
+// is prepended to every turn until a ticket is bound.
+const NO_ISSUE = 'TeamFlow: no issue is bound — run /teamflow:next '
+  + '(the teamflow-next skill) to take the top-priority open ticket and bind it before editing.';
+
 export function claudeContext(event, state, justBound) {
   if (!FAST.includes(event)) return undefined;
-  if (!state.binding?.key) return undefined;
+  if (!state.binding?.key) {
+    return JSON.stringify({
+      hookSpecificOutput: { hookEventName: event, additionalContext: NO_ISSUE },
+    });
+  }
   const tracker = state.binding.tracker || 'jira';
   const context = [
     `TeamFlow: working on ${tracker} issue ${state.binding.key}.`,
