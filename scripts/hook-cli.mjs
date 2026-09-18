@@ -87,7 +87,10 @@ export async function run(argv = process.argv.slice(2), { cwd = process.cwd() } 
 
   const event = adapter(payload, context);
   if (!event) return;
-  await handleEvent({ cwd: root, ...event });
+  // Which tool this is, so the report can name it (MACLEOD-532). After the
+  // spread rather than before: the adapter translates the tool's payload and
+  // has no business deciding what the tool is called.
+  await handleEvent({ cwd: root, ...event, reporter_tool: tool });
 }
 
 export async function main(argv = process.argv.slice(2)) {

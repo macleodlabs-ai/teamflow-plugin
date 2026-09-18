@@ -18,6 +18,7 @@ import {
   loadConfig,
   publishState,
   readJson,
+  reporterInfo,
   repositoryRoot,
   saveSession,
   sessionPath,
@@ -93,7 +94,17 @@ export async function handleEvent(input = {}) {
 
   const config = loadConfig(cwd);
   const previous = saved ?? newSession(sessionId, cwd);
-  let state = { ...previous, sessionId, cwd, ended: false, tenantId: tenantId(config) };
+  // What is reporting (MACLEOD-532). `reporter_tool` is set by hook-cli.mjs
+  // from `--for`; Claude Code's own entry passes nothing, because its hook is
+  // the one this plugin ships and there is no ambiguity about what ran it.
+  let state = {
+    ...previous,
+    sessionId,
+    cwd,
+    ended: false,
+    tenantId: tenantId(config),
+    reporter: reporterInfo(input.reporter_tool),
+  };
 
   // SessionEnd has a 1.5s default lifecycle budget. Keep it local and fast:
   // no git inspection, issue detection or S3 calls during shutdown.

@@ -8,10 +8,12 @@ import {
   credential,
   credentialKind,
   dataDir,
+  dataDirWritable,
   fetchAccount,
   gitInfo,
   latestSessionForCwd,
   loadConfig,
+  localBindingPath,
   parseBindArgument,
   projectBindingPath,
   publishState,
@@ -24,6 +26,7 @@ import {
   safeExec,
   saveSession,
   writeJson,
+  writeLocalBinding,
 } from './core.mjs';
 
 // Two subcommands live in their own modules because they are the two a
@@ -38,7 +41,9 @@ const USAGE = `teamflow \u2014 delivery reporting for TeamFlow
   teamflow logout                  remove the session
   teamflow org [switch <id>]       which organisation this session reports to
   teamflow status                  who is signed in, what is bound, what was sent
-  teamflow bind <issue> | unbind   name the ticket by hand, or stop
+  teamflow bind <issue> [--local] | unbind
+                                   name the ticket by hand, or stop; --local writes
+                                   the binding inside the repository, for a worktree
   teamflow next [--dry-run]        take the top-priority open ticket and bind it
   teamflow sync                    publish the current state now
   teamflow doctor                  transport, account, credits, tracker MCP and connections
@@ -55,7 +60,7 @@ const USAGE = `teamflow \u2014 delivery reporting for TeamFlow
 \`teamflow report --help\`, \`teamflow skills --help\`, \`teamflow hooks --help\`
 and \`teamflow admin code --help\` list their own flags.`;
 
-const BIND_USAGE = 'Usage: /teamflow:bind <issue>. Accepted: DAEMON-142, ENG-42, #123, owner/repo#123, or a Jira/Linear/GitHub issue URL. A bare #123 needs githubRepo configured or a GitHub origin remote.';
+const BIND_USAGE = 'Usage: /teamflow:bind <issue> [--local]. Accepted: DAEMON-142, ENG-42, #123, owner/repo#123, or a Jira/Linear/GitHub issue URL. A bare #123 needs githubRepo configured or a GitHub origin remote.';
 
 const [command = 'status', ...args] = process.argv.slice(2);
 const cwd = process.cwd();
@@ -170,11 +175,16 @@ async function status() {
 // Naming the ticket is also the moment to learn what it is called: the
 // title is resolved once here and cached on the binding, so the first
 // report already carries it and no later one has to ask again.
-async function bind(argument = args.join(' ')) {
+async function bind(argument = args.filter((a) => a !== '--local').join(' '), { local = args.includes('--local') } = {}) {
   const ref = parseBindArgument(argument, config, info);
   if (!ref) throw new Error(BIND_USAGE);
   const found = await resolveIssueTitle(ref, config, info);
-  writeJson(projectBindingPath(cwd, config), {
+  // An agent sandboxed to its worktree cannot write the user data
+  // directory. Asking first, rather than letting the write throw, is
+  // what makes `teamflow bind` work there at all — and the fallback is
+  // silent because the binding it wrote is just as good.
+  const inRepo = local || !dataDirWritable();
+  const record = {
     jiraKey: ref.key,
     tracker: ref.tracker,
     repo: ref.repo,
@@ -187,7 +197,9 @@ async function bind(argument = args.join(' ')) {
     titleLookedUp: Boolean(found?.title),
     tenantId: tenantId(config),
     boundAt: new Date().toISOString(),
-  });
+  };
+  if (inRepo) writeLocalBinding(cwd, record);
+  else writeJson(projectBindingPath(cwd, config), record);
   const state = latestSessionForCwd(cwd);
   if (state) {
     state.binding = { key: ref.key, tracker: ref.tracker, repo: ref.repo, workspace: ref.workspace, confidence: 1000, source: 'manual', sticky: true, boundAt: new Date().toISOString() };
@@ -195,14 +207,19 @@ async function bind(argument = args.join(' ')) {
       state.jira = { ...(state.jira || {}), key: ref.key, title: found.title, status: found.status };
     }
     state.updatedAt = new Date().toISOString();
-    saveSession(state);
+    // The session lives in the data directory too. Where that is not
+    // writable the binding file is still on disk and the next hook
+    // event will find it, so a failure here is not a failed bind.
+    try { saveSession(state); } catch {}
   }
-  print(`TeamFlow bound this project to ${ref.tracker} issue ${ref.key}${found?.title ? ` — ${found.title}` : ''}. `
+  print(`TeamFlow bound this project to ${ref.tracker} issue ${ref.key}${found?.title ? ` — ${found.title}` : ''}`
+    + `${inRepo ? ', in this working copy (.teamflow/binding.json)' : ''}. `
     + 'Run /teamflow:sync to publish immediately.');
 }
 
 function unbind() {
   try { fs.unlinkSync(projectBindingPath(cwd, config)); } catch {}
+  try { fs.unlinkSync(localBindingPath(cwd)); } catch {}
   const state = latestSessionForCwd(cwd);
   if (state) {
     delete state.binding;

@@ -5,6 +5,7 @@ import crypto from 'node:crypto';
 import { spawnSync } from 'node:child_process';
 
 import * as auth from './auth.mjs';
+import { TOOL_CAPABILITIES } from './tools.mjs';
 
 // Jira and Linear share this key shape; the configured tracker decides how it is labelled and linked.
 // The upper bound is adapters/teamflow/schema.py's `_JIRA_KEY`, so a key the
@@ -260,6 +261,69 @@ export function projectId(cwd) {
 // root does, or the binding is written where nothing will look for it.
 export function projectBindingPath(cwd, config = {}) {
   return path.join(dataDir(), 'bindings', tenantId(config), `${projectId(repositoryRoot(cwd))}.json`);
+}
+
+// The other place a binding may live: inside the repository itself.
+//
+// An agent sandboxed to its worktree cannot write to the user data
+// directory, so `teamflow bind` there wrote nothing a hook could find
+// and the agent's work reported unbound or under whatever key the last
+// person to bind this machine had left behind. `teamflow bind --local`
+// writes here instead, one file per repository root, and the plugin's
+// own `.teamflow/.gitignore` keeps it out of the commit.
+export function localBindingPath(cwd) {
+  return path.join(repositoryRoot(cwd), '.teamflow', 'binding.json');
+}
+
+// Whether `teamflow bind` can write where it normally writes. A sandbox
+// that denies the user data directory is the ordinary case this asks
+// about, not an error, so it answers false rather than throwing.
+export function dataDirWritable() {
+  const dir = path.join(dataDir(), 'bindings');
+  try {
+    fs.mkdirSync(dir, { recursive: true });
+    fs.accessSync(dir, fs.constants.W_OK);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Which of the two binding files speaks for this repository.
+ *
+ * The newer `boundAt` wins, because both files are somebody saying
+ * "this ticket now" and the later word is the current one. A tie — or
+ * a file written before `boundAt` existed — goes to the local one: it
+ * is the more specific of the two, written into this working copy
+ * rather than onto this machine.
+ */
+export function preferBinding(local, user) {
+  if (!local?.jiraKey) return user;
+  if (!user?.jiraKey) return local;
+  return (user.boundAt || '') > (local.boundAt || '') ? user : local;
+}
+
+/**
+ * Write the local binding, and keep it out of the repository's history.
+ *
+ * The ignore rule names `binding.json` rather than the whole directory
+ * because `.teamflow/hooks/` is committed on purpose — those shims are
+ * what a teammate's checkout runs. An existing `.gitignore` is appended
+ * to, never replaced: it is the repository's file, not ours.
+ */
+export function writeLocalBinding(cwd, value) {
+  const file = localBindingPath(cwd);
+  writeJson(file, value);
+  const ignore = path.join(path.dirname(file), '.gitignore');
+  const current = (() => {
+    try { return fs.readFileSync(ignore, 'utf8'); } catch { return undefined; }
+  })();
+  if (current === undefined) fs.writeFileSync(ignore, 'binding.json\n');
+  else if (!current.split(/\r?\n/).includes('binding.json')) {
+    fs.writeFileSync(ignore, `${current.endsWith('\n') || !current ? current : `${current}\n`}binding.json\n`);
+  }
+  return file;
 }
 
 export function sessionPath(sessionId) {
@@ -536,11 +600,17 @@ export function issueCandidates(input = {}, info = {}, manual = undefined, confi
     if (item) candidates.push(item);
   };
 
-  if (manual?.jiraKey) {
+  // `manual` is either one binding file or the pair [local, user]. Both
+  // are the same kind of statement, so they are resolved to one before
+  // becoming a candidate: two manual candidates would make confidence
+  // decide between them, and confidence knows nothing about which was
+  // written last.
+  const bound = Array.isArray(manual) ? preferBinding(manual[0], manual[1]) : manual;
+  if (bound?.jiraKey) {
     // boundAt travels with the candidate: it is how a `teamflow bind` run
     // after this session started outranks the sticky binding the session
     // already holds (see chooseBinding).
-    add({ key: manual.jiraKey, tracker: manual.tracker || tracker, repo: manual.repo, workspace: manual.workspace, boundAt: manual.boundAt }, 1000, 'manual');
+    add({ key: bound.jiraKey, tracker: bound.tracker || tracker, repo: bound.repo, workspace: bound.workspace, boundAt: bound.boundAt }, 1000, 'manual');
   }
   add(detectIssueRef(input.prompt, config, info), 100, 'prompt');
   add(detectIssueRef(input.task_subject, config, info), 98, 'task');
@@ -569,7 +639,7 @@ export function issueCandidates(input = {}, info = {}, manual = undefined, confi
 
 export function detectCandidates(input, cwd, state = {}, config = {}) {
   const info = gitInfo(cwd);
-  const manual = readJson(projectBindingPath(cwd, config));
+  const manual = [readJson(localBindingPath(cwd)), readJson(projectBindingPath(cwd, config))];
   const candidates = issueCandidates(input, info, manual, config);
   if (state.binding?.key) {
     const session = candidate(state.binding.key, state.binding.confidence || 1, state.binding.source || 'session', state.binding);
@@ -875,7 +945,11 @@ export async function resolveIssueTitle(binding = {}, config = {}, info = {}) {
  * nobody asked for.
  */
 export async function cachedIssueTitle(ref, cwd, config = {}, info = {}) {
-  const file = projectBindingPath(cwd, config);
+  // Two files can hold a binding; the cache is whichever one names this
+  // key, local first, because a worktree's own binding is the one the
+  // report is being written for.
+  const files = [localBindingPath(cwd), projectBindingPath(cwd, config)];
+  const file = files.find((candidateFile) => readJson(candidateFile)?.jiraKey === ref.key) || files[1];
   const cached = readJson(file);
   const isCache = cached?.jiraKey === ref.key;
   if (isCache && (cached.title || cached.titleLookedUp)) {
@@ -1092,6 +1166,66 @@ export function issueProject(key, tracker = 'jira') {
   return tracker === 'github' ? String(key).split('#')[0] : String(key).split('-')[0];
 }
 
+// --- what is reporting (MACLEOD-532) -------------------------------
+//
+// The dashboard's plugin pill used to be the words "Plugin connected",
+// hardcoded, which was true of a tenant nothing had ever reported to.
+// The report now says which tool sent it and which plugin version did,
+// and the pill reads that back.
+//
+// Derived state, like everything else on a report: a tool's name from
+// the capability table and this package's version. Nothing about the
+// machine, the path or the person. `adapters/teamflow/schema.py`
+// accepts exactly those two fields and drops anything else.
+
+let cachedVersion;
+
+/**
+ * This plugin's version, read from the manifest beside these scripts.
+ *
+ * At runtime rather than stamped at build: the plugin is installed by
+ * copying this directory, and a stamped constant would report whatever
+ * the last publish said rather than what is actually running.
+ * `undefined` when the manifest cannot be read, which is honest — the
+ * dashboard draws "version unknown" rather than a guess.
+ */
+export function pluginVersion() {
+  if (cachedVersion !== undefined) return cachedVersion || undefined;
+  try {
+    const here = path.dirname(new URL(import.meta.url).pathname);
+    const manifest = JSON.parse(fs.readFileSync(path.join(here, '..', 'package.json'), 'utf8'));
+    cachedVersion = typeof manifest.version === 'string' ? manifest.version : '';
+  } catch {
+    cachedVersion = '';
+  }
+  return cachedVersion || undefined;
+}
+
+// The one id that is not a tool. A repository whose editor has no hook
+// system reports on commit, merge and push instead, and "git" on
+// somebody's dashboard would read as a tracker rather than as the
+// fallback it is.
+const REPORTER_NAMES = { git: 'Git hooks' };
+
+/**
+ * `{ tool, version }` for the tool this hook is running in.
+ *
+ * The name comes from `tools.mjs`, which is already the one place
+ * TeamFlow keeps a tool's display name, so a tool renamed there is
+ * renamed on every board with no edit here. An id the table has never
+ * heard of reports as itself: a wrong name is worse than an unfamiliar
+ * one, and it makes the gap visible.
+ */
+export function reporterInfo(tool = 'claude-code') {
+  const id = String(tool || 'claude-code');
+  const known = TOOL_CAPABILITIES.find((entry) => entry.id === id);
+  const name = known?.name || REPORTER_NAMES[id] || id;
+  const version = pluginVersion();
+  const reporter = { tool: name.slice(0, 80) };
+  if (version) reporter.version = String(version).slice(0, 40);
+  return reporter;
+}
+
 export function issuePayload(state, config, info) {
   if (!state.binding?.key) return undefined;
   const key = state.binding.key;
@@ -1120,6 +1254,9 @@ export function issuePayload(state, config, info) {
     // outside a repository or when the branch has no pull request.
     git: state.git,
     pr: state.pr,
+    // MACLEOD-532. Absent on a session that never named a tool, which is
+    // what the dashboard reads as "connected, version unknown".
+    reporter: state.reporter,
     evidence: (state.evidence || []).slice(0, 8),
     executions: [
       {
@@ -1165,6 +1302,10 @@ export function sanitizePayload(value) {
     // service's schema has always accepted them; this allowlist was silently
     // dropping them, which is why no dependency arrow ever drew on real data.
     'links','target','type',
+    // MACLEOD-532: what reported. Two fields and no more — the point of the
+    // allowlist is that a reporter talked into attaching a hostname or a path
+    // cannot reach the service by hanging it off a field that is allowed.
+    'reporter','tool','version',
   ]);
   function walk(v) {
     if (Array.isArray(v)) return v.slice(0, 50).map(walk);

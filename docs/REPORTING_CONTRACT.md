@@ -125,8 +125,69 @@ An absent field means *this tracker did not say*, which is not the same as an em
 - compact evidence counts/references
 - execution IDs/kinds
 - timestamps
+- `reporter`: what sent the report
+
+### The `reporter` block on an issue report
+
+`reporter` is two fields and no more:
+
+- `tool`: the name of the tool the plugin was running in — `Claude Code`,
+  `Cursor`, `Git hooks` — taken from the capability table in
+  `plugin/scripts/tools.mjs`, capped at 80 characters.
+- `version`: the plugin's own version, capped at 40. Optional, because every
+  plugin older than 0.3.6 sends none; a report without one is accepted and the
+  dashboard says the version is unknown rather than guessing.
+
+It exists so the dashboard's header can name what is actually reporting
+instead of asserting that a plugin is connected. Nothing else about the
+machine belongs in it: no hostname, no working directory, no user, no account,
+no path. `adapters/teamflow/schema.py`'s `REPORTER` table is the enforcement
+and drops anything else.
 
 Never persist prompts/transcripts, source contents/diffs, raw shell commands/tool output, secrets, issue descriptions/comments/attachments, or raw CI/test logs.
+
+## What TeamFlow writes back to a tracker
+
+Everything above governs what reaches TeamFlow. This governs the one thing
+that leaves it: with two-way switched on by an organisation admin, TeamFlow
+comments on the issue in the customer's own tracker, in front of their whole
+team. It is off for every connection until somebody turns it on
+(`GET/PUT /v1/members/trackers/two-way`, admin only).
+
+**Exactly one sentence leaves the machine, and this is it:**
+
+```
+Verified on dev by TeamFlow at <updatedAt>: <summary>
+Ready for production by TeamFlow at <updatedAt>: <summary>
+```
+
+with the trailing `: <summary>` replaced by a full stop when the report
+carried no summary, and the whole sentence cut to 300 characters with an
+ellipsis when it would be longer. `<updatedAt>` is the report's own ISO
+timestamp; `<summary>` is the report's own `summary` field, which is already
+on the allowlist above. Nothing else is composed, quoted or attached: no
+diff, no log, no command, no prompt, no evidence row, no branch name, no
+commit subject and no link. The cap is tighter than the report's own
+`summary` limit on purpose — a person reading the ticket never agreed to
+this contract, so the ceiling is the sentence and not the field it came
+from.
+
+**The transition carries no text at all.** With transitions on, TeamFlow
+also moves the issue to the workflow state the admin named on the members
+page, per TeamFlow stage. What travels is the state's name, which the admin
+typed, resolved to the tracker's own id by the provider.
+
+**When.** Only when a report puts a ticket at `DEV_VERIFIED` or
+`READY_PROD` with a status that is not `failed`. Never for an earlier
+stage, a rework or a failure, never twice for the same `(key, stage)`, and
+never for a ticket the tracker has already marked done, cancelled or
+deleted — the tracker wins on closure, and two-way only ever moves forward
+from what the skill proved. It never reopens and never closes.
+
+**What is kept about it.** One `wrote_back` row on `runtime/<KEY>/tracker.json`'s
+history: `event`, `stage`, `wrote` (`comment`, `state`, or both) and
+`occurredAt`, plus `lastWriteBackAt` on the sidecar. The words themselves are
+not kept — they are in the tracker, where they were posted.
 
 ## Caching
 
