@@ -37,6 +37,39 @@ const BUILD_RE = /\b(?:npm|pnpm|yarn|bun)\s+(?:run\s+)?build\b|\btsc\s+-b\b/i;
 const LOCAL_AUDIT_RE = /\b(?:npm|pnpm|yarn|bun)\s+(?:run\s+)?audit(?:[-_:]local)?\b|\b(?:make|just)\s+audit\b/i;
 const DEV_AUDIT_RE = /\baudit[-_: ]?(?:dev|staging)\b|\b(?:dev|staging)[-_: ]?audit\b/i;
 
+/*
+ * The columns, in delivery order. This is the emitting side's copy of STAGES in
+ * src/lib/stageMachine.ts: the plugin needs the order to answer one question a
+ * transition cannot answer on its own — has the gate that sent this ticket back
+ * been passed again? Rework stages are not in it, because they are not columns.
+ */
+const STAGE_ORDER = [
+  'JIRA', 'LOCAL_DEV', 'LOCAL_TEST', 'LOCAL_AUDIT', 'MERGE', 'CI_BUILD',
+  'DEPLOY_DEV', 'DEV_TEST', 'DEV_AUDIT', 'DEV_VERIFIED', 'READY_PROD',
+];
+
+/** What the dashboard calls the step at a gate, so the rework arrow can name it. */
+const GATE_LABELS = {
+  LOCAL_TEST: 'Run tests',
+  LOCAL_AUDIT: 'Local audit',
+  MERGE: 'Merge',
+  DEPLOY_DEV: 'Deploy to dev',
+  DEV_TEST: 'Dev tests',
+  DEV_AUDIT: 'Dev audit',
+};
+
+/** The execution kind a gate's own run is, for the lane the dashboard draws it in. */
+const GATE_KINDS = {
+  LOCAL_TEST: 'test',
+  LOCAL_AUDIT: 'audit',
+  MERGE: 'ci',
+  DEPLOY_DEV: 'deploy',
+  DEV_TEST: 'test',
+  DEV_AUDIT: 'audit',
+};
+
+const stageRank = (stage) => STAGE_ORDER.indexOf(stage);
+
 export function extractJiraKey(value) {
   if (!value) return undefined;
   const match = String(value).match(ISSUE_RE);
@@ -920,12 +953,17 @@ export function classifyTool(input, state, config) {
   if (event === 'TaskCompleted') return { summary: state.summary || 'Task completed', heartbeat: true };
 
   if (tool === 'Edit' || tool === 'Write' || tool === 'MultiEdit' || tool === 'NotebookEdit') {
+    /*
+     * No clearRework. Editing a file is where a ticket goes *because* a gate
+     * failed, so clearing the attribution here wiped the reason within seconds
+     * of the failure and left a card sitting back in Local Dev saying nothing
+     * about why. The gate clears its own rework by passing again.
+     */
     return {
       stage: 'LOCAL_DEV',
       status: failed ? 'failed' : 'running',
       summary: failed ? 'Code edit failed' : 'Implementing locally',
       sticky: true,
-      clearRework: true,
     };
   }
 
@@ -985,18 +1023,48 @@ export function classifyTool(input, state, config) {
   return undefined;
 }
 
+/*
+ * Whether this transition closes the loop the ticket is in.
+ *
+ * `clearRework` says a gate passed; it does not say *which*. A local test suite
+ * going green tells nobody anything about the dev audit that sent the ticket
+ * back, so a clear only counts from the failed gate onwards.
+ */
+function clearsRework(state, transition) {
+  if (!transition.clearRework) return false;
+  if (!state.reworkFrom) return true;
+  return stageRank(transition.stage) >= stageRank(state.reworkFrom);
+}
+
 export function applyTransition(state, transition) {
   if (!transition) return state;
+  const cleared = clearsRework(state, transition);
+  const updatedAt = new Date().toISOString();
+  const evidence = transition.evidence?.length ? transition.evidence : state.evidence;
   return {
     ...state,
     stage: transition.stage || state.stage,
     status: transition.status || state.status,
     summary: transition.summary || state.summary,
     loopCount: (state.loopCount || 0) + (transition.incrementLoop ? 1 : 0),
-    evidence: transition.evidence?.length ? transition.evidence : state.evidence,
-    reworkFrom: transition.clearRework ? undefined : (transition.reworkFrom || state.reworkFrom),
+    evidence,
+    reworkFrom: cleared ? undefined : (transition.reworkFrom || state.reworkFrom),
+    /*
+     * The gate's own run, remembered so the report can carry it. The dashboard
+     * draws the arrow from this step and labels it with what the step said, and
+     * a later report that only describes the editing would otherwise have lost it.
+     */
+    rework: cleared ? undefined : (transition.reworkFrom
+      ? {
+        stage: transition.reworkFrom,
+        label: GATE_LABELS[transition.reworkFrom] || transition.reworkFrom,
+        summary: transition.summary,
+        evidence: transition.evidence || [],
+        updatedAt,
+      }
+      : state.rework),
     binding: state.binding ? { ...state.binding, sticky: transition.sticky ? true : state.binding.sticky } : state.binding,
-    updatedAt: new Date().toISOString(),
+    updatedAt,
   };
 }
 
@@ -1063,7 +1131,24 @@ export function issuePayload(state, config, info) {
         summary: String(state.summary || 'Work detected').slice(0, 180),
         evidence: (state.evidence || []).slice(0, 4),
         updatedAt: state.updatedAt || new Date().toISOString(),
-      }
+      },
+      /*
+       * The gate that sent this ticket back, for as long as it has not passed
+       * again. Without it a report is one node in the ticket's own column and
+       * the dashboard has nothing to draw the loop from: `reworkFrom` says which
+       * column, this says which step and what it found. Derived state only —
+       * step name, stage, status, summary, evidence counts, timestamp.
+       */
+      ...(state.rework ? [{
+        id: `gate-${state.rework.stage}`,
+        kind: GATE_KINDS[state.rework.stage] || 'ci',
+        label: state.rework.label,
+        stage: state.rework.stage,
+        status: 'failed',
+        summary: String(state.rework.summary || `${state.rework.label} failed`).slice(0, 180),
+        evidence: (state.rework.evidence || []).slice(0, 4),
+        updatedAt: state.rework.updatedAt,
+      }] : []),
     ],
   };
 }
@@ -1076,6 +1161,10 @@ export function sanitizePayload(value) {
     // MACLEOD-510, and the same names adapters/teamflow/schema.py takes.
     'git','head','sha','subject','commitsSinceMain','ahead','behind','pushed','dirty',
     'pr','number','url','state','mergeable','checks','passing','failing','pending','review',
+    // Tracker relations: "parent/related keys" in docs/REPORTING_CONTRACT.md. The
+    // service's schema has always accepted them; this allowlist was silently
+    // dropping them, which is why no dependency arrow ever drew on real data.
+    'links','target','type',
   ]);
   function walk(v) {
     if (Array.isArray(v)) return v.slice(0, 50).map(walk);
