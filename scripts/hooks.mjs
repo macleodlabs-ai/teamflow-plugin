@@ -159,7 +159,25 @@ export function shimRef(tool, ext = 'sh') {
   return tool === 'gemini' ? `$GEMINI_PROJECT_DIR/${relative}` : relative;
 }
 
-export function shimScript(tool) {
+// Every repository shim sits exactly two levels below the root it was
+// installed into — `.teamflow/hooks/<tool>.sh`, and Cline's
+// `.clinerules/hooks/PostToolUse` — so it can put itself back there
+// before reporting. That matters because no tool here promises the
+// working directory it runs a hook with, and several of the events do
+// not carry a cwd of their own: Cascade's post_write_code has none,
+// nor has Cursor's stop. What is left is the process's own directory,
+// and a subdirectory hashes to a different projectId, which is a
+// different binding and a ticket that stops moving.
+//
+// Junie's shim is the exception. It is installed into
+// ~/.junie/teamflow-hook.sh, where two levels up is the home
+// directory's parent, so it is written without the cd and reports
+// against the cwd and project_path Junie sends.
+const CD_TO_ROOT = `root=$(CDPATH= cd -- "$(dirname -- "$0")/../.." 2>/dev/null && pwd)
+[ -n "$root" ] && cd -- "$root" || :
+`;
+
+export function shimScript(tool, { inRepository = true } = {}) {
   return `#!/bin/sh
 # TeamFlow delivery reporting for ${tool}. Written by
 # \`teamflow hooks install --for ${tool}\`; delete this file to stop.
@@ -167,7 +185,7 @@ export function shimScript(tool) {
 # Observability, never a gate. This script exits 0 whatever happens, so
 # a TeamFlow outage, a missing node or an unreachable network can never
 # block an edit, a command or a turn.
-if command -v teamflow >/dev/null 2>&1; then
+${inRepository ? CD_TO_ROOT : ''}if command -v teamflow >/dev/null 2>&1; then
   teamflow hook --for ${tool}
 else
   npx -y ${PACKAGE} hook --for ${tool}
@@ -203,6 +221,12 @@ export function powershellShim(tool) {
 # Observability, never a gate. This script exits 0 whatever happens, so
 # a TeamFlow outage, a missing node or an unreachable network can never
 # block an edit, a command or a turn.
+#
+# \`$PSScriptRoot\` is this file's own directory, and this file is two
+# levels below the repository root, for the reason CD_TO_ROOT gives.
+try {
+  Set-Location (Join-Path $PSScriptRoot '..\..')
+} catch { }
 try {
   if (Get-Command teamflow -ErrorAction SilentlyContinue) {
     teamflow hook --for ${tool}
@@ -279,7 +303,8 @@ export const HOOK_SPECS = {
 
   // One file for both Copilot agents. VS Code sends Claude Code's
   // envelope under PascalCase event names; Copilot CLI sends its own
-  // camelCase ones. Neither fires an event name it does not know, so
+  // camelCase ones, down to PostToolUseFailure against
+  // postToolUseFailure. Neither fires an event name it does not know, so
   // registering both dialects in the one file `.github/hooks/*.json`
   // that both of them read is what makes a single install cover the
   // IDE and the CLI.
@@ -299,6 +324,7 @@ export const HOOK_SPECS = {
             version: 1,
             hooks: {
               PostToolUse: hook(),
+              PostToolUseFailure: hook(),
               Stop: hook(),
               postToolUse: hook(),
               postToolUseFailure: hook(),
@@ -370,7 +396,7 @@ export const HOOK_SPECS = {
     return {
       covers: 'edits, as LOCAL_DEV; Junie fires no PostToolUse, so gates need the git fallback',
       targets: [
-        { file: sh, script: shimScript('jetbrains') },
+        { file: sh, script: shimScript('jetbrains', { inRepository: false }) },
         {
           file: path.join(home(), '.junie', 'config.json'),
           json: {

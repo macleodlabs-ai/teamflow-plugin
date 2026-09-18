@@ -131,10 +131,14 @@ The session file gains `account` and `accountName` beside the refresh token, so 
 
 ```bash
 teamflow org                      # the organisation reports go to, and the others
-teamflow org switch <id>          # POST /v1/members/switch, per person not per session
+teamflow org switch <id>          # POST /v1/members/switch, per session
 ```
 
-`teamflow org` reads `GET /v1/members/me` with the ID token as the bearer — the access token names a seat, and this has to answer for the address, which is what the other organisations are found by. A switch moves the binding on the seat itself, so every signed-in dashboard and CLI on that address follows it; reports already published stay where they were published.
+`teamflow org` reads `GET /v1/members/me` with the ID token as the bearer — the access token names a seat, and this has to answer for the address, which is what the other organisations are found by.
+
+A switch is **per session**: the service answers with an account-scoped token for the credential in hand and moves no binding, so this CLI goes to the named organisation and the dashboard tab beside it stays where its holder put it. Reports already published stay where they were published. A device credential — the one `/teamflow:login` leaves on a machine that cannot open a browser — switches the same way and may move to any seat its person holds; an account key cannot switch at all, because it names the account rather than a person.
+
+**Which pool a report is charged to.** The one the session is in. Somebody in three organisations is billed to whichever one the credential posting the report is in, which is why the switch is per session and not per person. A person who signed up alone keeps their own pool on joining; the service asks once whether to fold it into the organisation, and `/teamflow:status` names the organisation the reports are going to.
 
 Somebody already bound to one organisation who names another at login is switching, and the service says so rather than moving billing quietly: identity answers `409 already_bound_elsewhere`, and the plugin retries the same intent against `/v1/members/switch`.
 
@@ -581,15 +585,23 @@ information as data, one record per tool, and is what the site reads.
 
 ### What is automatic, per tool
 
-Every URL below was read on 2026-09-17.
+Every URL below was read on 2026-09-17 and re-read on 2026-09-18. What
+each re-read found is recorded per tool in `verified` in
+`plugin/scripts/tools.mjs`, and the client guides render it, because
+"the vendor documents this" and "this was watched arriving" are
+different claims and a reader deciding whether to trust a board is owed
+the difference. `from: 'docs'` is a vendor page, `'source'` is the
+tool's own code, and `'run'` — which nothing claims yet — means the
+plugin was installed in that tool and the payload was watched arriving.
+[What still needs a real run](#what-still-needs-a-real-run) is the list.
 
 | Tool | Level | Where the hooks go | Events TeamFlow subscribes to |
 | --- | --- | --- | --- |
 | Claude Code | hooks | in the plugin | `SessionStart`, `UserPromptSubmit`, `PostToolUse`, `PostToolUseFailure`, `TaskCompleted`, `SubagentStart`, `SubagentStop`, `Stop`, `SessionEnd` |
 | [Cursor](https://cursor.com/docs/agent/hooks) | hooks | `.cursor/hooks.json` | `afterFileEdit`, `postToolUse`, `postToolUseFailure`, `afterShellExecution`, `stop` |
-| [VS Code + Copilot](https://code.visualstudio.com/docs/copilot/customization/hooks) and [Copilot CLI](https://docs.github.com/en/copilot/reference/hooks-configuration) | hooks | `.github/hooks/teamflow.json` | `PostToolUse`, `Stop` (VS Code); `postToolUse`, `postToolUseFailure`, `agentStop` (CLI) |
+| [VS Code + Copilot](https://code.visualstudio.com/docs/copilot/customization/hooks) and [Copilot CLI](https://docs.github.com/en/copilot/reference/hooks-reference) | hooks | `.github/hooks/teamflow.json` | `PostToolUse`, `PostToolUseFailure`, `Stop` (VS Code); `postToolUse`, `postToolUseFailure`, `agentStop` (CLI) |
 | [Windsurf](https://docs.devin.ai/desktop/cascade/hooks) | hooks | `.windsurf/hooks.json` | `post_write_code`, `post_run_command`, `post_cascade_response` |
-| [Cline](https://cline.bot/blog/cline-v3-36-hooks) | hooks | `.clinerules/hooks/PostToolUse` | `PostToolUse` |
+| [Cline](https://cline.bot/blog/cline-v3-36-hooks) ([payload schema](https://github.com/cline/cline/blob/main/.clinerules/hooks/README.md)) | hooks | `.clinerules/hooks/PostToolUse` | `PostToolUse` |
 | [OpenAI Codex CLI](https://learn.chatgpt.com/docs/hooks) | hooks | `.codex/hooks.json` | `PostToolUse`, `Stop` |
 | [Gemini CLI](https://github.com/google-gemini/gemini-cli/blob/main/docs/hooks/reference.md) | hooks | `.gemini/settings.json` | `AfterTool`, `AfterAgent` |
 | [JetBrains Junie](https://junie.jetbrains.com/docs/junie-cli-hooks.html) | hooks | `~/.junie/config.json` | `PreToolUse`, `Stop` |
@@ -599,27 +611,65 @@ Every URL below was read on 2026-09-17.
 
 **Cursor** is the closest thing to Claude Code here: it has a distinct
 `postToolUseFailure`, so a red test run reports `LOCAL_REWORK` rather
-than a green gate. `afterShellExecution` documents `command`, `output`
-and `duration` and no exit status, so TeamFlow only classifies it when
-Cursor does supply an exit code; the definite signal comes from
-`postToolUse` and `postToolUseFailure`.
+than a green gate. `afterShellExecution` documents `command`, `output`,
+`duration` and `sandbox`, and as of **2026-09-18 still no exit status**,
+so TeamFlow only classifies it when Cursor does supply an exit code; the
+definite signal comes from `postToolUse` and `postToolUseFailure`, which
+carry `cwd` and `tool_output` of their own.
 
 **Copilot** reads `.github/hooks/*.json` from both the VS Code agent and
 Copilot CLI, in two dialects of the same idea. One file registers both:
 VS Code's PascalCase event names beside Copilot CLI's camelCase ones. A
 tool never fires an event name it does not know, so the halves it does
-not recognise cost nothing. Copilot CLI's payload names no event at all
-and passes `toolArgs` as a JSON string, both of which the adapter
-handles.
+not recognise cost nothing. Copilot CLI's payload names no event at all,
+which the adapter handles by taking a payload that names a tool as a
+finished tool call.
+
+The 2026-09-18 re-read of the [hooks
+reference](https://docs.github.com/en/copilot/reference/hooks-reference)
+found that the two dialects diverge inside the result as well as around
+it — `toolResult.resultType` for the CLI against `tool_result.result_type`
+for VS Code, and `postToolUseFailure` against `PostToolUseFailure` — and
+the adapter was reading only the CLI half of each pair. So a failed tool
+call in the VS Code agent was dropped, and a `tool_result` saying
+`failure` read as a pass: a red suite reported as a green `LOCAL_TEST`
+in the IDE half of a single install. Both halves are read now, and
+`PostToolUseFailure` is registered in `.github/hooks/teamflow.json`
+beside the camelCase one. `toolArgs` is documented as the parsed
+arguments and has been seen as the JSON string of them; both are
+accepted.
 
 **Windsurf** puts everything under `tool_info` and, like Cursor,
-documents no exit status for `post_run_command`. Writes are reported;
-commands whose outcome is unknown are not.
+documents no exit status for `post_run_command` — checked again on
+**2026-09-18**, where that event's `tool_info` is `command_line` and
+`cwd` and nothing else, not even the output. Writes are reported;
+commands whose outcome is unknown are not. The adapter still reads an
+exit code and an output if either appears, so the release that adds one
+needs no change here.
 
 **Cline** has no hooks config file: the hook is an executable named
 exactly after the event, which is why the install writes
 `.clinerules/hooks/PostToolUse` and nothing else. Hooks also have to be
-switched on once in Settings → Features before Cline will run it.
+switched on once in Settings → Features before Cline will run it, and
+Cline's hooks are macOS and Linux only, which is why no `.ps1` is
+written for it.
+
+Cline's field names are the one set here taken from a tool's own
+repository rather than a vendor page, because the vendor page does not
+print them: [`.clinerules/hooks/README.md`](https://github.com/cline/cline/blob/main/.clinerules/hooks/README.md),
+read 2026-09-18, gives the payload as a schema. It settled two things
+the adapter had guessed at. The event body is `postToolUse` with
+`toolName`, `parameters`, `result`, `success` and `executionTimeMs`, and
+those are the only spellings — the adapter also accepted `tool_name`,
+`toolInput` and `response`, none of which exist, and they are gone,
+because an alternative that is wrong is not tolerance but a place for a
+real drift to hide. And `success` is a **sibling** of `result`, not
+something inside it, while `result` is a string: the adapter was looking
+for the outcome inside the result the way every other tool's does,
+finding nothing there, and calling every failed Cline tool call a pass.
+`success` is read directly now. Of the six documented hook names Cline
+fires today, `TaskComplete` is marked "coming soon"; it is mapped
+anyway, so the release that ships it is not a silent gap.
 
 **Codex CLI** adopted Claude Code's hook shape field for field, down to
 `tool_input` and `tool_response`, so its adapter is almost a
@@ -684,6 +734,67 @@ comment. The reverse — PowerShell handed the `.sh` — logs one ignorable
 Nothing is invented for the four tools whose vendors document no Windows
 form. A field their parser rejects would be worse than none, and the git
 fallback below covers a Windows developer using one of them.
+
+### Where a shim runs, and from which directory
+
+Every hook config names the shim relative to the repository root, since
+the configs are committed and an absolute path would name the
+installer's home directory. What no tool here promises is the *working
+directory* it runs the shim with, and several events carry no `cwd` of
+their own — Cascade's `post_write_code` has none, nor has Cursor's
+`stop` — so the process's own directory is what decides which project
+the report belongs to. A subdirectory resolves to a different project
+id, which is a different binding: a ticket that stops moving with
+nothing in any log to say why.
+
+So each repository shim puts itself back at its root before reporting.
+`.teamflow/hooks/<tool>.sh` and Cline's `.clinerules/hooks/PostToolUse`
+both sit exactly two levels below it, and the `.ps1` does the same with
+`$PSScriptRoot`. Junie's shim is the exception and is written without
+it: it lives at `~/.junie/teamflow-hook.sh`, where two levels up is the
+home directory's parent, and Junie's payload carries `cwd` and
+`project_path` to key the report on instead.
+
+### What still needs a real run
+
+Everything above is from documentation or from a tool's own source. None
+of it is from watching a payload arrive, which is a different kind of
+evidence and the only kind that catches a vendor page that is simply
+out of date. For each tool the check is the same three steps: install,
+do one thing, look at the board.
+
+1. In the repository, `npx -y github:macleodlabs-ai/teamflow-plugin hooks install --for <tool>`,
+   then `teamflow hooks status` to confirm the files.
+2. Open the tool on that repository, and from the agent: edit one file,
+   then run the test command, then run it again with a deliberately
+   failing test.
+3. `teamflow status` after each. The edit should read `LOCAL_DEV`
+   running, the green run `LOCAL_TEST` success, the red run
+   `LOCAL_REWORK` with `reworkFrom` = `LOCAL_TEST`.
+
+What to watch for per tool, beyond that:
+
+- **Cursor** (installed on this Mac, so this is the first one to do).
+  Whether `afterShellExecution` has grown an exit status since
+  2026-09-18 — if the red run reports `LOCAL_REWORK` at all, it has, and
+  the adapter already reads `exit_code`, `exitCode` and `status`. Also
+  whether `postToolUse` carries the agent's `cwd` as a subdirectory:
+  compare the project in `teamflow status` against the repository root.
+- **Windsurf**. Whether `post_run_command`'s `tool_info` carries
+  anything about the outcome. If the red run reports nothing at all,
+  it does not, and that is the documented behaviour rather than a bug.
+- **Cline**. That `success: false` arrives on a failed `execute_command`
+  and that the board shows `LOCAL_REWORK`. Hooks must be enabled in
+  Settings → Features first, or nothing runs at all and it looks
+  identical to a broken adapter.
+- **VS Code with Copilot**. That the IDE fires `PostToolUseFailure`
+  rather than only the CLI's `postToolUseFailure`, and that its result
+  arrives as `tool_result`. Both are registered and both are read, so
+  the check is that exactly one report lands per tool call and not two.
+- **Any of them, from a subdirectory**. Open the tool on a
+  subdirectory of the repository rather than its root, edit a file, and
+  confirm `teamflow status` still names the repository. That is what
+  the shim's `cd` is for.
 
 ### The git fallback
 

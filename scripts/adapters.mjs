@@ -96,7 +96,11 @@ export function failedFrom(response) {
     const value = response[name];
     if (typeof value === 'number' && value !== 0) return true;
   }
-  if (typeof response.resultType === 'string' && /error|fail|denied/i.test(response.resultType)) return true;
+  // Copilot spells this `resultType` to its CLI and `result_type` to
+  // VS Code, out of the same `.github/hooks/*.json` file.
+  for (const name of ['resultType', 'result_type']) {
+    if (typeof response[name] === 'string' && /error|fail|denied/i.test(response[name])) return true;
+  }
   return false;
 }
 
@@ -121,7 +125,9 @@ export function toolEvent({ tool, input, response, ok, session, cwd }) {
 // Each takes the payload that tool puts on stdin and returns a Claude
 // Code shaped event, or undefined for an event that says nothing about
 // delivery. Vendor field names are quoted from the documentation read
-// on 2026-09-17; see docs/PLUGIN.md for the URLs.
+// on 2026-09-17 and re-read on 2026-09-18, except Cline's, which are
+// from its own repository; see docs/PLUGIN.md for the URLs and what
+// each check found.
 
 export const ADAPTERS = {};
 
@@ -146,12 +152,14 @@ export const PASSIVE_STDOUT = {
 // Code: it has postToolUse AND postToolUseFailure, so the one thing
 // every other adapter has to guess at is stated outright.
 //
-// afterShellExecution documents `command`, `output` and `duration` and
-// no exit status. An event that cannot say whether the command passed
-// cannot be classified, because "npm test" with an unknown outcome
-// would otherwise report a green LOCAL_TEST for a red suite. So it is
-// used only when Cursor does supply an exit code, and postToolUse /
-// postToolUseFailure carry the shell calls otherwise.
+// afterShellExecution documents `command`, `output`, `duration` and
+// `sandbox`, and still no exit status as of 2026-09-18. An event that
+// cannot say whether the command passed cannot be classified, because
+// "npm test" with an unknown outcome would otherwise report a green
+// LOCAL_TEST for a red suite. So it is used only if Cursor does supply
+// an exit code, and postToolUse / postToolUseFailure carry the shell
+// calls otherwise — which they do, with cwd and tool_output of their
+// own.
 ADAPTERS.cursor = (payload = {}) => {
   const event = payload.hook_event_name;
   const cwd = payload.cwd || payload.workspace_roots?.[0] || process.cwd();
@@ -199,6 +207,7 @@ ADAPTERS.copilot = (payload = {}) => {
   if (/^(Stop|agentStop)$/.test(event || '')) {
     return { hook_event_name: 'Stop', session_id: session, cwd };
   }
+  const failure = /^(postToolUseFailure|PostToolUseFailure)$/.test(event || '');
   // Copilot CLI's documented payload names no event at all: it is
   // `{timestamp, cwd, toolName, toolArgs}` and the hook is expected to
   // know which event it was registered for. So a payload that names a
@@ -207,21 +216,24 @@ ADAPTERS.copilot = (payload = {}) => {
   // failure event.
   const named = payload.tool_name || payload.toolName;
   if (!event && !named) return undefined;
-  if (event && !/^(PostToolUse|postToolUse|postToolUseFailure)$/.test(event)) return undefined;
+  if (event && !/^(PostToolUse|postToolUse)$/.test(event) && !failure) return undefined;
 
-  // Copilot CLI sends toolArgs as a JSON string; VS Code sends
-  // tool_input as an object. Both end up as an object here.
+  // `toolArgs` is documented as the parsed arguments, but it has been
+  // seen as the JSON string of them; both end up as an object here.
   let input = payload.tool_input || payload.toolArgs || payload.toolArguments;
   if (typeof input === 'string') {
     try { input = JSON.parse(input); } catch { input = {}; }
   }
-  const response = payload.tool_response || payload.toolResult || payload.toolResponse;
+  // `toolResult` to the CLI, `tool_result` to VS Code. There is no
+  // `tool_response` in either dialect; it is kept because Copilot's
+  // own docs used it before the reference page settled.
+  const response = payload.toolResult || payload.tool_result || payload.tool_response || payload.toolResponse;
   return toolEvent({
     ...base,
     tool: payload.tool_name || payload.toolName,
     input,
     response,
-    ok: event === 'postToolUseFailure' ? false : undefined,
+    ok: failure ? false : undefined,
   });
 };
 
@@ -230,9 +242,11 @@ ADAPTERS.copilot = (payload = {}) => {
 // .windsurf/hooks.json. Everything arrives under `tool_info`, and the
 // event name says what kind of thing it was rather than the payload:
 // post_write_code is an edit, post_run_command is a shell call.
-// Windsurf documents no exit status for post_run_command either, so the
-// same rule as Cursor applies and a command whose outcome is unknown
-// is not reported.
+// Checked again on 2026-09-18: post_run_command's tool_info documents
+// `command_line` and `cwd` and nothing else — no output and no exit
+// status — so the same rule as Cursor applies and a command whose
+// outcome is unknown is not reported. `output` and the exit code are
+// read for the release that adds them.
 ADAPTERS.windsurf = (payload = {}) => {
   const event = payload.agent_action_name || payload.hook_event_name;
   const info = payload.tool_info || {};
@@ -259,6 +273,19 @@ ADAPTERS.windsurf = (payload = {}) => {
 // .clinerules/hooks/<HookName>, an executable named exactly after the
 // event, with no config file at all. The payload nests the event's own
 // fields under a key named for the event in lower camel case.
+//
+// These names are not from a vendor page: they are from Cline's own
+// repository, .clinerules/hooks/README.md, read on 2026-09-18, which
+// prints the payload as a schema. The adapter used to accept a second
+// spelling of each of them — tool_name, toolInput, response — and none
+// of the three exists. They are gone rather than kept, because an
+// alternative that is wrong is not tolerance, it is a place for a real
+// drift to hide.
+//
+// `success` is the field that matters and it is a sibling of `result`,
+// not something inside it; `result` is a string. So the outcome is read
+// here and not left to failedFrom, which would find nothing in a string
+// and call every failed command a pass.
 ADAPTERS.cline = (payload = {}) => {
   const event = payload.hookName || payload.hook_event_name;
   const cwd = payload.workspaceRoots?.[0] || payload.cwd || process.cwd();
@@ -269,11 +296,15 @@ ADAPTERS.cline = (payload = {}) => {
     const body = payload.postToolUse || {};
     return toolEvent({
       ...base,
-      tool: body.toolName || body.tool_name,
-      input: body.parameters || body.toolInput,
-      response: body.result || body.response,
+      tool: body.toolName,
+      input: body.parameters,
+      response: body.result,
+      ok: typeof body.success === 'boolean' ? body.success : undefined,
     });
   }
+  // TaskCancel fires today. TaskComplete is in the documented hookName
+  // union and marked "coming soon", so it is mapped now rather than
+  // being a silent gap on the release that ships it.
   if (event === 'TaskComplete' || event === 'TaskCancel') {
     return { hook_event_name: 'Stop', session_id: session, cwd };
   }
