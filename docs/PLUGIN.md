@@ -218,7 +218,7 @@ TeamFlow binds to one tracker per project. The stage machine, reporting contract
 
 Canonical keys:
 
-- Jira and Linear share the shape `[A-Z][A-Z0-9]{1,11}-\d+` and are stored upper case. The configured tracker decides how such a key is labelled and linked.
+- Jira and Linear share the shape `[A-Z][A-Z0-9]{1,19}-\d+` and are stored upper case — the same twenty characters of team key `adapters/teamflow/schema.py` accepts. The configured tracker decides how such a key is labelled and linked.
 - GitHub keys are `<repo>#<n>` (repo name only, for example `daemon-core#123`) so they stay unique inside a tenant. `project` is the repo name.
 
 ### Detection sources
@@ -236,7 +236,11 @@ Canonical keys:
 
 ### Binding by hand
 
-`/teamflow:bind` accepts `DAEMON-142`, `ENG-42`, `#123`, `owner/repo#123` or any of the three issue URL forms, normalises to the canonical key and records the tracker. A bare `#123` needs `githubRepo` or a GitHub origin remote. Anything else is rejected with the accepted forms.
+`/teamflow:bind` accepts `DAEMON-142`, `ENG-42`, `#123`, `owner/repo#123` or any of the three issue URL forms, normalises to the canonical key and records the tracker. Anything else is rejected with the accepted forms.
+
+**Every form is accepted whatever tracker is configured.** An organisation runs several trackers at once, so the form of the argument names the provider and the binding records it: a Linear URL is Linear's, `owner/repo#123` is GitHub's, and only the two forms that cannot name a provider fall back to configuration — `#123`, which is GitHub and needs `githubRepo` or a GitHub origin remote, and a bare `TEAM-123`, which is Jira or Linear. When the configured tracker is `github` a bare `TEAM-123` is certainly neither a GitHub key nor the configured tracker's, so it is recorded as Linear if `linearWorkspace` is set and Jira otherwise; bind the full issue URL to be explicit. Gating the shared-shape key on the configured tracker is what made `teamflow bind MACLEOD-507` answer the usage error in this repository.
+
+Binding is also where a title is learned: see below.
 
 `/teamflow:doctor` reports the transport, the service account and its credits, the configured tracker, the resolved issue source and whether that tracker's bundled MCP server is visible; authenticate it once through `/mcp`.
 
@@ -250,7 +254,7 @@ What the webhooks contribute, and nothing beyond it:
 - **completion** — the tracker's "done" moves the ticket to `READY_PROD` and sets `deliveredAt`, and a reopen after done is drawn as `DEV_REWORK` with `reworkFrom: READY_PROD`;
 - **metadata** — title, assignee, status name and labels, which overwrite whatever the plugin guessed from a branch name. The status name is a tooltip, never a column: "Ready for QA" is one team's name for another team's stage.
 
-What a tracker event may never do is set a delivery stage the skill owns. It never moves a ticket backwards or sideways inside `LOCAL_DEV`..`DEV_VERIFIED`, so Jira saying "In Progress" about a ticket the skill already has in `DEV_TEST` is Jira being behind, and the ticket does not move. Nothing is inferred from silence either: no event, no change.
+What a tracker event may never do is set a delivery stage the skill owns. It never moves a ticket backwards or sideways inside `LOCAL_DEV`..`DEV_VERIFIED`, so Jira saying "In Progress" about a ticket the skill already has in `DEV_TEST` is Jira being behind, and the ticket does not move. A ticket the skill has never reported is different: there, an in-progress status is the only signal there is, and it puts the ticket in `LOCAL_DEV`. Nothing is inferred from silence either: no event, no change.
 
 No hook changes when a tracker is connected, and nothing stops when one breaks. With every connection dead the board draws exactly what the plugin and the background reporters report, which is what it drew before trackers existed. A connection is made once per organisation by an owner on the members page, not in this plugin's config.
 
@@ -304,6 +308,75 @@ The reporting contract is the hard limit. Key, link, short title and
 short status, and nothing else — no description, no comment, no body.
 The `gh issue view` parser stops at the `--` separator for exactly that
 reason, because everything after it is the issue body.
+
+### The title nothing looked up
+
+An agent that never opened the issue leaves the board with a key and a
+stage summary and no name. `teamflow bind` resolves the title once, and
+so does the first report for a key whose binding carries none.
+
+Only GitHub is asked, and only with a credential the developer already
+has: `gh issue view <n> --repo <owner/repo> --json title,state` when
+`gh` is installed and authenticated, otherwise
+`https://api.github.com/repos/<owner>/<repo>/issues/<n>` unauthenticated,
+which answers for public repositories and fails in silence for
+everything else. Jira and Linear are never asked — that would mean an
+API token this plugin has never needed — so their titles keep coming
+from the tool results above.
+
+The answer is cached on the binding file, including the fact that a
+lookup found nothing, so the question is asked once and not once per
+report. A lookup that failed at bind time is retried by the first
+report and then closed. The lookup never creates a binding file: doing
+so would promote an automatically detected key to a manual, sticky one.
+
+Environment variables exist so the tests can never reach github.com:
+`TEAMFLOW_GH_BIN` points `gh` at a stub, `TEAMFLOW_GIT_BIN` does the same
+for `git`, and `TEAMFLOW_GITHUB_API` points the REST fallback somewhere
+else. They sit beside `TEAMFLOW_CLAUDE_BIN`, which does the same for
+`claude`.
+
+### Where the branch is, and what its PR is doing
+
+Every issue report carries two more blocks of derived state, so the card
+dialog can answer "is it in yet" without anybody opening GitHub:
+
+```json
+"git": { "branch": "feature/510-card-dialog",
+         "head": { "sha": "a1b2c3d4e5f6", "subject": "feat: card dialog (#17)" },
+         "commitsSinceMain": 3, "ahead": 0, "behind": 0,
+         "pushed": true, "dirty": false },
+"pr":  { "number": 42, "url": "https://github.com/macleodlabs/daemon-core/pull/42",
+         "state": "open", "mergeable": "clean",
+         "checks": { "passing": 1, "failing": 0, "pending": 1 },
+         "review": "pending" }
+```
+
+- `git` comes from local `git` alone: the branch, the head commit,
+  `rev-list --count <default>..HEAD`, `rev-list --left-right --count
+  @{upstream}...HEAD` for ahead and behind, and `status --porcelain` for
+  dirty. A branch with no upstream has never been pushed. The default
+  branch is `origin/HEAD`, or `defaultBranch` in `.teamflow.json`.
+  Absent outside a repository.
+- `pr` comes from `gh pr view --json
+  number,url,state,isDraft,mergeable,mergeStateStatus,statusCheckRollup,reviewDecision`.
+  `state` is `open`, `draft`, `merged` or `closed`; `mergeable` is
+  `clean`, `conflicting` or `unknown`; `review` is `approved`,
+  `changes_requested`, `pending` or `none`. Absent when there is no
+  `gh`, no authentication, no pull request or no repository — every one
+  of those fails in silence, because none is a problem a report should
+  carry and none may interrupt a hook.
+
+The contract still holds: counts, flags, a number, a link and four
+enumerated verdicts. The head commit's subject line is the only text,
+and nothing reads a commit body, a diff or a file list.
+
+`git` is local and refreshed on every report. `pr` is a round trip to
+GitHub and a hook fires on every tool call, so it is refreshed at most
+every `prRefreshMs` (30s by default) and always on a forced publish —
+the Stop hook at the end of a turn, and `/teamflow:sync`. That is what
+moves a pull request from "checks pending" to "approved" on the board
+with nobody editing a file.
 
 ## Audit semantics
 

@@ -11,6 +11,8 @@ Validate that "$ARGUMENTS" contains an issue reference in one of these forms, th
 - a GitHub issue as `#123` (needs `githubRepo` or a GitHub origin remote) or `owner/repo#123`;
 - a Jira browse URL, a `linear.app/<workspace>/issue/<KEY>` URL or a `github.com/<owner>/<repo>/issues/<n>` URL.
 
+Every form is accepted whatever tracker the repository is configured for: an organisation runs several trackers at once, and the form of the argument names the provider. Pass the full issue URL when a bare `TEAM-123` could be either Jira's or Linear's.
+
 ```bash
 npx -y github:macleodlabs-ai/teamflow-plugin bind "$ARGUMENTS"
 ```

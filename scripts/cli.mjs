@@ -15,6 +15,7 @@ import {
   projectBindingPath,
   publishState,
   resolveGithubRepo,
+  resolveIssueTitle,
   serviceUrl,
   tenantId,
   transportOf,
@@ -161,24 +162,38 @@ async function status() {
   });
 }
 
-function bind() {
+// Naming the ticket is also the moment to learn what it is called: the
+// title is resolved once here and cached on the binding, so the first
+// report already carries it and no later one has to ask again.
+async function bind() {
   const ref = parseBindArgument(args.join(' '), config, info);
   if (!ref) throw new Error(BIND_USAGE);
+  const found = await resolveIssueTitle(ref, config, info);
   writeJson(projectBindingPath(cwd, config), {
     jiraKey: ref.key,
     tracker: ref.tracker,
     repo: ref.repo,
     workspace: ref.workspace,
+    title: found?.title,
+    status: found?.status,
+    // Only a lookup that answered closes the question. One that did not
+    // — no `gh`, offline, a private repository — leaves the next report
+    // free to try once more rather than blanking the card for good.
+    titleLookedUp: Boolean(found?.title),
     tenantId: tenantId(config),
     boundAt: new Date().toISOString(),
   });
   const state = latestSessionForCwd(cwd);
   if (state) {
     state.binding = { key: ref.key, tracker: ref.tracker, repo: ref.repo, workspace: ref.workspace, confidence: 1000, source: 'manual', sticky: true };
+    if (found?.title || found?.status) {
+      state.jira = { ...(state.jira || {}), key: ref.key, title: found.title, status: found.status };
+    }
     state.updatedAt = new Date().toISOString();
     saveSession(state);
   }
-  print(`TeamFlow bound this project to ${ref.tracker} issue ${ref.key}. Run /teamflow:sync to publish immediately.`);
+  print(`TeamFlow bound this project to ${ref.tracker} issue ${ref.key}${found?.title ? ` — ${found.title}` : ''}. `
+    + 'Run /teamflow:sync to publish immediately.');
 }
 
 function unbind() {
@@ -418,7 +433,7 @@ try {
     const { main } = await import('./hooks.mjs');
     process.exit(await main(args, { cwd, config }));
   } else if (command === 'status') await status();
-  else if (command === 'bind') bind();
+  else if (command === 'bind') await bind();
   else if (command === 'unbind') unbind();
   else if (command === 'sync') await sync();
   else if (command === 'doctor') await doctor();

@@ -20,11 +20,14 @@ import { fileURLToPath } from 'node:url';
 
 import {
   actor,
+  cachedIssueTitle,
   gitInfo,
+  gitSnapshot,
   issueProject,
   issueUrl,
   loadConfig,
   parseBindArgument,
+  prSnapshot,
   putReport,
   sendReport,
   tenantId,
@@ -220,7 +223,9 @@ export function buildPayload(options, config, info, now = new Date()) {
   if (reworkFrom) payload.reworkFrom = reworkFrom;
   if (evidence.length) payload.evidence = evidence;
 
-  return { payload };
+  // The ref travels with the payload so a caller can look the title up
+  // without re-deriving which repository `<repo>#<n>` came from.
+  return { payload, ref };
 }
 
 export async function main(argv = process.argv.slice(2), io = {}) {
@@ -255,6 +260,23 @@ export async function main(argv = process.argv.slice(2), io = {}) {
     err(`${built.errors.join('\n')}\n\nRun \`teamflow report --help\` for the accepted values.\n`);
     return 2;
   }
+
+  // A report for a key whose binding carries no title resolves one,
+  // once, and caches it there. Nobody should have to type --title for
+  // the board to say what the ticket is called.
+  if (!built.payload.title) {
+    const found = await cachedIssueTitle(built.ref, cwd, config, info);
+    if (found?.title) built.payload.title = String(found.title).slice(0, 200);
+    if (found?.status) built.payload.jiraStatus = String(found.status).slice(0, 60);
+  }
+
+  // Where the branch is and what its pull request is doing, refreshed on
+  // every report (MACLEOD-510). Derived state only: counts, flags, a
+  // number, a link and the head commit's subject.
+  const branchState = gitSnapshot(cwd, info, config);
+  if (branchState) built.payload.git = branchState;
+  const pullRequest = prSnapshot(cwd, config);
+  if (pullRequest) built.payload.pr = pullRequest;
 
   const transport = transportOf(config);
   if (options['dry-run']) {

@@ -107,6 +107,21 @@ the board with no report typed by hand. One seam,
 `enrichFromToolResult(tracker, result)`, one parser per tracker, and the
 reporting contract unchanged: title and status only, never a body.
 
+When nothing looked it up, the title is resolved once instead — at
+`/teamflow:bind`, and again on the first report for a key whose binding
+carries none. GitHub is asked through the developer's own `gh`, or the
+public REST endpoint when `gh` is missing, and the answer is cached on
+the binding. Jira and Linear are never asked: that would mean an API
+token this plugin has never needed.
+
+Every report also carries where the branch stands and what its pull
+request is doing — branch, head commit, commits since the default
+branch, ahead, behind, pushed, dirty, and for the PR its number, link,
+state, mergeability, check counts and review decision. The branch half
+is local `git`; the PR half is `gh pr view` and is simply absent when
+there is no `gh` or no pull request. Counts, flags and enumerated
+verdicts only: never a diff, a commit body or a file list.
+
 ## Reporting from anything else
 
 Claude Code was automatic for as long as it was the only tool with a

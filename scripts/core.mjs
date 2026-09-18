@@ -7,9 +7,14 @@ import { spawnSync } from 'node:child_process';
 import * as auth from './auth.mjs';
 
 // Jira and Linear share this key shape; the configured tracker decides how it is labelled and linked.
-const ISSUE_RE = /\b([A-Z][A-Z0-9]{1,11}-\d+)\b/i;
-const JIRA_URL_RE = /\/browse\/([A-Z][A-Z0-9]{1,11}-\d+)\b/i;
-const LINEAR_URL_RE = /linear\.app\/([\w.-]+)\/issue\/([A-Z][A-Z0-9]{1,11}-\d+)/i;
+// The upper bound is adapters/teamflow/schema.py's `_JIRA_KEY`, so a key the
+// service accepts is a key the plugin can bind. It was 12 characters here and
+// 20 there, which is a key that reports fine and cannot be named by hand.
+const ISSUE_RE = /\b([A-Z][A-Z0-9]{1,19}-\d+)\b/i;
+const JIRA_URL_RE = /\/browse\/([A-Z][A-Z0-9]{1,19}-\d+)\b/i;
+const LINEAR_URL_RE = /linear\.app\/([\w.-]+)\/issue\/([A-Z][A-Z0-9]{1,19}-\d+)/i;
+// The whole argument, for `teamflow bind` and `teamflow report --issue`.
+const BARE_KEY_RE = /^[A-Z][A-Z0-9]{1,19}-\d+$/i;
 const GITHUB_URL_RE = /github\.com\/([\w.-]+)\/([\w.-]+)\/issues\/(\d+)\b/i;
 // The lookbehind keeps a deeper path such as src/lib/dataSource.ts#42 from reading as owner/repo#n.
 const GITHUB_REF_RE = /(?<![\w.\-/])([\w.-]+)\/([\w.-]+)#(\d+)\b/;
@@ -122,13 +127,30 @@ function toolRef(payload, tracker, config, info) {
   return githubRef(owner && name ? `${owner}/${name}` : resolveGithubRepo(config, info), number[1]);
 }
 
+/**
+ * The bind grammar: a key, a bare number, owner/repo#n, or an issue URL.
+ *
+ * An organisation runs several trackers at once (MACLEOD-477), so the form of
+ * the argument names the provider and the configured tracker is only the
+ * default for the two forms that cannot name one themselves — a bare `#123`,
+ * which is GitHub, and a bare `TEAM-123`, which is Jira or Linear. Gating the
+ * shared-shape key on the configured tracker is what made `teamflow bind
+ * MACLEOD-507` answer the usage error in a repository configured for GitHub.
+ */
 export function parseBindArgument(value, config = {}, info = {}) {
   const raw = String(value ?? '').trim();
   if (!raw) return undefined;
   // An explicit bind of "#123" means GitHub even when the configured tracker is not.
   const bare = raw.match(/^#?(\d+)$/);
   if (bare) return githubRef(resolveGithubRepo(config, info), bare[1]);
-  return detectIssueRef(raw, config, info);
+  const detected = detectIssueRef(raw, config, info);
+  if (detected) return detected;
+  if (!BARE_KEY_RE.test(raw)) return undefined;
+  // Reaching here means the configured tracker is GitHub, because a Jira or
+  // Linear install already answered above. The key is not a GitHub key —
+  // those are <repo>#<n> — so it belongs to whichever other tracker this
+  // install has coordinates for, and Jira last, as trackerOf defaults there.
+  return { key: raw.toUpperCase(), tracker: config.linearWorkspace ? 'linear' : 'jira' };
 }
 
 export function safeExec(command, args = [], options = {}) {
@@ -245,8 +267,11 @@ export function tenantPath(config, relativePath) {
   return `tenants/${tenantId(config)}/${String(relativePath).replace(/^\/+/, '')}`;
 }
 
+// TEAMFLOW_GIT_BIN is the test seam, beside TEAMFLOW_CLAUDE_BIN and
+// TEAMFLOW_GH_BIN: a stub can answer "three ahead, two behind, dirty"
+// without a test having to build a repository in that state.
 function git(cwd, args) {
-  return safeExec('git', ['-C', cwd, ...args], { cwd, timeout: 2000 });
+  return safeExec(process.env.TEAMFLOW_GIT_BIN || 'git', ['-C', cwd, ...args], { cwd, timeout: 2000 });
 }
 
 export function gitInfo(cwd) {
@@ -264,6 +289,151 @@ export function gitInfo(cwd) {
       .replace(/\.git$/, '');
   }
   return { branch, remote, repository, commit, lastMessage, name, email };
+}
+
+// --- where the branch is, and what its PR is doing -------------------
+//
+// MACLEOD-510. The card dialog wants the two things a person checks
+// before asking "is it in yet": where the branch stands against the
+// default branch, and what the pull request is doing. Both are derived
+// state and stay inside docs/REPORTING_CONTRACT.md: counts, flags, a
+// number, a link, four enumerated verdicts. Never a diff, never a
+// commit body, never a file list — the head commit's subject line is
+// the one piece of text, because a card that cannot say what the last
+// commit was is a card nobody reads.
+
+function defaultBranchName(cwd, config = {}) {
+  if (config.defaultBranch) return String(config.defaultBranch);
+  const head = git(cwd, ['symbolic-ref', '--quiet', 'refs/remotes/origin/HEAD']).stdout;
+  return head.match(/^refs\/remotes\/origin\/(.+)$/)?.[1] || 'main';
+}
+
+/**
+ * { branch, head, commitsSinceMain, ahead, behind, pushed, dirty }, or
+ * undefined outside a repository. Local git only, so it is cheap enough
+ * to refresh on every report.
+ */
+export function gitSnapshot(cwd, info = {}, config = {}) {
+  const branch = info.branch || git(cwd, ['branch', '--show-current']).stdout || undefined;
+  const sha = info.commit || git(cwd, ['rev-parse', '--short=12', 'HEAD']).stdout || undefined;
+  if (!branch && !sha) return undefined;
+
+  const base = defaultBranchName(cwd, config);
+  // The default branch as the remote has it, falling back to the local
+  // one in a clone that has never fetched.
+  const counted = [`origin/${base}`, base]
+    .map((ref) => git(cwd, ['rev-list', '--count', `${ref}..HEAD`]))
+    .find((result) => result.ok && /^\d+$/.test(result.stdout));
+  // `--left-right` counts the upstream side first, so behind comes
+  // before ahead. A branch with no upstream has neither, and is not
+  // pushed by definition.
+  const tracking = git(cwd, ['rev-list', '--left-right', '--count', '@{upstream}...HEAD']);
+  const [behind, ahead] = tracking.ok && /^\d+\s+\d+$/.test(tracking.stdout)
+    ? tracking.stdout.split(/\s+/).map(Number)
+    : [undefined, undefined];
+  const subject = git(cwd, ['log', '-1', '--pretty=%s']).stdout || undefined;
+
+  return {
+    branch,
+    head: sha ? { sha, subject: subject?.slice(0, 120) } : undefined,
+    commitsSinceMain: counted ? Number(counted.stdout) : undefined,
+    ahead,
+    behind,
+    pushed: ahead === undefined ? false : ahead === 0,
+    dirty: Boolean(git(cwd, ['status', '--porcelain']).stdout),
+  };
+}
+
+// gh's CheckRun reports `conclusion` once `status` is COMPLETED; its
+// StatusContext reports `state` and has no status at all. Anything
+// still running, queued or unrecognised counts as pending, because a
+// check nobody can classify has not passed.
+const CHECK_PASSING = new Set(['SUCCESS', 'NEUTRAL', 'SKIPPED']);
+const CHECK_FAILING = new Set(['FAILURE', 'TIMED_OUT', 'CANCELLED', 'ACTION_REQUIRED', 'STARTUP_FAILURE', 'ERROR']);
+
+function checkCounts(rollup) {
+  const counts = { passing: 0, failing: 0, pending: 0 };
+  for (const run of Array.isArray(rollup) ? rollup : []) {
+    const verdict = String(run?.conclusion || run?.state || '').toUpperCase();
+    const status = String(run?.status || '').toUpperCase();
+    if (status && status !== 'COMPLETED') counts.pending += 1;
+    else if (CHECK_FAILING.has(verdict)) counts.failing += 1;
+    else if (CHECK_PASSING.has(verdict)) counts.passing += 1;
+    else counts.pending += 1;
+  }
+  return counts;
+}
+
+function prState(pr) {
+  const state = String(pr.state || '').toUpperCase();
+  if (state === 'MERGED') return 'merged';
+  if (state === 'CLOSED') return 'closed';
+  return pr.isDraft ? 'draft' : 'open';
+}
+
+// `mergeable` is the API's own three-way answer; `mergeStateStatus`
+// DIRTY is the same news arriving by a different route, and either one
+// is enough to say the branch conflicts.
+function prMergeable(pr) {
+  const mergeable = String(pr.mergeable || '').toUpperCase();
+  if (mergeable === 'CONFLICTING' || String(pr.mergeStateStatus || '').toUpperCase() === 'DIRTY') return 'conflicting';
+  return mergeable === 'MERGEABLE' ? 'clean' : 'unknown';
+}
+
+function prReview(decision) {
+  const value = String(decision || '').toUpperCase();
+  if (value === 'APPROVED') return 'approved';
+  if (value === 'CHANGES_REQUESTED') return 'changes_requested';
+  return value === 'REVIEW_REQUIRED' ? 'pending' : 'none';
+}
+
+const PR_FIELDS = 'number,url,state,isDraft,mergeable,mergeStateStatus,statusCheckRollup,reviewDecision';
+
+/**
+ * { number, url, state, mergeable, checks, review } for the branch's
+ * pull request, or undefined.
+ *
+ * Undefined covers every way there is not one to report: no `gh`, `gh`
+ * not authenticated, no PR for this branch, not a GitHub remote, not a
+ * repository. None of them is a problem a report should carry, and none
+ * of them may interrupt a hook, so the failure is silent.
+ */
+export function prSnapshot(cwd, config = {}) {
+  const result = safeExec(process.env.TEAMFLOW_GH_BIN || 'gh',
+    ['pr', 'view', '--json', PR_FIELDS],
+    { cwd, timeout: Number(config.lookupTimeoutMs || 5000) });
+  if (!result.ok) return undefined;
+  let pr;
+  try { pr = JSON.parse(result.stdout); } catch { return undefined; }
+  if (!pr || typeof pr !== 'object' || !Number.isInteger(Number(pr.number))) return undefined;
+  return {
+    number: Number(pr.number),
+    url: /^https?:\/\//i.test(pr.url || '') ? pr.url : undefined,
+    state: prState(pr),
+    mergeable: prMergeable(pr),
+    checks: checkCounts(pr.statusCheckRollup),
+    review: prReview(pr.reviewDecision),
+  };
+}
+
+/**
+ * Put both blocks on the session before the report is built.
+ *
+ * The git half is local and refreshed every time. The PR half is a
+ * round trip to GitHub, and a hook fires on every tool call, so it is
+ * refreshed at most every `prRefreshMs` — unless the caller forces it,
+ * which `publishState` does on Stop and on `/teamflow:sync`. That is
+ * what moves a PR from "checks pending" to "approved" on the board
+ * without anybody editing a file.
+ */
+export function refreshDelivery(state, config = {}, info = {}, { force = false } = {}) {
+  const cwd = state.cwd || process.cwd();
+  state.git = gitSnapshot(cwd, info, config);
+  const ttl = Number(config.prRefreshMs ?? 30000);
+  if (!force && state.prCheckedAt && Date.now() - state.prCheckedAt < ttl) return state;
+  state.prCheckedAt = Date.now();
+  state.pr = prSnapshot(cwd, config);
+  return state;
 }
 
 export function actor(config, info) {
@@ -551,6 +721,116 @@ export function enrichBinding(state, input) {
   };
 }
 
+// --- resolving a title the hooks never saw ---------------------------
+//
+// A card that says only "teamflow#17 · Local tests passed" is a card
+// nobody recognises. The title usually arrives through
+// enrichFromToolResult, from a tool result the hooks already see — but
+// only if the agent happened to look the issue up. When it did not, one
+// lookup fills the gap, and the answer is cached on the binding so no
+// second report ever asks.
+//
+// GitHub is the only tracker asked directly, and with no credential of
+// TeamFlow's own: `gh` when the developer has it (already authenticated,
+// so private repositories work), otherwise the public REST endpoint,
+// which answers for public repositories and is allowed to fail in
+// silence for everything else. Jira and Linear have no such path —
+// adding one would mean asking for an API token this plugin has never
+// needed — so their titles keep coming from tool results.
+//
+// Two environment variables exist for the tests: TEAMFLOW_GH_BIN points
+// `gh` at a stub and TEAMFLOW_GITHUB_API points the fallback somewhere
+// that is not github.com. Nothing in a test may reach either.
+
+function githubApiBase() {
+  return String(process.env.TEAMFLOW_GITHUB_API || 'https://api.github.com').replace(/\/+$/, '');
+}
+
+async function lookupGithubIssue(repo, number, config = {}) {
+  const gh = safeExec(process.env.TEAMFLOW_GH_BIN || 'gh',
+    ['issue', 'view', String(number), '--repo', repo, '--json', 'title,state'],
+    { timeout: Number(config.lookupTimeoutMs || 5000) });
+  if (gh.ok) {
+    const found = enrichFromToolResult('github', gh.stdout);
+    if (found?.title) return found;
+  }
+  try {
+    const response = await fetch(`${githubApiBase()}/repos/${repo}/issues/${number}`, {
+      headers: { Accept: 'application/vnd.github+json', 'User-Agent': 'teamflow-plugin' },
+      signal: AbortSignal.timeout(Number(config.lookupTimeoutMs || 5000)),
+    });
+    if (!response.ok) return undefined;
+    return enrichFromToolResult('github', await response.json());
+  } catch {
+    // Offline, rate limited, private, or no such issue. A missing title
+    // is a plain card; a thrown error would be a broken hook.
+    return undefined;
+  }
+}
+
+// { title, status, url } for the bound issue, or undefined. Never throws.
+export async function resolveIssueTitle(binding = {}, config = {}, info = {}) {
+  if (!binding.key) return undefined;
+  const tracker = binding.tracker || trackerOf(config);
+  if (tracker !== 'github') return undefined;
+  const number = String(binding.key).split('#')[1];
+  const repo = binding.repo || resolveGithubRepo(config, info);
+  if (!number || !repo) return undefined;
+  return lookupGithubIssue(repo, number, config);
+}
+
+/**
+ * The binding file is the cache. `teamflow bind` fills it, a report
+ * reads it, and a lookup that had to go out writes it back — including
+ * when it found nothing, so a private repository is asked once and not
+ * once per report.
+ *
+ * The file is only ever updated, never created: creating it here would
+ * turn an automatically detected key into a manual, sticky binding that
+ * nobody asked for.
+ */
+export async function cachedIssueTitle(ref, cwd, config = {}, info = {}) {
+  const file = projectBindingPath(cwd, config);
+  const cached = readJson(file);
+  const isCache = cached?.jiraKey === ref.key;
+  if (isCache && (cached.title || cached.titleLookedUp)) {
+    return cached.title ? { title: cached.title, status: cached.status } : undefined;
+  }
+  const found = await resolveIssueTitle(ref, config, info);
+  if (isCache) {
+    writeJson(file, {
+      ...cached,
+      title: found?.title || cached.title,
+      status: found?.status || cached.status,
+      titleLookedUp: true,
+    });
+  }
+  return found;
+}
+
+/**
+ * Give `state.jira` a title before the report goes out, at most one
+ * lookup per bound key per session. Mutates and returns whether it
+ * changed anything, because publishState is the only caller and it
+ * already owns saving the session.
+ */
+export async function ensureIssueTitle(state, config = {}, info = {}) {
+  const key = state.binding?.key;
+  if (!key) return false;
+  if (state.jira?.key === key && state.jira.title) return false;
+  if (state.titleLookedUpFor === key) return false;
+  state.titleLookedUpFor = key;
+  const found = await cachedIssueTitle(state.binding, state.cwd || process.cwd(), config, info);
+  if (!found?.title && !found?.status) return false;
+  state.jira = {
+    ...(state.jira || {}),
+    key,
+    title: found.title || state.jira?.title,
+    status: found.status || state.jira?.status,
+  };
+  return true;
+}
+
 export function extractTestEvidence(value) {
   const text = typeof value === 'string' ? value : JSON.stringify(value ?? '');
   const evidence = [];
@@ -716,6 +996,10 @@ export function issuePayload(state, config, info) {
     updatedAt: state.updatedAt || new Date().toISOString(),
     loopCount: state.loopCount || 0,
     reworkFrom: state.reworkFrom,
+    // MACLEOD-510. Set by refreshDelivery, and absent rather than empty
+    // outside a repository or when the branch has no pull request.
+    git: state.git,
+    pr: state.pr,
     evidence: (state.evidence || []).slice(0, 8),
     executions: [
       {
@@ -736,7 +1020,10 @@ export function sanitizePayload(value) {
   const allowed = new Set([
     'tracker','jiraKey','jiraUrl','title','jiraStatus','parentKeys','project','actor','repository','branch',
     'tenantId','stage','status','summary','updatedAt','loopCount','reworkFrom','evidence','executions',
-    'id','kind','label','value','displayName','active','recent','slot'
+    'id','kind','label','value','displayName','active','recent','slot',
+    // MACLEOD-510, and the same names adapters/teamflow/schema.py takes.
+    'git','head','sha','subject','commitsSinceMain','ahead','behind','pushed','dirty',
+    'pr','number','url','state','mergeable','checks','passing','failing','pending','review',
   ]);
   function walk(v) {
     if (Array.isArray(v)) return v.slice(0, 50).map(walk);
@@ -1110,6 +1397,14 @@ export function aggregateActor(config, info) {
 
 export async function publishState(state, config, info, { force = false } = {}) {
   state.tenantId = tenantId(config);
+  // Before the envelope is built, not after: the board wants the ticket's
+  // name on the first report, not on whichever later one happens to follow
+  // the agent looking the issue up.
+  await ensureIssueTitle(state, config, info);
+  // Where the branch is and what its PR is doing, refreshed here so a
+  // forced publish — Stop, or /teamflow:sync — always carries the
+  // current answer (MACLEOD-510).
+  refreshDelivery(state, config, info, { force });
   const payload = issuePayload(state, config, info);
   if (!payload) return { ok: false, skipped: true, reason: 'No issue bound' };
   const now = Date.now();

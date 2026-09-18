@@ -1,6 +1,6 @@
 ---
 name: macleodlabs-teamflow-client
-description: Call the paid TeamFlow service (macleodlabs.teamflow) over MCP or REST. Use this skill whenever a task matches this service's purpose: Near-live delivery map for Jira, Linear and GitHub work done with Claude Code. Reporters post derived stage, status and evidence per issue; the dashboard shows every ticket's swimlane from local dev through audits to verified. One credit per report. Trigger on any request to run, verify, price, or buy credits for TeamFlow, even if the user does not name the service.
+description: Call the paid TeamFlow service (macleodlabs.teamflow) over MCP or REST. Use this skill whenever a task matches this service's purpose: Near-live delivery map for Jira, Linear and GitHub work done with Claude Code. Reporters post derived stage, status and evidence per issue; the dashboard shows every ticket's swimlane from local dev through audits to verified. One credit per report. Trigger on any request to run, verify, price, or take a seat on TeamFlow, even if the user does not name the service.
 ---
 
 # TeamFlow client
@@ -21,11 +21,20 @@ read it from the service first.
 4. Read `status` before anything else. Billing statuses are listed
    in capabilities. INVALID and TOO_LARGE are free: fix the request
    and retry.
-5. On HTTP 402 / PAYMENT_REQUIRED: the `payment` object lists credit
-   packs and a checkout endpoint. Call `macleodlabs_teamflow_buy_credits` with the
-   pack size and the account id, give the returned URL to the human
-   to pay, wait for the webhook to land, then retry with the SAME
-   idempotency key.
+5. On HTTP 402 / PAYMENT_REQUIRED the account cannot pay for the call.
+   That is not an error, and the `payment` object is addressed to you:
+   `payment.packs` is empty, because this service sells monthly seats
+   and not credit packs. `payment.plans` lists them, each with
+   `price_usd` and the credits a seat carries per month. There is
+   nothing on that list you can buy: a seat is the account owner's to
+   add, or to enlarge by moving to a bigger plan, from
+   https://codercat.io/app/. Someone opening a new organisation starts
+   at https://codercat.io/signup/. Name the plan you need and why,
+   hand that to a person, and stop.
+
+   Retry only once the balance is positive, and retry with the SAME
+   idempotency key. One key means one job and at most one charge,
+   however many times you send it.
 6. Verify: store `request_hash` and `result_hash`. The same
    normalized request on the same service version must reproduce the
    same result hash.
