@@ -42,6 +42,7 @@ The legacy transport writes the same documents straight to S3 at the paths below
 /data/tenants/<tenant>/runtime/<ISSUE-KEY>/audit-dev.json
 /data/tenants/<tenant>/runtime/<ISSUE-KEY>/security.json
 /data/tenants/<tenant>/runtime/<ISSUE-KEY>/tracker.json
+/data/tenants/<tenant>/runtime/<ISSUE-KEY>/pr.json
 ```
 
 `<ISSUE-KEY>` is the canonical key: `DAEMON-142` for Jira, `ENG-42` for Linear, `daemon-core#123` (repo name plus number) for GitHub Issues.
@@ -74,7 +75,7 @@ Each writer owns a deterministic object:
 - deployment owns `deploy.json`;
 - deployed tests own `dev-test.json`;
 - scanners own `security.json`;
-- the tracker webhook owns `tracker.json`; `/v1/report` refuses that slot by name, because the webhook proves who sent a delivery with an HMAC signature and a report only proves who holds the tenant's API key.
+- the tracker webhook owns `tracker.json`, and the same webhook's pull request, review and check deliveries own `pr.json`; `/v1/report` refuses both slots by name, because the webhook proves who sent a delivery with an HMAC signature and a report only proves who holds the tenant's API key.
 
 The browser merges sidecars by execution ID. Independent background jobs therefore do not contend with Claude's primary ticket state.
 
@@ -93,6 +94,31 @@ The dashboard tenant selector is **navigation, not authorization**. For external
 - actor, repository and branch
 - `git`: `branch`, `head.sha` and `head.subject`, `commitsSinceMain`, `ahead`, `behind`, `pushed`, `dirty` — where the branch stands, as counts and flags. Derived state: a count of commits is not the commits, and the subject line is capped at one line's length so a hunk cannot ride in as prose.
 - `pr`: `number`, `url`, `state`, `mergeable`, `checks.{passing,failing,pending}`, `review` — what the forge already publishes about the pull request. Derived state: how many checks are in each state, never which ones and never their output.
+
+### The `pr` sidecar
+
+`runtime/<KEY>/pr.json` is the same `pr` block as above, written by the connector webhook instead of by a reporter, and it is an **execution**: `id`, `kind`, `label`, `stage`, `status` and `summary` beside the block, so the dashboard merges it with `ci.json` and `deploy.json` rather than down a path of its own. It also carries `occurredAt` (the forge's clock for the delivery it last applied), `updatedAt`, `deliveryId`, `provider`, `repository`, `headSha`, `checkRuns` and a `history` of the last twenty deliveries.
+
+`checkRuns` maps a runner to its verdict — `passing`, `failing` or `pending` — keyed by the numeric id GitHub gives the workflow or the app that owns the check suite, never by a name and never with a log, an annotation or a step. It exists so the counts are a tally of runners rather than of deliveries: a flaky job that reran four times is one check, and a green rerun cannot clear a different job's genuine failure. It is dropped whole when the head commit changes, because a run that passed against a commit nobody is on says nothing about the code on screen.
+
+`history` rows are `event`, `action`, `occurredAt`, `state` and `deliveryId`. No title, no branch, no body, no review comment.
+
+### The `detail` block on the `tracker` sidecar
+
+`runtime/<KEY>/tracker.json` carries a `detail` block: the structure the tracker keeps around the issue, written only by a verified connector webhook and never by a reporter. Its fields are the whole of it:
+
+- `priority`: `{value, name}` — a number to sort by and a word to read.
+- `estimate`: a number. A Linear estimate or Jira story points.
+- `project`, `cycle`, `dueDate`: names and a date. `cycle` is a Linear cycle or a Jira sprint.
+- `milestone`: `{title, dueOn}`.
+- `assignees`: `{id, name}` each, capped at twenty.
+- `parent`: `{key, title}`. `children`: the same, capped at fifty.
+- `childrenTotal` / `childrenDone`: a tally, for a tracker that counts sub-issues without naming them.
+- `relations`: `{type, key, title}` each, capped at fifty, where `type` is `blocks`, `blocked_by`, `related` or `duplicate`.
+
+Derived state, on the same rule as everything above: a key and a title name an issue. A title is capped at 120 characters. No issue description, no comment, no link comment, and no issue body — GitHub's relations are the keys read out of a body that is then dropped, never the body.
+
+An absent field means *this tracker did not say*, which is not the same as an empty list and is not drawn as one. `docs/TRACKERS.md` has the per-tracker table of what each webhook states and what it cannot.
 - normalized stage/status
 - `reworkFrom` and loop count
 - concise derived summary
@@ -105,3 +131,9 @@ Never persist prompts/transcripts, source contents/diffs, raw shell commands/too
 ## Caching
 
 Static assets: long/content-hashed caching. Current state: short TTL plus ETag / `If-None-Match`. Missing runtime sidecars are normal.
+
+## The push channel
+
+A dashboard may be told that its tenant moved rather than asking every five seconds (MACLEOD-517). What travels on that channel is a pointer and never a document: the tenant's `updatedAt` watermark and the issue keys that changed, and nothing else. The dashboard then reads `GET /v1/state/tenants/<account>/bundle` exactly as a poll would, so every byte of state still leaves through the one route this allowlist governs. A second way out would be a second allowlist to keep in step with this one, and there is no reason to have one: the reader has to make that request anyway to see the change.
+
+The subscription key is the account the credential resolved to, never one the client named, so a connection only ever hears about its own tenant.

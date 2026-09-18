@@ -29,14 +29,34 @@ const DEFAULT_SCOPES = 'openid email profile';
 const REFRESH_MARGIN_MS = 5 * 60 * 1000;
 const LOGIN_TIMEOUT_MS = 180000;
 const SESSION_VERSION = 1;
+// Discovery runs once per sign-in and decides whether a sign-in is
+// possible at all, so it gets longer than a report does.
+const CAPABILITIES_TIMEOUT_MS = 10000;
+const CAPABILITIES_ATTEMPTS = 2;
+// A session whose credential is one machine's device credential
+// rather than a refresh token. Nothing about it is refreshed, and
+// `status`, `logout` and the reporters all branch on this.
+const DEVICE_KIND = 'device';
+const DEVICE_INTERVAL_MS = 5000;
+// What the service adds to the interval when it says slow_down. The
+// grant's own number, and the point of it is that a client which
+// ignores the answer gets itself cut off.
+const SLOW_DOWN_MS = 5000;
 
 export function sessionPath() {
   return path.join(os.homedir(), '.config', 'teamflow', 'session.json');
 }
 
+// Two kinds of session, and both are a credential this machine can
+// report with: a refresh token from the browser sign-in, or a device
+// credential from the code flow. A file with neither is not a session.
 export function readSession() {
   const session = readJson(sessionPath());
-  return session?.refreshToken ? session : undefined;
+  return (session?.refreshToken || session?.deviceToken) ? session : undefined;
+}
+
+export function isDeviceSession(session = readSession()) {
+  return session?.kind === DEVICE_KIND && Boolean(session.deviceToken);
 }
 
 export function hasSession() {
@@ -100,17 +120,38 @@ export function claimsOf(idToken) {
 
 // --- discovery -----------------------------------------------------
 
-async function capabilitiesAuth(config) {
-  try {
-    const response = await fetch(`${serviceUrl(config)}/v1/capabilities`, {
-      signal: AbortSignal.timeout(Number(config.serviceTimeoutMs || 5000)),
-    });
-    if (!response.ok) return undefined;
-    const body = await response.json();
-    return body?.auth;
-  } catch {
-    return undefined;
+// Two answers that used to look the same and are not: the service said
+// it publishes no auth block, or the service never answered at all.
+// Told the first when the second happened, a developer goes looking for
+// configuration that was never the problem -- which is exactly what the
+// bug report said the plugin did.
+//
+// Ten seconds and one retry, because a cold Lambda behind CloudFront
+// spends most of the first window starting up. The retry is a second
+// window rather than a pause: by the time it goes out the function is
+// warm. Only a timeout, a transport error or a 5xx is retried; a 404 is
+// a service that has no such route and will not grow one on a retry.
+async function capabilities(config) {
+  const url = `${serviceUrl(config)}/v1/capabilities`;
+  const timeoutMs = Number(config.serviceTimeoutMs || CAPABILITIES_TIMEOUT_MS);
+  let detail;
+  for (let attempt = 0; attempt < CAPABILITIES_ATTEMPTS; attempt += 1) {
+    try {
+      const response = await fetch(url, { signal: AbortSignal.timeout(timeoutMs) });
+      if (response.status >= 500) {
+        detail = `the service answered ${response.status}`;
+        continue;
+      }
+      if (!response.ok) return { reached: true };
+      const body = await response.json();
+      return { reached: true, auth: body?.auth };
+    } catch (error) {
+      detail = error?.name === 'TimeoutError'
+        ? `no answer in ${timeoutMs}ms`
+        : (error instanceof Error ? error.message : String(error));
+    }
   }
+  return { reached: false, detail };
 }
 
 // OAuth wants one space-separated string, and the service publishes
@@ -133,12 +174,27 @@ export function scopeString(...values) {
 // and env override it so a developer can point at a preview stack, and
 // cover the window before the kit publishes the block at all.
 export async function discoverAuth(config = {}) {
-  const published = (config.authIssuer && config.authClientId) ? undefined : await capabilitiesAuth(config);
+  const overridden = Boolean(config.authIssuer && config.authClientId);
+  const probe = overridden ? { reached: true } : await capabilities(config);
+  if (!probe.reached) {
+    return {
+      ok: false,
+      unreachable: true,
+      reason: `could not reach ${serviceUrl(config)} to ask how to sign in`
+        + `${probe.detail ? ` (${probe.detail})` : ''}; check the network and try again`,
+    };
+  }
+  const published = probe.auth;
   const issuer = String(config.authIssuer || published?.issuer || '').replace(/\/+$/, '');
   const clientId = config.authClientId || published?.client_id;
   if (!issuer || !clientId) {
     return {
       ok: false,
+      // Carried even here: the device flow needs neither an issuer
+      // nor a client id, so a service that publishes only that block
+      // can still sign somebody in.
+      device: Boolean(published?.device?.enabled),
+      deviceVerificationUrl: published?.device?.verification_url,
       reason: 'the service published no auth configuration; set authIssuer and authClientId '
         + '(TEAMFLOW_AUTH_ISSUER, TEAMFLOW_AUTH_CLIENT_ID) to sign in against a specific stack',
     };
@@ -153,6 +209,11 @@ export async function discoverAuth(config = {}) {
       config.authScopes || published?.scopes || DEFAULT_SCOPES,
       config.authApiScope || published?.api_scope || '',
     ),
+    // Whether asking for a device code is an option here. Published
+    // by the service, so a CLI on a machine with no browser knows
+    // before it asks rather than reading a 404 as an outage.
+    device: Boolean(published?.device?.enabled),
+    deviceVerificationUrl: published?.device?.verification_url,
   };
 }
 
@@ -232,6 +293,22 @@ async function loopback() {
   throw new Error(`no free loopback port in ${REDIRECT_PORTS[0]}-${REDIRECT_PORTS.at(-1)}; close whatever is using them and retry`);
 }
 
+// Whether shelling out to a browser can possibly work here. macOS and
+// Windows always have one in front of somebody; an X or Wayland display
+// says the same about a Linux desktop. A Linux box with neither -- a
+// server, a container, an SSH session -- has nowhere to open a window,
+// and running `xdg-open` there buys a five-second wait and no browser.
+export function browserPossible({ env = process.env, platform = process.platform } = {}) {
+  if (platform === 'darwin' || platform === 'win32') return true;
+  return Boolean(env.DISPLAY || env.WAYLAND_DISPLAY);
+}
+
+// Sign-in progress goes to stderr: stdout carries the result the caller
+// parses, and a URL printed into it would land in the middle of that.
+function printLine(line) {
+  process.stderr.write(`${line}\n`);
+}
+
 function openInBrowser(url) {
   const opener = process.platform === 'darwin'
     ? ['open', [url]]
@@ -245,6 +322,11 @@ function openInBrowser(url) {
 
 export async function login(config = {}, {
   openUrl = openInBrowser, timeoutMs = LOGIN_TIMEOUT_MS, account, chooseAccount,
+  // `teamflow login --no-browser`, a box with no display, and whether
+  // anybody is watching a terminal. None of them stop a sign-in: they
+  // decide whether the URL is opened here or handed to the person.
+  noBrowser = false, canOpenBrowser = browserPossible(), tty = Boolean(process.stdout.isTTY),
+  notify = printLine,
 } = {}) {
   const auth = await discoverAuth(config);
   if (!auth.ok) return auth;
@@ -263,7 +345,20 @@ export async function login(config = {}, {
       code_challenge_method: 'S256',
     })}`;
 
-    const opened = await openUrl(authorizeUrl);
+    // Nothing is opened when there is nowhere to open it. Otherwise the
+    // opener is asked, and its answer is believed: `open` and `xdg-open`
+    // exit non-zero when there is no browser to hand the URL to.
+    const opened = (noBrowser || !canOpenBrowser) ? false : await openUrl(authorizeUrl);
+    // The URL goes out now, while the listener is up, rather than after
+    // the timeout when the port has closed and the URL leads nowhere.
+    // A run with no terminal gets it too: Claude Code drives this over a
+    // pipe, and the person only ever sees what was printed.
+    const printedUrl = !opened || !tty;
+    if (printedUrl) {
+      notify(`TeamFlow sign-in: open this URL in any browser on this machine within`
+        + ` ${Math.max(1, Math.round(timeoutMs / 1000))} seconds. This terminal keeps waiting.`);
+      notify(authorizeUrl);
+    }
     // The timer is cleared, not just lost to the race: an uncancelled
     // three-minute timeout keeps the process alive long after the
     // developer has signed in.
@@ -274,9 +369,9 @@ export async function login(config = {}, {
     ]).finally(() => clearTimeout(timer));
 
     if (callback.error === 'timeout') {
-      return { ok: false, reason: 'sign-in timed out', authorizeUrl, opened };
+      return { ok: false, reason: 'sign-in timed out; nobody opened the URL', authorizeUrl, opened, printedUrl };
     }
-    if (callback.error) return { ok: false, reason: callback.error, authorizeUrl, opened };
+    if (callback.error) return { ok: false, reason: callback.error, authorizeUrl, opened, printedUrl };
     // A mismatched state means the code came from a request this
     // process did not start. Redeeming it would be redeeming somebody
     // else's authorization.
@@ -333,10 +428,171 @@ export async function login(config = {}, {
       createdAt: new Date().toISOString(),
     });
     rememberToken(exchanged.body, exchanged.body.refresh_token, email);
-    return { ok: true, email, issuer: auth.issuer, account: bound.account, accountName: bound.name, bound: bound.bound };
+    return {
+      ok: true, email, issuer: auth.issuer, account: bound.account, accountName: bound.name,
+      bound: bound.bound, opened, printedUrl,
+    };
   } finally {
     await server.close();
   }
+}
+
+// --- device sign-in --------------------------------------------------
+//
+// The loopback redirect above goes to 127.0.0.1, which is this
+// machine and nobody else's. When the browser is somewhere else --
+// an SSH session, a container, an agent running on a box in a rack --
+// no URL printed on this terminal can help, because the address it
+// comes back to is not reachable from where the browser is.
+//
+// So: the machine asks the service for a code, the person carries the
+// short half of it to any browser anywhere, signs in the way they
+// always do and approves. What comes back is a device credential --
+// revocable, bound to their seat, and nothing anybody had to type
+// into a terminal.
+
+function deviceLabel() {
+  // What this machine will be called on the members page. A hostname
+  // is the one name a person recognises without being told it.
+  return String(os.hostname() || 'unnamed machine').slice(0, 64);
+}
+
+const wait = (ms) => new Promise((resolve) => { setTimeout(resolve, ms); });
+
+async function deviceCall(config, route, payload) {
+  let response;
+  try {
+    response = await fetch(`${serviceUrl(config)}${route}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+      signal: AbortSignal.timeout(Number(config.serviceTimeoutMs || 10000)),
+    });
+  } catch (error) {
+    return { ok: false, unreachable: true, reason: `service unreachable: ${error instanceof Error ? error.message : String(error)}` };
+  }
+  let body;
+  try { body = await response.json(); } catch { body = undefined; }
+  if (!response.ok) {
+    return {
+      ok: false,
+      status: response.status,
+      // The grant's own slugs. The caller branches on these, so they
+      // are carried through rather than flattened into prose.
+      error: body?.error,
+      reason: body?.detail || body?.message || body?.error || `the service answered ${response.status}`,
+    };
+  }
+  return { ok: true, body: body || {} };
+}
+
+const DEVICE_REFUSALS = {
+  access_denied: 'the sign-in was refused in the browser',
+  expired_token: 'the code expired before anybody approved it',
+  invalid_grant: 'that code is no longer valid; start again',
+};
+
+export async function deviceLogin(config = {}, {
+  notify = printLine, label = deviceLabel(), timeoutMs = LOGIN_TIMEOUT_MS,
+  sleep = wait, now = () => Date.now(),
+} = {}) {
+  const started = await deviceCall(config, '/v1/auth/device', { label });
+  if (!started.ok) {
+    return { ok: false, reason: `the service would not start a device sign-in: ${started.reason}` };
+  }
+  const grant = started.body;
+  if (!grant.device_code || !grant.user_code) {
+    return { ok: false, reason: 'the service answered a device request without a code' };
+  }
+  const url = grant.verification_url_complete || grant.verification_url;
+  notify(`TeamFlow sign-in: open ${url} in a browser on ANY machine and enter the code ${grant.user_code}`);
+
+  let interval = Math.max(1000, (Number(grant.interval) || 0) * 1000 || DEVICE_INTERVAL_MS);
+  // Whichever runs out first: the caller's patience or the code's own
+  // life. Polling a code the service has already forgotten is noise.
+  const deadline = now() + Math.min(timeoutMs, (Number(grant.expires_in) || 600) * 1000);
+  while (now() + interval <= deadline) {
+    await sleep(interval);
+    const answer = await deviceCall(config, '/v1/auth/device/token', { device_code: grant.device_code });
+    if (answer.ok) {
+      const body = answer.body;
+      if (!body.access_token) return { ok: false, reason: 'the service approved the code but issued no credential' };
+      saveSession({
+        version: SESSION_VERSION,
+        kind: DEVICE_KIND,
+        // Not a refresh token: there is nothing to exchange it for.
+        // It is the credential, and revoking it is instant.
+        deviceToken: body.access_token,
+        deviceId: body.device_id,
+        label,
+        email: body.member,
+        account: body.account,
+        createdAt: new Date().toISOString(),
+      });
+      forgetCachedToken();
+      return {
+        ok: true, device: true, email: body.member, account: body.account,
+        accountName: body.account_name, deviceId: body.device_id, label,
+      };
+    }
+    if (answer.error === 'authorization_pending') continue;
+    if (answer.error === 'slow_down') {
+      // Believed, not ignored: a client that keeps its own pace is
+      // the one the service ends up refusing outright.
+      interval += SLOW_DOWN_MS;
+      continue;
+    }
+    if (answer.unreachable) continue;       // a blip, not an answer
+    return { ok: false, reason: DEVICE_REFUSALS[answer.error] || answer.reason, error: answer.error };
+  }
+  return {
+    ok: false,
+    reason: `device sign-in timed out; nobody entered ${grant.user_code}`,
+    userCode: grant.user_code,
+    verificationUrl: url,
+  };
+}
+
+// Signing out, both ends. A device credential lives on the service
+// until somebody takes it away, so a machine being handed on or
+// decommissioned has to say so; a refresh-token session has nothing
+// to revoke here, because removing the file is the revocation.
+//
+// The local file goes whatever the service answered. A machine left
+// signed in because the network was down is the worse of the two
+// failures, and the credential is revocable from the members page.
+export async function signOut(config = {}) {
+  const session = readSession();
+  if (!session) return { ok: false, reason: 'not signed in' };
+  let revoked = false;
+  let reason;
+  if (isDeviceSession(session) && session.deviceId) {
+    const answer = await revokeDevice(config, session.deviceId, session.deviceToken);
+    revoked = answer.ok;
+    reason = answer.ok ? undefined : answer.reason;
+  }
+  clearSession();
+  return { ok: true, revoked, reason, device: isDeviceSession(session) };
+}
+
+export async function revokeDevice(config, deviceId, token) {
+  if (!deviceId || !token) return { ok: false, reason: 'no device credential to revoke' };
+  let response;
+  try {
+    response = await fetch(`${serviceUrl(config)}/v1/members/devices/${encodeURIComponent(deviceId)}`, {
+      method: 'DELETE',
+      headers: { Authorization: `Bearer ${token}` },
+      signal: AbortSignal.timeout(Number(config.serviceTimeoutMs || 10000)),
+    });
+  } catch (error) {
+    return { ok: false, reason: `service unreachable: ${error instanceof Error ? error.message : String(error)}` };
+  }
+  if (!response.ok) {
+    let body;
+    try { body = await response.json(); } catch { body = undefined; }
+    return { ok: false, status: response.status, reason: body?.detail || body?.error || `the service answered ${response.status}` };
+  }
+  return { ok: true };
 }
 
 // A member who has just signed in holds a token from the pool and
@@ -508,6 +764,17 @@ function rememberToken(body, refreshToken, email) {
 export async function accessToken(config = {}) {
   const session = readSession();
   if (!session) return { ok: false, reason: 'not signed in; run /teamflow:login' };
+  // A device credential is the credential. Nothing to exchange, no
+  // expiry to race, and no round trip on the way to a report.
+  if (isDeviceSession(session)) {
+    return {
+      ok: true,
+      token: session.deviceToken,
+      device: true,
+      email: session.email,
+      refreshed: false,
+    };
+  }
   const refresh = fingerprint(session.refreshToken);
   if (cached && cached.refresh === refresh && cached.expiresAt - REFRESH_MARGIN_MS > Date.now()) {
     return { ok: true, token: cached.token, idToken: cached.idToken, expiresAt: cached.expiresAt, email: session.email, refreshed: false };
@@ -546,7 +813,12 @@ export async function adminIdToken(config = {}) {
   if (!token.idToken) {
     return {
       ok: false,
-      reason: 'this session has no ID token; sign in again with `teamflow login` so the openid scope is granted',
+      reason: token.device
+        // A device credential names a seat, not an address, and the
+        // admin and organisation routes are the address's.
+        ? 'this machine is signed in with a device credential, which names a seat but not a verified address; '
+          + 'run `teamflow login` where a browser can be opened for the routes that need one'
+        : 'this session has no ID token; sign in again with `teamflow login` so the openid scope is granted',
     };
   }
   return { ok: true, token: token.idToken, email: token.email, expiresAt: token.expiresAt };

@@ -252,6 +252,11 @@ export function loadConfig(cwd) {
     linearWorkspace: process.env.TEAMFLOW_LINEAR_WORKSPACE || undefined,
     githubRepo: process.env.TEAMFLOW_GITHUB_REPO || undefined,
     awsProfile: process.env.TEAMFLOW_AWS_PROFILE || undefined,
+    // For a machine that has no browser and cannot be detected as
+    // such: a container with a display variable set by its base
+    // image, a remote shell, an agent's sandbox. Set it once there
+    // instead of remembering `--no-browser` on every sign-in.
+    noBrowser: process.env.TEAMFLOW_NO_BROWSER === '1' || undefined,
   });
 }
 
@@ -1102,6 +1107,11 @@ export async function credential(config = {}) {
 // transportOf and the CLI's status need an answer now; resolving a
 // bearer can mean a refresh round trip, and neither should pay for one.
 export function credentialKind(config = {}) {
+  // Named apart from a bearer session, because the two behave
+  // differently in the two places somebody looks: a device credential
+  // has nothing to refresh, and it is revoked at the service rather
+  // than by deleting a file.
+  if (auth.isDeviceSession()) return 'device';
   if (auth.hasSession() || config.accessToken) return 'bearer';
   if (config.apiKey) return 'api_key';
   return undefined;

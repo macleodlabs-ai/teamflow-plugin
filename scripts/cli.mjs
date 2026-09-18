@@ -33,7 +33,7 @@ import {
 const TRACKER_MCP = { jira: 'atlassian', linear: 'linear', github: 'github' };
 const USAGE = `teamflow \u2014 delivery reporting for TeamFlow
 
-  teamflow login [--org <id>]      sign in once, naming an org if asked for one
+  teamflow login [--org <id>] [--no-browser] [--device]  sign in once, naming an org if asked for one
   teamflow logout                  remove the session
   teamflow org [switch <id>]       which organisation this session reports to
   teamflow status                  who is signed in, what is bound, what was sent
@@ -41,6 +41,9 @@ const USAGE = `teamflow \u2014 delivery reporting for TeamFlow
   teamflow next [--dry-run]        take the top-priority open ticket and bind it
   teamflow sync                    publish the current state now
   teamflow doctor                  transport, account, credits, tracker MCP and connections
+  teamflow trackers [list]         the issue trackers this org has connected
+  teamflow trackers connect <tracker> [--filter <team>]
+                                   authorise a tracker; prints the URL to open
   teamflow repos [list|add]        register a repository for CI OIDC
   teamflow admin code [create|list|revoke]  invite codes, for superadmins
   teamflow report --issue ... --stage ...   report one stage transition
@@ -325,9 +328,25 @@ function orgFlag(list) {
   return at === -1 ? undefined : list[at + 1];
 }
 
+// Three ways in, and the command picks between them rather than
+// asking: a browser here, a URL to open here, or a code to type into
+// a browser anywhere. The third is the only one that works when the
+// browser is on another machine, because the loopback redirect the
+// first two come back to is 127.0.0.1 -- this machine and no other.
 async function login() {
+  const noBrowser = args.includes('--no-browser') || Boolean(config.noBrowser);
+  const wantsDevice = args.includes('--device');
+  const canOpen = auth.browserPossible();
+  if (wantsDevice || ((noBrowser || !canOpen) && await serviceOffersDevice())) {
+    return deviceLogin(wantsDevice ? undefined
+      : `No browser can be opened here${canOpen ? '' : ' (no display)'}, so TeamFlow is asking for a code instead.`);
+  }
   const result = await auth.login(config, {
     account: orgFlag(args),
+    // `--no-browser` is for the person who knows their box has none, or
+    // whose browser is somewhere else entirely. The URL is printed and
+    // the listener waits either way.
+    noBrowser,
     // Only a terminal can be asked. A hook, a CI job or a piped run gets the
     // list printed and the flag to pass instead of a prompt nobody answers.
     chooseAccount: process.stdin.isTTY ? (accounts) => auth.promptForAccount(accounts) : undefined,
@@ -338,13 +357,50 @@ async function login() {
       + 'Run `teamflow login --org <id>` with the one to report to.');
   }
   if (!result.ok) {
-    throw new Error(`TeamFlow sign-in failed: ${result.reason}${result.authorizeUrl ? `\nOpen this URL by hand and try again: ${result.authorizeUrl}` : ''}`);
+    // The URL is not repeated when it was already printed while the
+    // listener was up: there it was an invitation, here it would be a
+    // link to a port that has closed.
+    const url = result.authorizeUrl && !result.printedUrl
+      ? `\nOpen this URL by hand and try again: ${result.authorizeUrl}`
+      : '';
+    const elsewhere = result.printedUrl
+      ? '\nIf the browser you can use is on another machine, run `teamflow login --device` instead.'
+      : '';
+    throw new Error(`TeamFlow sign-in failed: ${result.reason}${url}${elsewhere}`);
   }
   const probe = await fetchAccount(config);
   const org = result.accountName || result.account || (probe.ok ? probe.account?.account : undefined);
   print(`TeamFlow signed in${result.email ? ` as ${result.email}` : ''}${org ? `, org ${org}` : ''}. `
     + `Reporting now uses a one-hour access token refreshed in the background; `
     + `the refresh token is at ${auth.sessionPath()} and /teamflow:logout removes it.`);
+}
+
+// Whether asking for a code is an option at all. A service that
+// predates the flow publishes no such block, and must not be sent to
+// a route it would answer 404 to.
+async function serviceOffersDevice() {
+  // Not gated on the rest of the block being usable: the code flow
+  // needs neither an issuer nor a client id, so a service that
+  // publishes only that much can still sign this machine in.
+  return Boolean((await auth.discoverAuth(config)).device);
+}
+
+async function deviceLogin(because) {
+  if (because) print(because);
+  if (orgFlag(args)) {
+    // The organisation is chosen in the browser, by the person
+    // approving: that is where the question can be answered, and the
+    // service asks it there when the address holds several seats.
+    print('`--org` is not used by a device sign-in; the browser asks which organisation.');
+  }
+  const result = await auth.deviceLogin(config);
+  if (!result.ok) throw new Error(`TeamFlow device sign-in failed: ${result.reason}`);
+  const probe = await fetchAccount(config);
+  const org = result.account || (probe.ok ? probe.account?.account : undefined);
+  print(`TeamFlow signed in${result.email ? ` as ${result.email}` : ''}${org ? `, org ${org}` : ''}, `
+    + `as device "${result.label}". Reporting uses a revocable device credential stored at `
+    + `${auth.sessionPath()}; /teamflow:logout revokes it here and at the service, and the `
+    + 'members page lists every machine signed in this way.');
 }
 
 // `teamflow org`, and `teamflow org switch <id>`.
@@ -378,6 +434,61 @@ async function org() {
       : 'That is the only organisation your address holds a seat on.'));
 }
 
+/**
+ * `teamflow trackers`, and `teamflow trackers connect <tracker>`.
+ *
+ * The members page has a button for this; the terminal gets the same flow
+ * without one. The CLI cannot finish an authorisation — a consent screen is a
+ * browser's job and the callback lands wherever the person opened it — so it
+ * asks the service for the URL, prints it, and says what happens next. The
+ * connection is already waiting by then, pending, and `teamflow trackers`
+ * shows it as connected once the browser has been round.
+ */
+async function trackers() {
+  const [action = 'list', target] = args;
+  if (action === 'list') {
+    const result = await trackerConnections(config);
+    if (!result.ok) throw new Error(`TeamFlow could not list your trackers: ${result.reason}`);
+    print(result.connections.length
+      ? result.connections.map(trackerLine).join('\n')
+      : 'No tracker is connected. `teamflow trackers connect linear` starts one.');
+    return;
+  }
+  if (action !== 'connect' || !target) {
+    throw new Error('Usage: teamflow trackers, or teamflow trackers connect <tracker> [--filter <team>]');
+  }
+  const at = args.indexOf('--filter');
+  const filter = at === -1 ? '' : String(args[at + 1] || '').trim();
+  const cred = await credential(config);
+  if (!cred) throw new Error('TeamFlow needs a credential to connect a tracker; run /teamflow:login.');
+  const provider = String(target).toLowerCase();
+  const response = await fetch(
+    `${serviceUrl(config)}/v1/members/trackers/oauth/${encodeURIComponent(provider)}/start`,
+    {
+      method: 'POST',
+      headers: { [cred.header]: cred.value, 'content-type': 'application/json' },
+      body: JSON.stringify(filter ? { filter } : {}),
+      signal: AbortSignal.timeout(Number(config.serviceTimeoutMs || 5000)),
+    },
+  );
+  let body;
+  try { body = await response.json(); } catch { body = undefined; }
+  if (!response.ok || !body?.authorize_url) {
+    // `providers` names the way out when the way in was wrong, and it is the
+    // one thing a person cannot guess.
+    const can = Array.isArray(body?.providers) && body.providers.length
+      ? ` Trackers you can authorise: ${body.providers.join(', ')}.`
+      : '';
+    throw new Error(`TeamFlow could not start ${provider}: `
+      + `${body?.detail || body?.error || `the service returned ${response.status}`}.${can}`);
+  }
+  const minutes = Math.max(1, Math.round(Number(body.expires_in || 600) / 60));
+  print(`Open this to authorise ${provider}:\n\n  ${body.authorize_url}\n\n`
+    + `It expires in ${minutes} minutes. Approve it and TeamFlow creates the webhook itself — `
+    + 'there is nothing to paste. The browser lands back on the members page, and '
+    + `\`teamflow trackers\` shows ${provider} connected once it has.`);
+}
+
 async function repos() {
   const [action = 'list', target] = args;
   const cred = await credential(config);
@@ -402,10 +513,20 @@ async function repos() {
     + 'The workflow needs `permissions: id-token: write` and no secret.');
 }
 
-function logout() {
-  print(auth.clearSession()
-    ? `TeamFlow signed out. ${auth.sessionPath()} removed; reporting stops unless an API key is configured.`
-    : 'TeamFlow was not signed in; nothing to remove.');
+async function logout() {
+  const out = await auth.signOut(config);
+  if (!out.ok) {
+    print('TeamFlow was not signed in; nothing to remove.');
+    return;
+  }
+  const revoked = out.device
+    ? (out.revoked
+      ? ' The device credential was revoked at the service too.'
+      : ` The device credential could not be revoked at the service (${out.reason});`
+        + ' revoke it from the members page.')
+    : '';
+  print(`TeamFlow signed out. ${auth.sessionPath()} removed; reporting stops unless an API key is `
+    + `configured.${revoked}`);
 }
 
 try {
@@ -445,7 +566,8 @@ try {
   else if (command === 'sync') await sync();
   else if (command === 'doctor') await doctor();
   else if (command === 'login') await login();
-  else if (command === 'logout') logout();
+  else if (command === 'logout') await logout();
+  else if (command === 'trackers') await trackers();
   else if (command === 'repos') await repos();
   else if (command === 'org') await org();
   else if (command === 'help' || command === '--help' || command === '-h') print(USAGE);

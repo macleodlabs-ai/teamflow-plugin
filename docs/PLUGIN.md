@@ -72,6 +72,44 @@ The seat binding is not optional. A member who has just signed in holds a token 
 
 Nothing but the refresh token reaches the disk. A refresh token is revocable and scoped to one machine; an access token on disk would be a bearer secret with an hour of life and no way to take it back.
 
+### A machine with no browser
+
+The browser does not have to be opened by the plugin. `teamflow login --no-browser`, a box with no display (no `DISPLAY` or `WAYLAND_DISPLAY`, and not macOS or Windows), an `open` that exits non-zero, or a run with no terminal — Claude Code drives the CLI over a pipe — all print the authorize URL immediately and keep the loopback listener up for the whole three minutes. The person opens that URL in a browser on the same machine and the redirect lands where it always did. The URL used to be printed only after the timeout, when the port it points back to had already closed, which is the same as not printing it.
+
+The browser still has to be on *this* machine, because the redirect goes to `127.0.0.1`. A browser somewhere else is what device-code sign-in is for.
+
+### A browser on another machine
+
+`teamflow login --device`, and what a machine with no browser does on its own:
+
+```text
+teamflow login --device
+  → POST /v1/auth/device            (no credential; the machine has none yet)
+  ← device_code (secret), user_code (WXYZ-1234), verification_url, interval
+  → the terminal prints the URL and the code
+  (the person opens https://codercat.io/app/#device in any browser anywhere,
+   signs in as usual, types the code and approves)
+  → POST /v1/auth/device/approve    (their ID token, from the dashboard)
+  → POST /v1/auth/device/token      (polled at `interval`)
+  ← a device credential, stored at ~/.config/teamflow/session.json at 0600
+```
+
+The three paths, and when each one is taken:
+
+| Where the browser is | What runs | What is stored |
+| --- | --- | --- |
+| This machine, openable | the loopback sign-in, browser opened here | a refresh token |
+| This machine, not openable | the loopback sign-in, URL printed here | a refresh token |
+| Any other machine | the device flow (`--device`) | a device credential |
+
+The command chooses without being asked: `--device` forces it, and a run with `--no-browser`, `TEAMFLOW_NO_BROWSER=1`, or no display takes it whenever the service publishes `auth.device` in its capabilities. A service that does not publish it falls back to printing the authorize URL, which is the best that can be done there. When a loopback sign-in times out, the message names `--device`, because "nobody opened the URL" and "the browser is on another machine" look the same from here.
+
+The stored credential is not a token from the identity provider. It is a device credential: bound to that person's seat, held as a peppered hash at the service, shown once, and revocable on its own — `teamflow logout` revokes it at the service as well as removing the file, and the members page lists every machine signed in this way. Nothing about it is refreshed, so `teamflow status` reports the credential as `device` rather than `bearer`, and `teamflow org` and the admin routes refuse it: those need the ID token that names a verified address, and a device credential names a seat.
+
+The organisation is chosen in the browser, not on the terminal. An address holding seats on several organisations is asked on the approval page, which is where the question can be answered; `--org` is ignored by a device sign-in and says so.
+
+`GET /v1/capabilities` gets ten seconds and one retry, because a cold Lambda behind CloudFront can spend most of the first window starting up. A service that never answers is reported as unreachable. A service that answers but publishes no auth block is reported as unconfigured, naming `TEAMFLOW_AUTH_ISSUER` and `TEAMFLOW_AUTH_CLIENT_ID` — two different faults, and telling somebody the second when the first happened sends them after configuration that was never the problem.
+
 The loopback listener binds the first free port in 52480-52489. Every one of those is registered as a callback URL on the app client, so the range cannot grow without a deploy. The `state` returned by the identity provider must match the one this process sent, or the code is discarded unredeemed: it belongs to somebody else's sign-in.
 
 ### More than one organisation

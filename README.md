@@ -63,7 +63,7 @@ All are manual-only skills except `/teamflow:next`, which a session with no tick
 
 `~/.config/teamflow/config.json`:
 
-Inside a Claude Code session: `/plugin marketplace add macleodlabs-ai/teamflow-plugin`, `/plugin install teamflow@macleodlabs`, then `/teamflow:login` once (a terminal install needs `/reload-plugins` in the open session). That is the whole of onboarding for Claude Code; the dashboard signs in on its own with your email. Reporting then uses a one-hour access token refreshed in the background; only a revocable refresh token is stored, at `~/.config/teamflow/session.json`, and `/teamflow:logout` removes it. `/teamflow:doctor` shows who is signed in, the org and its remaining credits.
+Inside a Claude Code session: `/plugin marketplace add macleodlabs-ai/teamflow-plugin`, `/plugin install teamflow@macleodlabs`, then `/teamflow:login` once (a terminal install needs `/reload-plugins` in the open session). That is the whole of onboarding for Claude Code; the dashboard signs in on its own with your email. Turn on auto-update for the macleodlabs marketplace (`/plugin`, Marketplaces tab) and new versions arrive in the background; Claude Code asks you to run `/reload-plugins` when one lands. Reporting then uses a one-hour access token refreshed in the background; only a revocable refresh token is stored, at `~/.config/teamflow/session.json`, and `/teamflow:logout` removes it. `/teamflow:doctor` shows who is signed in, the org and its remaining credits.
 
 CI signs in per job with its GitHub Actions OIDC token and stores no secret. An owner registers each repository once with `/teamflow:repos add <owner/repo>`; until then that repository's exchange answers `repository_not_registered`.
 
