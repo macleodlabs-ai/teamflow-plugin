@@ -193,7 +193,13 @@ async function status() {
         + 'Run /reload-plugins.',
     } : {}),
     actor: actor(config, info),
-    repository: info.repository,
+    // Never left out. A customer who ran this in the wrong directory saw
+    // no repository line at all and every other line looking healthy,
+    // which reads as "fine" rather than as the one thing that is wrong:
+    // a report names the repository it came from, and outside a checkout
+    // there is none (MACLEOD-567).
+    repository: info.repository
+      || 'not a git repository — run TeamFlow inside your checkout; a report names the repository it came from',
     project: project.line,
     branch: info.branch,
     tracker: state?.binding?.tracker || trackerOf(config),
@@ -409,6 +415,15 @@ async function doctor() {
         .forEach((connection) => warnings.push(`the ${connection.provider} connection's last delivery failed: ${connection.last_error}`));
       if (warnings.length) report.trackerWarnings = warnings;
     }
+  } else if (transport === 'none' && !config.dataUri) {
+    // Nothing is configured at all, which on a new machine means one
+    // thing and not the other: the customer has not signed in yet. It is
+    // not an install that is on the legacy S3 transport and has lost its
+    // bucket, so probing for the AWS CLI and reporting `s3Access: not
+    // verified` buries the one actionable line under a page about a
+    // transport this person has never heard of (MACLEOD-567).
+    report.reporting = 'nothing is being reported: this machine has no credential. '
+      + 'Run /teamflow:login once — there is no key to copy.';
   } else {
     // Legacy S3 reporting: the AWS CLI and the bucket are the transport.
     const aws = safeExec('aws', ['--version'], { timeout: 2000 });
@@ -511,7 +526,17 @@ async function deviceLogin(because) {
     print('`--org` is not used by a device sign-in; the browser asks which organisation.');
   }
   const result = await auth.deviceLogin(config);
-  if (!result.ok) throw new Error(`TeamFlow device sign-in failed: ${result.reason}`);
+  if (!result.ok) {
+    // A code is one-shot: expired, spent or never approved, the way out
+    // is always a fresh one, and a failure that does not say so leaves
+    // the person retyping a code the service has already forgotten.
+    // Except a refusal — somebody said no in the browser, and telling
+    // the terminal to ask again is the wrong advice (MACLEOD-567).
+    const again = result.error === 'access_denied'
+      ? ' If that was not you, nothing was issued and nothing needs undoing.'
+      : ' Run `teamflow login --device` again for a fresh code.';
+    throw new Error(`TeamFlow device sign-in failed: ${result.reason}.${again}`);
+  }
   const probe = await fetchAccount(config);
   const org = result.account || (probe.ok ? probe.account?.account : undefined);
   print(`TeamFlow signed in${result.email ? ` as ${result.email}` : ''}${org ? `, org ${org}` : ''}, `

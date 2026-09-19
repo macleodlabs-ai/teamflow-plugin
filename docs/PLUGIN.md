@@ -72,6 +72,12 @@ The seat binding is not optional. A member who has just signed in holds a token 
 
 Nothing but the refresh token reaches the disk. A refresh token is revocable and scoped to one machine; an access token on disk would be a bearer secret with an hour of life and no way to take it back.
 
+### Forgetting to sign in
+
+Reporting fails open, which means an install nobody has signed in on breaks nothing and reports nothing: every event is classified, every session is saved, and `publishState` skips because there is no credential. There is no error, and the only symptom is a board that stays empty, noticed days later. So the plugin says it where the person is looking — Claude Code's first `SessionStart` of a session on a machine with no credential prepends one sentence, once, naming `/teamflow:login`. It is context, never a denial: a reporter that blocked a turn would be worse than one that said nothing (MACLEOD-567).
+
+Every other tool gets no such sentence, and deliberately. Cursor, Copilot, Cline and Gemini CLI read a hook's stdout as a decision, so a notice printed there is a denied action; and no adapter emits a session-start event to say it once on instead. After `teamflow skills install --for <tool>`, run **`teamflow status`** — it names the credential, the repository and the project in one answer, and says `not signed in; run /teamflow:login` when that is the problem. `teamflow doctor` is the longer form, and on a machine with nothing configured it now answers with the one line to act on rather than with the legacy S3 probe.
+
 ### A machine with no browser
 
 The browser does not have to be opened by the plugin. `teamflow login --no-browser`, a box with no display (no `DISPLAY` or `WAYLAND_DISPLAY`, and not macOS or Windows), an `open` that exits non-zero, or a run with no terminal — Claude Code drives the CLI over a pipe — all print the authorize URL immediately and keep the loopback listener up for the whole three minutes. The person opens that URL in a browser on the same machine and the redirect lands where it always did. The URL used to be printed only after the timeout, when the port it points back to had already closed, which is the same as not printing it.

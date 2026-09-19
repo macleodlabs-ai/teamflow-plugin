@@ -13,6 +13,7 @@ import {
   applyTransition,
   chooseBinding,
   classifyTool,
+  credentialKind,
   detectCandidates,
   enrichBinding,
   isAdHocKey,
@@ -55,6 +56,22 @@ const NO_ISSUE = 'TeamFlow: no issue is bound — run /teamflow:next '
   + '(the teamflow-next skill) to take the top-priority open ticket and bind it before editing.';
 
 /**
+ * The machine has no credential at all (MACLEOD-567).
+ *
+ * The quietest failure the plugin has. Reporting fails open, so an
+ * install nobody signed in on classifies every event, saves every
+ * session and posts nothing — for ever, with no error anywhere and a
+ * board that simply stays empty. It looks exactly like a working
+ * install until somebody goes looking, which is days later.
+ *
+ * Said on SessionStart only, like the stale-build notice and for the
+ * same reason: signing in is a once-per-machine act and a line per turn
+ * about it is the noise that teaches a reader to skip the notices.
+ */
+const NOT_SIGNED_IN = 'TeamFlow: nothing is reaching the board — this machine is not signed in. '
+  + 'Run /teamflow:login (the teamflow-login skill) once; there is no key to copy.';
+
+/**
  * The one line about the project, or nothing (MACLEOD-565).
  *
  * Said on SessionStart only, for the same reason the stale-build notice
@@ -73,7 +90,10 @@ function projectSentence(project) {
   return project.name ? `Project: ${project.name}.` : undefined;
 }
 
-export function claudeContext(event, state, justBound, stale = staleBuildNotice(), project = undefined) {
+// `signedIn` defaults to true so that a caller which cannot answer the
+// question says nothing rather than accusing a signed-in machine.
+export function claudeContext(event, state, justBound, stale = staleBuildNotice(), project = undefined,
+  signedIn = true) {
   if (!FAST.includes(event)) return undefined;
   // Said on SessionStart only. A session loads plugin code once, so
   // the answer cannot change until it restarts, and repeating it on
@@ -81,16 +101,21 @@ export function claudeContext(event, state, justBound, stale = staleBuildNotice(
   // reader can only act on once (MACLEOD-538).
   const notice = event === 'SessionStart' && stale ? [stale] : [];
   const named = event === 'SessionStart' ? projectSentence(project) : undefined;
+  // Before everything else, because it is the reason none of the rest
+  // will happen: an unbound ticket is a ticket that will not move, and
+  // an unsigned-in machine is every ticket.
+  const credential = event === 'SessionStart' && !signedIn ? [NOT_SIGNED_IN] : [];
   if (!state.binding?.key) {
     return JSON.stringify({
       hookSpecificOutput: {
         hookEventName: event,
-        additionalContext: [NO_ISSUE, ...(named ? [named] : []), ...notice].join(' '),
+        additionalContext: [...credential, NO_ISSUE, ...(named ? [named] : []), ...notice].join(' '),
       },
     });
   }
   const tracker = state.binding.tracker || 'jira';
   const context = [
+    ...credential,
     `TeamFlow: working on ${tracker} issue ${state.binding.key}.`,
   ];
   // After the ticket, because the ticket is what the work is and the
@@ -152,8 +177,13 @@ export async function handleEvent(input = {}) {
     if (state.status === 'running') state.status = 'idle';
     state.updatedAt = new Date().toISOString();
     saveSession(state);
-    return { state, justBound: false, event };
+    return { state, justBound: false, event, signedIn: true };
   }
+
+  // Whether this machine has anything to report with. Local and cheap —
+  // a session file and the configuration, no network — so the fast
+  // events can carry the answer without costing the tool anything.
+  const signedIn = Boolean(credentialKind(config));
 
   const beforeKey = state.binding?.key;
   const { candidates, info } = detectCandidates(resolved, cwd, state, config);
@@ -227,7 +257,7 @@ export async function handleEvent(input = {}) {
     ? await resolveProject(info?.repository, config, { timeoutMs: 1500 })
     : undefined;
 
-  return { state, justBound, event, project };
+  return { state, justBound, event, project, signedIn };
 }
 
 // Every hook entry runs inside this. Reporting must never break the
