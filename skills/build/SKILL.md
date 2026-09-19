@@ -52,19 +52,76 @@ plan` with no keys does the listing itself, with the same ordering rule as
 `teamflow next`. For Linear and Jira the CLI cannot reach your MCP tools, so
 you list them and pass them in.
 
-## 3. Find the dependencies
-
-Tickets almost never say what they depend on. Read the pool and record what
-you find, before the first phase starts:
+**Work in the run that has no ticket goes in the pool too.** Mint it a key
+first — `teamflow adhoc start "<a short sentence saying what the work is>"` —
+and add it like any other:
 
 ```bash
-teamflow workflow depends MACLEOD-540 --on MACLEOD-538 \
-  --reason "needs the reporter field that release adds" --found planning
+teamflow workflow add ADHOC-7
 ```
 
-Each edge re-levels the phases. An edge may point at a ticket outside the
-pool; that is worth recording and it gates nothing, so if the run genuinely
-needs that ticket, put it in: `teamflow workflow add <KEY>`.
+An ad hoc item is an issue document whose key TeamFlow minted, so from that
+point it is an ordinary node: it levels into a phase, it takes edges in both
+directions, the hooks report its stages, and the board draws it beside the
+tickets. The title is **what the work is, never the request that asked for
+it** — a prompt never leaves the machine, and this is the field where that is
+easiest to get wrong. The `adhoc` skill has the whole of it.
+
+## 3. Plan the graph
+
+This is the planning step, and it happens **before the first phase starts**.
+Tickets almost never say what they depend on, so the run's whole dependency
+graph is something you work out here and record in one go. A pool with no
+edges is one flat phase, which says every ticket can be built at once — and
+that is almost never true.
+
+**Read every task in the pool.** All of them, not the ones that look related.
+Open each one in the tracker and ask what it needs that another task in this
+pool produces: a field, a migration, a route, a release, a rename. A task with
+no tracker ticket is a node too, and is read the same way — a node id is just
+a string here, and an ad hoc item's `ADHOC-<n>` is one of them. **Compute the
+edges over the whole pool, ad hoc and ticketed alike**: an ad hoc item that a
+ticket waits on, or that waits on a ticket, is an ordinary edge and belongs in
+the same batch as the rest.
+
+**Decide the edges.** This is the half that is yours. Reading two tickets and
+concluding that one needs the other is judgment, and no command does it for
+you. Give each edge a short sentence saying why; "MACLEOD-540 waits on
+MACLEOD-538" with no reason is unreadable a week later, and the reason is what
+the board draws on the arrow.
+
+**Record them all in one call**, as JSON on stdin:
+
+```bash
+cat <<'JSON' | teamflow workflow depends --batch --found planning
+[
+  { "from": "MACLEOD-540", "on": "MACLEOD-538",
+    "reason": "needs the reporter field that release adds" },
+  { "from": "MACLEOD-541", "on": "MACLEOD-538",
+    "reason": "reads the same field" }
+]
+JSON
+```
+
+One call, not one per edge. A sixty-ticket pool has a couple of hundred edges;
+recording them one at a time is a couple of hundred process starts, the same
+number of re-levellings, and a plan that is briefly wrong after each one.
+`--batch` is all-or-nothing: a malformed entry refuses the whole batch and
+names it, rather than leaving the pool levelled on half a plan. Fix it and
+send the batch again.
+
+`--found planning` is the default and says these are the plan. Use
+`--found build` only for what a team hits later (see below), because `show`
+tells the two apart and one is the plan while the other is news.
+
+The levelling is not yours. `teamflow workflow depends` turns the edges into
+phases by topological sort — that is arithmetic, it is tested, and it is the
+only thing that decides which phase a ticket lands in.
+Do not reorder the phases by hand; record an edge and let them re-level.
+
+An edge may point at a ticket outside the pool; that is worth recording and it
+gates nothing, so if the run genuinely needs that ticket, put it in:
+`teamflow workflow add <KEY>`.
 
 If a cycle appears the phases come back blocked. Say so and ask the user
 which edge to drop. Do not guess.
@@ -101,6 +158,19 @@ lying about what shipped.
 
 Then `teamflow workflow ticket <KEY> --state done --cycle verified`. When the
 phase's tickets are all done, `ready` moves to the next phase on its own.
+
+For an ad hoc item, finish it as well: `teamflow adhoc done` publishes its
+last state and unbinds. It never reopens — a later request about the same
+code is a new item with a new key.
+
+### Keep the metadata current as the run goes
+
+Every one of these commands republishes the document it changed, the moment
+it changes it, and the board follows on its own push channel. So **say it when
+it happens**, not when the run ends: the title when the work turns out to be
+something else, the ticket's state and cycle at each gate, the edge the
+moment a team reports it, the ad hoc item the moment it is minted. A run that
+batches its updates to the end is a board that was wrong for the whole run.
 
 ### When a gate fails
 

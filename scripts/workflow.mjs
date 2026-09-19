@@ -50,7 +50,9 @@ export const USAGE = `teamflow workflow — the pool of tickets a run works thro
 
   teamflow workflow add <KEY> [--to <name>]
       Put a ticket in the pool by hand. This is the escape hatch for one
-      the filter missed; the pool is what a run works from.
+      the filter missed; the pool is what a run works from. An ad hoc key
+      (ADHOC-<n>, from \`teamflow adhoc start\`) is an ordinary node here:
+      added, levelled and depended on exactly like a ticket.
 
   teamflow workflow show [<name>]
       The plan: phases, tickets and what waits on what.
@@ -68,6 +70,12 @@ export const USAGE = `teamflow workflow — the pool of tickets a run works thro
                             [--found planning|build] [--to <name>]
       One ticket waits on another. Re-levels the phases, because an edge
       a team found mid-build moves tickets between them.
+
+  teamflow workflow depends --batch [--found planning|build] [--to <name>]
+      The whole graph at once, as JSON on stdin: an array of
+      {"from","on","reason","found"}, or {"dependencies": [...]}. This is
+      what planning uses — one call, one levelling, one report, instead of
+      one subprocess per edge. A malformed entry refuses the batch.
 
   teamflow workflow ready [--to <name>]
       What the current phase has open. This is what a run starts next.
@@ -308,7 +316,28 @@ export function render(workflow, state) {
 
 // --- the command -----------------------------------------------------
 
-export async function main(args, { config = {}, info = {}, print = (s) => process.stdout.write(`${s}\n`) } = {}) {
+/**
+ * The edges a batch was given, off stdin.
+ *
+ * Not argv: a sweep over this repository is a couple of hundred edges with
+ * a sentence on each, which is past what a shell will hand a process, and
+ * quoting those sentences on a command line is a way to lose one.
+ */
+async function readJson(stream) {
+  let text = '';
+  for await (const chunk of stream) text += chunk;
+  if (!text.trim()) throw new Error('--batch reads the edges as JSON on stdin, and nothing arrived.');
+  try {
+    return JSON.parse(text);
+  } catch (error) {
+    throw new Error(`--batch could not read the JSON on stdin: ${error.message}`);
+  }
+}
+
+export async function main(args, {
+  config = {}, info = {}, stdin = process.stdin,
+  print = (s) => process.stdout.write(`${s}\n`),
+} = {}) {
   const [sub = 'show', ...rest] = args;
   if (sub === 'help' || sub === '--help' || sub === '-h') {
     print(USAGE);
@@ -400,6 +429,16 @@ export async function main(args, { config = {}, info = {}, print = (s) => proces
   }
 
   if (sub === 'depends') {
+    if (rest.includes('--batch')) {
+      const edges = dependsBatch(target, await readJson(stdin), { found: flag(rest, 'found') });
+      save(state, config);
+      await publish(target, config);
+      print(`TeamFlow recorded ${edges.length} dependenc${edges.length === 1 ? 'y' : 'ies'} `
+        + `in "${target.name}", now ${target.phases.length} phase`
+        + `${target.phases.length === 1 ? '' : 's'}.`);
+      print(render(target, state));
+      return 0;
+    }
     const positional = rest.filter((a) => !a.startsWith('--'));
     const edge = depends(target, positional[0], flag(rest, 'on'), {
       reason: flag(rest, 'reason'),
@@ -586,8 +625,18 @@ export function seed(workflow, keys = []) {
   return workflow.tickets;
 }
 
-/** Record that one ticket waits on another. */
-export function depends(workflow, from, on, { reason, found = 'planning' } = {}) {
+/**
+ * Record one edge, without re-levelling.
+ *
+ * A node id is a string and nothing more. Today every one of them is a
+ * tracker key because that is all the pool can hold, but ad hoc work
+ * (MACLEOD-556) is a subject with no key and has to be able to be a node
+ * here without widening anything. The one place that assumes otherwise is
+ * the `_key` check in `adapters/teamflow/schema.py`, which is deliberately
+ * left as it is: widening the service's allowlist before the ad hoc subject
+ * exists would accept ids nothing can draw.
+ */
+function recordEdge(workflow, from, on, { reason, found = 'planning' } = {}) {
   const a = String(from || '').trim();
   const b = String(on || '').trim();
   if (!a || !b) throw new Error('Usage: teamflow workflow depends <KEY> --on <KEY>');
@@ -602,6 +651,61 @@ export function depends(workflow, from, on, { reason, found = 'planning' } = {})
   edge.found = found;
   if (!existing) edges.push(edge);
   workflow.dependencies = edges;
+  return edge;
+}
+
+/** Record that one ticket waits on another. */
+export function depends(workflow, from, on, options = {}) {
+  const edge = recordEdge(workflow, from, on, options);
   relevel(workflow);
   return edge;
+}
+
+/**
+ * Record the whole graph in one call.
+ *
+ * `depends` is the single edge a team found mid-build. This is planning's
+ * shape: the model reads the pool, decides every edge in it, and records
+ * them together. A sixty-ticket pool has a couple of hundred edges, and one
+ * subprocess each would be a couple of hundred process starts, two hundred
+ * topological sorts and two hundred reports of a document that was wrong in
+ * between. Here it is one of each.
+ *
+ * All or nothing. A half-applied graph is a plan that levels into phases
+ * nobody decided, so a malformed entry refuses the batch and names its
+ * index rather than leaving the pool in a state the caller did not ask for.
+ */
+export function dependsBatch(workflow, entries, { found } = {}) {
+  const list = Array.isArray(entries) ? entries
+    : Array.isArray(entries?.dependencies) ? entries.dependencies
+      : null;
+  if (!list) {
+    throw new Error('A batch is a JSON array of edges, or an object with a "dependencies" array.');
+  }
+  const already = (workflow.dependencies || []).length;
+  if (already + list.length > CAPS.dependencies) {
+    // The service caps this list and `published` truncates to the same
+    // number. Refusing is the honest answer: a silently trimmed graph
+    // levels into phases that are missing gates nobody can see are gone.
+    throw new Error(`A workflow holds at most ${CAPS.dependencies} dependencies; `
+      + `this batch would make ${already + list.length}.`);
+  }
+  // Validated in full before anything is written.
+  const wanted = list.map((entry, index) => {
+    if (!entry || typeof entry !== 'object' || Array.isArray(entry)) {
+      throw new Error(`Edge ${index + 1} is not an object.`);
+    }
+    const from = String(entry.from ?? '').trim();
+    const on = String(entry.on ?? '').trim();
+    if (!from || !on) throw new Error(`Edge ${index + 1} needs both "from" and "on".`);
+    if (from === on) throw new Error(`Edge ${index + 1}: ${from} cannot wait on itself.`);
+    const where = entry.found ?? found ?? 'planning';
+    if (!['planning', 'build'].includes(where)) {
+      throw new Error(`Edge ${index + 1}: found must be planning or build.`);
+    }
+    return { from, on, reason: entry.reason, found: where };
+  });
+  const edges = wanted.map((edge) => recordEdge(workflow, edge.from, edge.on, edge));
+  relevel(workflow);
+  return edges;
 }

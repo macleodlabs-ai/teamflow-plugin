@@ -15,6 +15,7 @@ import {
   classifyTool,
   detectCandidates,
   enrichBinding,
+  isAdHocKey,
   loadConfig,
   publishState,
   readJson,
@@ -150,12 +151,43 @@ export async function handleEvent(input = {}) {
     state.summary = state.summary || 'Claude session idle';
     state.updatedAt = new Date().toISOString();
   }
+  /*
+   * An ad hoc item ends when the session that owns it stops
+   * (MACLEOD-556). An ad hoc item is one request's worth of work, and
+   * `Stop` is the event that says that request has been answered, so
+   * this is where it ends: the last publish below says so, and the
+   * binding is forgotten afterwards.
+   *
+   * `teamflow adhoc done` has already cleared the binding, so an item
+   * the skill finished is not ended twice; what this catches is the
+   * session that stops without saying anything, which is the common
+   * case and the one that would otherwise leave an item open forever.
+   */
+  const endingAdHoc = event === 'Stop' && isAdHocKey(state.binding?.key);
+  if (endingAdHoc) {
+    state.status = 'idle';
+    state.summary = 'Ad hoc work ended';
+    state.updatedAt = new Date().toISOString();
+  }
   saveSession(state);
 
   // Synchronous SessionStart/UserPromptSubmit must stay fast so they never hold up the tool.
   // Async tool/task/stop hooks publish to the service (or legacy S3).
   if (!FAST.includes(event) && state.binding?.key) {
     await publishState(state, config, info, { force: event === 'Stop' });
+    saveSession(state);
+  }
+
+  // After the publish, never before: the board's last word on the item
+  // is the state above, and forgetting the key first would have
+  // published nothing at all. It never reopens -- a new request is a
+  // new item -- so the next turn is attributed to whatever it is
+  // actually about rather than to finished work.
+  if (endingAdHoc) {
+    const { clearBinding } = await import('./adhoc.mjs');
+    clearBinding(cwd, config);
+    delete state.binding;
+    state.updatedAt = new Date().toISOString();
     saveSession(state);
   }
 

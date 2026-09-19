@@ -28,6 +28,26 @@ const GH_REPO_FLAG_RE = /--repo[=\s]+([\w.-]+\/[\w.-]+)/i;
 const GH_ISSUE_FIELD_RE = /"issue_?[nN]umber"\s*:\s*"?(\d+)"?/;
 const GH_OWNER_FIELD_RE = /"owner"\s*:\s*"([\w.-]+)"/;
 const GH_REPO_FIELD_RE = /"repo(?:sitory)?"\s*:\s*"([\w.-]+)"/;
+/*
+ * An ad hoc key (MACLEOD-556). TeamFlow minted it, so TeamFlow is the
+ * system of record for it and it is never read as the configured
+ * tracker's key: a repository configured for Jira that reported
+ * ADHOC-3 as a Jira issue would draw a link to a Jira issue that does
+ * not exist. Its shape is inside `_JIRA_KEY` in
+ * adapters/teamflow/schema.py, so nothing widens to accept it.
+ */
+const ADHOC_KEY_RE = /^ADHOC-\d{1,9}$/i;
+
+/** True for a key TeamFlow minted itself rather than read off a tracker. */
+export function isAdHocKey(value) {
+  return ADHOC_KEY_RE.test(String(value ?? '').trim());
+}
+
+// The trackers an install can be configured to use. `teamflow` is not
+// one of them: it is a key's provenance, never a setting, so it is
+// absent here and present in `Tracker` (src/types.ts) and `TRACKERS`
+// (adapters/teamflow/schema.py), which are vocabularies of what a key
+// can say about itself.
 const TRACKERS = new Set(['jira', 'linear', 'github']);
 const TEST_RE = /(?:^|\s)(?:npm|pnpm|yarn|bun)?\s*(?:run\s+)?(?:test|vitest|jest|pytest|playwright|cypress)(?:\s|$)|\bgo test\b|\bcargo test\b|\bmvn(?:w)?\s+test\b|\bgradle(?:w)?\s+test\b/i;
 const DEV_TEST_RE = /\b(?:smoke|acceptance|e2e|integration)[-_: ]?(?:dev|staging)|\b(?:dev|staging)[-_: ]?(?:smoke|acceptance|e2e|integration)\b/i;
@@ -130,7 +150,8 @@ export function detectIssueRef(value, config = {}, info = {}) {
     return number ? githubRef(resolveGithubRepo(config, info), number[1]) : undefined;
   }
   const key = extractJiraKey(text);
-  return key ? { key, tracker: trackerOf(config) } : undefined;
+  if (!key) return undefined;
+  return { key, tracker: isAdHocKey(key) ? 'teamflow' : trackerOf(config) };
 }
 
 // 123-fix-hot-reload, issue-123, gh-123, feature/123-fix-hot-reload
@@ -184,6 +205,7 @@ export function parseBindArgument(value, config = {}, info = {}) {
   // Linear install already answered above. The key is not a GitHub key —
   // those are <repo>#<n> — so it belongs to whichever other tracker this
   // install has coordinates for, and Jira last, as trackerOf defaults there.
+  if (isAdHocKey(raw)) return { key: raw.toUpperCase(), tracker: 'teamflow' };
   return { key: raw.toUpperCase(), tracker: config.linearWorkspace ? 'linear' : 'jira' };
 }
 
@@ -1204,6 +1226,9 @@ export function applyTransition(state, transition) {
 
 // jiraKey / jiraUrl / jiraStatus keep their names for the dashboard and existing S3 objects.
 export function issueUrl(key, tracker = 'jira', config = {}, info = {}, binding = {}) {
+  // An ad hoc item has no tracker to link to, because TeamFlow is its
+  // system of record: the link is its own card on the board.
+  if (tracker === 'teamflow') return `${serviceUrl(config)}/app/#delivery?issue=${encodeURIComponent(key)}`;
   if (tracker === 'linear') {
     const workspace = binding.workspace || config.linearWorkspace;
     return workspace ? `https://linear.app/${workspace}/issue/${key}` : undefined;

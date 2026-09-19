@@ -134,6 +134,25 @@ function skillInstruction(tracker) {
     + 'picks by the rule below, assigns the issue to you and runs `teamflow bind <key>`.';
 }
 
+/*
+ * What to do when the tracker has nothing to take (MACLEOD-556).
+ *
+ * Work with no ticket is still work, and until this it reached the
+ * board under no key at all. It gets one: `teamflow adhoc start` mints
+ * an `ADHOC-<n>` key, publishes the item and binds, and from there
+ * every hook reports against it exactly as it would a ticket.
+ *
+ * Printed rather than done. Minting needs a short sentence saying what
+ * the work is, and deriving that sentence is a judgment call the
+ * session makes and this command cannot -- the same split as the
+ * tracker listing above, and the reason the request itself never
+ * reaches a flag here.
+ */
+export const ADHOC_INSTRUCTION =
+  'If the work you have been asked to do has no ticket, it is ad hoc work and still belongs on the board: '
+  + 'run `teamflow adhoc start "<a short sentence saying what the work is>"`. '
+  + 'The sentence says what the work is, never what was asked for -- the request is a prompt and stays on this machine.';
+
 // Exported so `teamflow workflow plan` selects with the same call and
 // the same fields. A second `gh issue list` would be a second ordering
 // rule the day somebody changed one of them.
@@ -168,6 +187,7 @@ export async function main(args = [], ctx = {}) {
   if (tracker !== 'github') {
     print(skillInstruction(tracker));
     if (dryRun) print(`Ordering rule — ${rule}`);
+    print(ADHOC_INSTRUCTION);
     return 0;
   }
 
@@ -213,6 +233,7 @@ export async function main(args = [], ctx = {}) {
 
   if (!picked) {
     print(`No open issue in ${repo} is unassigned or already yours, so TeamFlow picked nothing. Ordering rule — ${rule}`);
+    print(ADHOC_INSTRUCTION);
     return 0;
   }
 

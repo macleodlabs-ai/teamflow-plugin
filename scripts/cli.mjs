@@ -47,13 +47,16 @@ const USAGE = `teamflow \u2014 delivery reporting for TeamFlow
                                    name the ticket by hand, or stop; --local writes
                                    the binding inside the repository, for a worktree
   teamflow next [--dry-run]        take the top-priority open ticket and bind it
+  teamflow adhoc start "<what the work is>" | title "<...>" | done
+                                   work that arrived without a ticket: TeamFlow
+                                   mints the key; \`teamflow adhoc --help\` has the rest
   teamflow workflow create <name> | add <KEY> | show | status <s>
                                    the pool of tickets a run works through;
                                    \`teamflow workflow --help\` lists its flags
   teamflow sync                    publish the current state now
   teamflow doctor                  transport, account, credits, tracker MCP and connections
   teamflow trackers [list]         the issue trackers this org has connected
-  teamflow trackers connect <tracker> [--filter <team>]
+  teamflow trackers connect <tracker> [--projects a,b] [--filter <team>]
                                    authorise a tracker; prints the URL to open
   teamflow repos [list|add]        register a repository for CI OIDC
   teamflow admin code [create|list|revoke]  invite codes, for superadmins
@@ -114,15 +117,42 @@ async function trackerConnections(config) {
   }
 }
 
-// One connection, on one line: which tracker, what it is filtered to, when it
-// last delivered and what went wrong last time, because those are the four
-// things somebody asks when issues are not appearing.
+// One connection, on one line: which tracker, what it is filtered to, which
+// projects it covers, when it last delivered and what went wrong last time,
+// because those are what somebody asks when issues are not appearing -- and
+// "it covers the whole workspace" is as much an answer as any of the others
+// (MACLEOD-539, a board of 538 tickets nobody had narrowed).
 function trackerLine(connection = {}) {
   const parts = [String(connection.provider || 'unknown')];
   if (connection.filter) parts.push(`filter ${connection.filter}`);
+  parts.push(`projects ${scopeWords(connection)}`);
   parts.push(connection.last_delivery_at ? `last delivery ${connection.last_delivery_at}` : 'nothing delivered yet');
   if (connection.last_error) parts.push(`last error: ${connection.last_error}`);
   return parts.join(' · ');
+}
+
+/**
+ * What this connection covers, in words.
+ *
+ * Names before ids because a person reads the line, and `all` for an empty
+ * scope because empty means everything everywhere else too -- a blank there
+ * would read as "none", which is the opposite of what it means.
+ */
+function scopeWords(connection = {}) {
+  const scope = connection.scope && !Array.isArray(connection.scope) ? connection.scope : {};
+  const named = (scope.names?.length ? scope.names : scope.ids) || [];
+  return named.length ? named.join(', ') : 'all';
+}
+
+/** `--projects a,b,c` -> the scope block the service stores. */
+function projectsArg(list) {
+  const at = list.indexOf('--projects');
+  // `--filter` is still read for the connections that were made with it: it
+  // is the team or repository the webhook itself is narrowed to, which is a
+  // different thing from which of that team's projects reach the board.
+  if (at === -1) return undefined;
+  const names = String(list[at + 1] || '').split(',').map((one) => one.trim()).filter(Boolean);
+  return { ids: [], names: [...new Set(names)] };
 }
 
 function connectedProviders(connections) {
@@ -497,10 +527,12 @@ async function trackers() {
     return;
   }
   if (action !== 'connect' || !target) {
-    throw new Error('Usage: teamflow trackers, or teamflow trackers connect <tracker> [--filter <team>]');
+    throw new Error('Usage: teamflow trackers, or teamflow trackers connect <tracker> '
+      + '[--projects a,b] [--filter <team>]');
   }
   const at = args.indexOf('--filter');
   const filter = at === -1 ? '' : String(args[at + 1] || '').trim();
+  const scope = projectsArg(args);
   const cred = await credential(config);
   if (!cred) throw new Error('TeamFlow needs a credential to connect a tracker; run /teamflow:login.');
   const provider = String(target).toLowerCase();
@@ -509,7 +541,7 @@ async function trackers() {
     {
       method: 'POST',
       headers: { [cred.header]: cred.value, 'content-type': 'application/json' },
-      body: JSON.stringify(filter ? { filter } : {}),
+      body: JSON.stringify({ ...(filter ? { filter } : {}), ...(scope ? { scope } : {}) }),
       signal: AbortSignal.timeout(Number(config.serviceTimeoutMs || 5000)),
     },
   );
@@ -528,7 +560,11 @@ async function trackers() {
   print(`Open this to authorise ${provider}:\n\n  ${body.authorize_url}\n\n`
     + `It expires in ${minutes} minutes. Approve it and TeamFlow creates the webhook itself — `
     + 'there is nothing to paste. The browser lands back on the members page, and '
-    + `\`teamflow trackers\` shows ${provider} connected once it has.`);
+    + `\`teamflow trackers\` shows ${provider} connected once it has.`
+    + (scope
+      ? `\n\nIt will cover ${scope.names.join(', ')}.`
+      : '\n\nIt will cover every project the workspace has. '
+        + 'Pass --projects to narrow it, or choose them on the members page.'));
 }
 
 async function repos() {
@@ -606,6 +642,10 @@ try {
   }
   else if (command === 'workflow') {
     const { main } = await import('./workflow.mjs');
+    process.exit(await main(args, { cwd, config, info }));
+  }
+  else if (command === 'adhoc') {
+    const { main } = await import('./adhoc.mjs');
     process.exit(await main(args, { cwd, config, info }));
   }
   else if (command === 'unbind') unbind();
