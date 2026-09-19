@@ -486,6 +486,37 @@ async function deviceCall(config, route, payload) {
   return { ok: true, body: body || {} };
 }
 
+/**
+ * The verification URL, on the host this machine is actually talking to
+ * (MACLEOD-572, plugin audit row 18).
+ *
+ * The service builds that URL from its own configured domain, which on
+ * the deployed stack is the host the plugin is talking to and on a
+ * preview, a laptop or a test service is not: a preview answers
+ * `https://codercat.io/app/#device` for a code only it has issued, and
+ * a person who opened that would be typing a real code into the live
+ * dashboard, which cannot approve it. So the path, query and fragment
+ * the service chose are kept exactly and only the origin is replaced,
+ * and only when the two disagree — a service that answered with its own
+ * host is left alone, and anything unparseable is passed through rather
+ * than guessed at.
+ */
+export function verificationUrl(given, config = {}) {
+  if (!given) return given;
+  let url;
+  let here;
+  try {
+    url = new URL(String(given));
+    here = new URL(serviceUrl(config));
+  } catch {
+    return given;
+  }
+  if (url.origin === here.origin) return given;
+  url.protocol = here.protocol;
+  url.host = here.host;
+  return url.toString();
+}
+
 const DEVICE_REFUSALS = {
   access_denied: 'the sign-in was refused in the browser',
   expired_token: 'the code expired before anybody approved it',
@@ -504,7 +535,8 @@ export async function deviceLogin(config = {}, {
   if (!grant.device_code || !grant.user_code) {
     return { ok: false, reason: 'the service answered a device request without a code' };
   }
-  const url = grant.verification_url_complete || grant.verification_url;
+  const url = verificationUrl(
+    grant.verification_url_complete || grant.verification_url, config);
   notify(`TeamFlow sign-in: open ${url} in a browser on ANY machine and enter the code ${grant.user_code}`);
 
   let interval = Math.max(1000, (Number(grant.interval) || 0) * 1000 || DEVICE_INTERVAL_MS);

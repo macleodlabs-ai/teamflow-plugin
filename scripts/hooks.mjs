@@ -20,7 +20,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
-import { safeExec } from './core.mjs';
+import { fetchAccount, gitInfo, loadConfig, safeExec, transportOf } from './core.mjs';
 import { BY_ID } from './tools.mjs';
 import { mergeJson, writeBlock, writeFile } from './write.mjs';
 
@@ -289,6 +289,14 @@ export const HOOK_SPECS = {
           json: {
             version: 1,
             hooks: {
+              // Registered for the sign-in notice and nothing else: it
+              // reports no stage, which is why it is not in this tool's
+              // `events` in tools.mjs. Cursor documents
+              // `additional_context` on it as "additional context to
+              // add to the conversation's initial system context",
+              // which is once a session and at the start of it
+              // (MACLEOD-569).
+              sessionStart: both(),
               afterFileEdit: both(),
               postToolUse: both(),
               postToolUseFailure: both(),
@@ -401,6 +409,16 @@ export const HOOK_SPECS = {
           file: path.join(home(), '.junie', 'config.json'),
           json: {
             hooks: {
+              // For the sign-in notice, not for reporting — Junie's
+              // own page says `systemMessage` is "honoured by the
+              // SessionStart, SessionEnd and UserPromptSubmit
+              // executors" and that "the Stop executor does not
+              // currently surface it in the TUI", so Stop, the obvious
+              // place, is the one place nobody would read it
+              // (MACLEOD-569). SessionEnd is on that list too and is
+              // not used, because the same page says hook output is
+              // discarded there.
+              SessionStart: [{ hooks: [entry.typed(sh, { timeout: 10 })] }],
               PreToolUse: [{ matcher: '*', hooks: [entry.typed(sh, { timeout: 10 })] }],
               Stop: [{ hooks: [entry.typed(sh, { timeout: 10 })] }],
             },
@@ -505,6 +523,79 @@ export function hooksStatus(root = process.cwd(), config = {}) {
   };
 }
 
+// --- what the install says last ----------------------------------------
+
+/**
+ * Installing the hooks is the moment the customer is looking (MACLEOD-569).
+ *
+ * After this command finishes there is no channel left. Claude Code
+ * hears about a missing credential on SessionStart; Cursor, Copilot,
+ * Windsurf, Cline, Codex CLI, Gemini CLI and Junie mostly do not, and
+ * where they do it is one line a day in a field the vendor happens to
+ * document. So the install ends by answering the only question that
+ * decides whether any of this works: is this machine signed in, and if
+ * it is, where does this repository's work appear.
+ *
+ * Both answers go on stderr and the short form goes into the JSON, so a
+ * person reads it and a script can still parse stdout.
+ */
+export async function credentialNotice({ root = process.cwd(), config } = {}) {
+  const resolved = config || loadConfig(root);
+  // The transport, not the credential (MACLEOD-569 review). A machine
+  // configured with a `dataUri` and no credential is on the legacy S3
+  // transport and its reports land; telling it to sign in would be
+  // wrong, and telling it nothing reaches the board would be false.
+  const transport = transportOf(resolved);
+  if (transport !== 'none' && transport !== 'service') {
+    return {
+      signIn: `reporting on the legacy ${transport} transport, which needs no sign-in; `
+        + '`teamflow doctor` checks it',
+      block: `\nTeamFlow: the hooks are in, reporting on the legacy ${transport} transport. `
+        + '`teamflow doctor` checks the bucket.\n',
+    };
+  }
+  if (transport === 'none') {
+    return {
+      signIn: 'NOT SIGNED IN: the hooks are installed and every report they make will be '
+        + 'dropped until `teamflow login` is run on this machine',
+      block: [
+        '',
+        '  ---------------------------------------------------------------',
+        '  TeamFlow: the hooks are in. Nothing will reach the board yet.',
+        '',
+        '  This machine has no credential, so every report these hooks make',
+        '  is dropped — silently, for ever, with an empty board as the only',
+        '  symptom. Outside Claude Code a hook cannot tell you this later:',
+        '  stdout is how a hook denies an action in these tools.',
+        '',
+        '      teamflow login            once, in a browser',
+        '      teamflow login --device   if the browser is on another machine',
+        '      teamflow status           to check it',
+        '',
+        `  Without \`teamflow\` on PATH, put \`npx -y ${PACKAGE}\``,
+        '  in front of each.',
+        '  ---------------------------------------------------------------',
+        '',
+      ].join('\n'),
+    };
+  }
+
+  // Signed in. Name the organisation and the project, because "it is
+  // installed" and "your work will appear where you are looking" are
+  // different claims and only the second one is the one being made.
+  const probe = await fetchAccount(resolved);
+  const { resolveProject } = await import('./project.mjs');
+  const repository = gitInfo(root).repository;
+  const project = await resolveProject(repository, resolved);
+  const org = probe.ok ? probe.account?.account : undefined;
+  const where = [
+    org ? `org ${org}` : 'the organisation this credential belongs to',
+    `project ${project.line}`,
+  ].join(', ');
+  const signIn = `signed in: ${repository || 'this repository'} reports to ${where}`;
+  return { signIn, block: `\nTeamFlow: ${signIn}. \`teamflow status\` confirms it.\n` };
+}
+
 // --- cli --------------------------------------------------------------
 
 export const USAGE = `teamflow hooks — report automatically from whatever you use
@@ -555,10 +646,24 @@ export async function main(argv = [], io = {}) {
   if (!options.git && !options.for) { err(`hooks install needs --for <tool> or --git.\n\n${USAGE}`); return 2; }
 
   try {
+    const dryRun = Boolean(options['dry-run']);
     const result = options.git
-      ? installGitHooks({ root, dryRun: Boolean(options['dry-run']) })
-      : installHooks(options.for, { root, dryRun: Boolean(options['dry-run']) });
-    out(`${JSON.stringify(result, null, 2)}\n`);
+      ? installGitHooks({ root, dryRun })
+      : installHooks(options.for, { root, dryRun });
+    // A dry run writes nothing and asks nobody anything, including the
+    // service.
+    // Loaded from `root` rather than reusing the caller's: `--root`
+    // moves which `.teamflow.json` applies, and this answer is about
+    // the repository being installed into.
+    const notice = dryRun ? undefined : await credentialNotice({ root });
+    out(`${JSON.stringify(notice ? { ...result, signIn: notice.signIn } : result, null, 2)}\n`);
+    // Exit 0 even when nobody is signed in. The hooks *are* installed —
+    // that is what was asked for and it happened — and a non-zero exit
+    // would break `&&` in every setup script and fail a build image that
+    // legitimately signs in later, or reports with an OIDC token that
+    // only exists inside CI. Non-zero is reserved for "the thing you
+    // asked for did not happen"; this is a warning, and it is loud.
+    if (notice) err(notice.block);
     return 0;
   } catch (error) {
     err(`${error instanceof Error ? error.message : String(error)}\n`);

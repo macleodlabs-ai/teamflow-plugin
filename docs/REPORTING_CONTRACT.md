@@ -130,6 +130,51 @@ A ticket's events used to be stored in three shapes — the issue document's `ex
 }
 ```
 
+### Who ran it: the `agent` and `session` blocks
+
+An event the plugin writes may carry two more blocks, and only these two shapes (MACLEOD-574):
+
+```jsonc
+{
+  "id": "claude-abc123-4f2a91c4",
+  "at": "2026-09-19T15:40:00Z",
+  "source": "plugin",
+  "kind": "claude",
+  "label": "wf-trackers-kit",
+  "agent": {
+    "id": "agent_01H…",                    // the tool's own id, or a digest when it sent none
+    "name": "wf-trackers-kit",             // ≤ 64
+    "task": "Kit trackers: 533, 537, then 534",   // ≤ 80
+    "type": "fork",                        // its subagent_type, ≤ 40
+    "parent": "9f1c2b7e4a05",              // the session it runs in, as `session.id` spells it
+    "startedAt": "2026-09-19T15:12:00Z",
+    "endedAt": "2026-09-19T15:39:00Z"      // once it has stopped
+  },
+  "session": {
+    "id": "9f1c2b7e4a05",                  // a digest of the session id, never the id
+    "tool": "Claude Code",
+    "startedAt": "2026-09-19T14:58:00Z",
+    "endedAt": "2026-09-19T18:02:00Z",
+    "repository": "macleodlabs-ai/teamflow",
+    "branch": "steve/macleod-574-agents"
+  }
+}
+```
+
+**An agent's `name` and its `task` are short labels the model wrote, of exactly the same class as a workflow's name — and nothing else about the agent leaves the machine.** The prompt it was launched with (`tool_input.prompt` on the `Agent` tool), the messages it wrote (`last_assistant_message` on `SubagentStop`), its transcript and its tool calls are none of them fields here, are never read by the plugin, and are dropped by the unknown-field path on the way in. `name` is capped at 64 characters, `task` at 80 and `type` at 40, all through the same sanitising a workflow name gets: one line, whitespace collapsed, truncated. An agent nobody named is `Agent <type>`.
+
+An agent's `id` is whatever its tool calls the instance. Where the tool names no instance — an older Claude Code, and the seven other tools TeamFlow supports — TeamFlow keys the agent by the repository it is working in, and **what travels is a digest of that path and never the path itself**, because a working directory carries an OS username, a client's name and a repository's name, none of which is derived state. The same is true of the execution id an agent's row carries, and of `agent.parent`, which is the digest `session.id` carries so that the two join. `AGENT`, `SESSION` and `EXECUTION` in `adapters/teamflow/schema.py` refuse an id with a path separator in it, so the rule is a check on both sides rather than a promise on one.
+
+They exist because the board is meant to show what the terminal shows. Claude Code lists its running agents by name and by the one line each was launched with; the board showed `Claude Code + 1 subagent` and counted none of them, because a subagent was a counter on its parent's state with no ticket, no stage and no name of its own.
+
+One identifier is deliberately not hashed: the execution id `claude-<session>` carries the tool's raw `session_id`. It predates all of this and is what a tenant's documents are already keyed by, so changing it would split every card in two on the day a plugin upgrades. A `session_id` is a random UUID the tool mints per session — not a secret, not derived from anything about the machine or the person, and useful precisely because it is stable: it is what correlates the several tickets one session touched. The digest in `session.id` exists for the board to group by, not because the raw id would be a disclosure.
+
+`session` is which session a run happened in, so the board can group a person's work as person → session → agent. `id` is a digest of the tool's `session_id` and **never the id itself**: telling two of somebody's sessions apart is the whole job, and a raw session id is a machine-local identifier with no business on a report. No transcript path, no scratchpad directory, no working directory — `repository` and `branch` are the same two fields the issue document already carries, repeated here because a worktree is the usual reason a person has more than one session open.
+
+A `running` agent is believed for as long as it keeps saying so. `SessionEnd` has 1.5 seconds and may not spend them on the network, so a session that is killed leaves its last report standing: the plugin carries those ends on the next turn by anything on the machine, and the dashboard ages out a Claude agent whose last report is older than `freshness`'s `idle` band, drawing it as *stopped reporting* rather than as working. A build or a test suite is not aged out — it is owned by a reporter with a lifecycle of its own and is taken at its word.
+
+`AGENT` and `SESSION` in `adapters/teamflow/schema.py` are the enforcement, and `sanitizePayload` in `plugin/scripts/core.mjs` gives each block a scope of its own rather than adding `name`, `task`, `parent` and the rest to the flat allowlist — those are precisely the words a reporter talked into attaching a prompt would reach for.
+
 `source` is a slot — `ci`, `audit-local`, `deploy`, `dev-test`, `audit-dev`, `security`, `tracker`, `pr` — or `plugin`, for the hooks, which write the issue document and have no slot of their own. `kind` is the execution vocabulary, which gained `tracker` and `forge` with this shape: a status change in Linear and a delivery from GitHub are neither a run nor a person, and calling either of them `ci` would say a build happened when none did.
 
 `stage` and `status` are both optional because not every event is a run. A tracker renaming a status moves no ticket and has no verdict, and a row claiming `success` for it would light a timeline green for an issue nobody has touched.

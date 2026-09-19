@@ -16,7 +16,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { installHooks } from './hooks.mjs';
+import { credentialNotice, installHooks } from './hooks.mjs';
 import { capability } from './tools.mjs';
 import { mergeJson, writeBlock, writeFile, writeTomlTable } from './write.mjs';
 
@@ -473,13 +473,21 @@ export async function main(argv = [], io = {}) {
   }
 
   try {
+    const root = options.root ? path.resolve(cwd, options.root) : cwd;
+    const dryRun = Boolean(options['dry-run']);
     const result = install(options.for, {
-      root: options.root ? path.resolve(cwd, options.root) : cwd,
+      root,
       scope: options.scope || 'project',
-      dryRun: Boolean(options['dry-run']),
+      dryRun,
       dir: options.dir ? path.resolve(cwd, options.dir) : skillsDir(),
     });
-    out(`${JSON.stringify(result, null, 2)}\n`);
+    // This is the documented one-liner, so it ends the way `hooks
+    // install` does: with whether this machine can report at all
+    // (MACLEOD-569). A dry run writes nothing and asks nobody anything.
+    const notice = dryRun ? undefined : await credentialNotice({ root });
+    out(`${JSON.stringify(notice ? { ...result, signIn: notice.signIn } : result, null, 2)}\n`);
+    // Exit 0: the skills and the hooks are installed. See hooks.mjs.
+    if (notice) err(notice.block);
     return 0;
   } catch (error) {
     err(`${error instanceof Error ? error.message : String(error)}\n`);

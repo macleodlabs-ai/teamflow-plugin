@@ -23,15 +23,91 @@ PostToolUse / PostToolUseFailure (async)
   → sanitize + deduplicate
   → POST the current state to the service as one report
 
-TaskCompleted / SubagentStart / SubagentStop
-  → update summary/subagent count
+PreToolUse (Agent / Task, in the parent)
+  → record the agent's name and one-line task in the launch registry
+  → never the prompt, which sits in the same tool_input
+
+SubagentStart / SubagentStop
+  → the agent's own actor: match its launch, name it, end it
+  → its stage, its ticket and its status are its own, not its parent's
+
+TaskCompleted
+  → heartbeat
 
 Stop
   → publish idle state
+  → flush any ends SessionEnd could not publish
 
 SessionEnd
   → local-only cleanup; no network work
+  → ends every actor of the session and marks their ends for the next turn
 ```
+
+## An actor is (session, agent)
+
+A subagent's hook events carry the **parent's** `session_id`. State is
+therefore keyed by session *and* agent, or five teams in five worktrees and
+the main session share one file and whoever fired last decides the ticket
+and the stage for everybody (MACLEOD-574).
+
+The agent key is, in order:
+
+1. `agent_id`, where the payload carries one;
+2. the agent that has already claimed this repository root;
+3. an agent that started but has not shown a root of its own yet — a
+   worktree-isolated agent's `SubagentStart` fires before its worktree
+   exists, so its first event comes from the parent's directory;
+4. a **digest** of the repository root, when it is not the session's own;
+5. nothing at all, which is the main actor and keeps the file name and the
+   behaviour it has always had.
+
+On disk: `sessions/<id>.json` is the main actor, `sessions/<id>--<digest>.json`
+is one agent, and `sessions/<id>.launches/` is the launch registry — one file
+per launch, claimed by atomic rename, because five agents launched in one
+message are five hook processes and a shared JSON file loses updates.
+
+A digest and never the path: a working directory carries an OS username, a
+client's name and a repository's name, and `docs/REPORTING_CONTRACT.md` is
+the rule it would break.
+
+A session that has never launched an `Agent` has no agents, so a developer
+who `cd`s into a second repository gets an actor of their own — two
+repositories must not overwrite each other's stage — and no `agent` block.
+
+## What does this tool actually send?
+
+`agent_id` is documented on `SubagentStart` and `SubagentStop` and on tool
+events fired inside a subagent. Whether a given build of Claude Code, or any
+of the other seven tools, really puts it on all of them is something no test
+on this machine can answer, because a synthetic payload proves only what the
+test put in it — so the plugin is built to work either way, and there is an
+opt-in trace for settling it from real payloads (MACLEOD-573).
+
+```bash
+TEAMFLOW_HOOK_TRACE=1        # in the environment of the session you want to watch
+```
+
+One line per event in `<data dir>/hook-trace.jsonl`, holding the event name,
+the tool name, the **key names** present on the payload and on `tool_input`,
+whether `agent_id` and `agent_type` were present, and whether the event came
+from the session's own repository root. Names and booleans: never a value,
+never a path, never a prompt, never an id.
+
+A key name is only written if it is on an **allowlist** — the hook payload's
+documented fields, and the tool-input fields this plugin's tools actually
+carry, both in one constant each in `core.mjs`. Anything else is counted into
+`otherKeys` and never written. A key name is content too: the first cut
+screened key names by shape, and a shape test passes `ghp_…`, `sk_live_…`,
+`xoxb_…`, `glpat_…`, `AIzaSy…` and `npm_…` without blinking, because every
+common token prefix is a valid identifier. The cost of the allowlist is that
+a field Claude Code adds tomorrow arrives as a number rather than a name —
+which is still the signal you need, and is a better trade than a debug file
+that can print a customer's access token.
+
+It is capped at forty names of forty characters per list, 2 KB per line and
+2 MB per file, it is never sent anywhere, it fails open like every other thing
+a hook does, and `teamflow doctor` names the file while it exists so nobody
+forgets it. Delete it when you are done with it.
 
 ## Install lifecycle
 
@@ -76,7 +152,37 @@ Nothing but the refresh token reaches the disk. A refresh token is revocable and
 
 Reporting fails open, which means an install nobody has signed in on breaks nothing and reports nothing: every event is classified, every session is saved, and `publishState` skips because there is no credential. There is no error, and the only symptom is a board that stays empty, noticed days later. So the plugin says it where the person is looking — Claude Code's first `SessionStart` of a session on a machine with no credential prepends one sentence, once, naming `/teamflow:login`. It is context, never a denial: a reporter that blocked a turn would be worse than one that said nothing (MACLEOD-567).
 
-Every other tool gets no such sentence, and deliberately. Cursor, Copilot, Cline and Gemini CLI read a hook's stdout as a decision, so a notice printed there is a denied action; and no adapter emits a session-start event to say it once on instead. After `teamflow skills install --for <tool>`, run **`teamflow status`** — it names the credential, the repository and the project in one answer, and says `not signed in; run /teamflow:login` when that is the problem. `teamflow doctor` is the longer form, and on a machine with nothing configured it now answers with the one line to act on rather than with the legacy S3 probe.
+Every other tool is told twice, in the two places a channel exists (MACLEOD-569).
+
+**At install time**, which is the one moment there is a person's attention and a stream nothing reads as a denial. `teamflow skills install --for <tool>`, `teamflow hooks install --for <tool>` and `teamflow hooks install --git` all end by asking the same local question the hook asks: what transport is configured. On the service transport the last line names the organisation and the project this repository reports to; on the legacy S3 transport it says so and points at `teamflow doctor`; with nothing configured at all, the last lines are a block on stderr naming `teamflow login`, `teamflow login --device` and `teamflow status`, and the JSON on stdout carries the same answer as `signIn` so a script can read it. The command still exits **0**: the hooks *are* installed, which is what was asked for, and a non-zero exit would break `&&` in every setup script and fail a build image that signs in later or reports with a CI OIDC token that only exists inside the job. Non-zero is for "the thing you asked for did not happen"; this is a warning, and it is loud. `--dry-run` writes nothing and asks nobody anything, including the service.
+
+**At run time**, once per machine per day and never per event, through whichever field that tool's own documentation calls informational rather than a denial. The rule is unchanged and outranks the notice: stdout is how a hook denies an action in these tools, so nothing TeamFlow prints there may carry `decision`, `permissionDecision`, `continue`, `stopReason` or `cancel: true`. The mechanism, and each piece of it exists because a plausible-looking shortcut was wrong:
+
+- **The table is data**, `notice` in `plugin/scripts/tools.mjs`, beside the doc URL it was read from. `noticeFor` in `adapters.mjs` is the only reader and builds the answer as *the passive value plus one field*, so a notice can never say less than silence does and cannot introduce a key the table did not name.
+- **`audience` is `person` or `agent`** and is never blurred, because it decides *which text is sent*. There are two constants in `hook-cli.mjs`, both with nothing interpolated into them. `NOT_SIGNED_IN` is an imperative — run `teamflow login`, then `teamflow status` — and goes only to a field the vendor says the person reads. `NOT_SIGNED_IN_FOR_AGENT` goes to the three that the model reads (Cursor's `additional_context`, Cline's `contextModification`, Junie's `PreToolUse` fallback); it is declarative, states that this is information for the person and explicitly not a task, asks only that the agent pass it on when it next reports back, and contains no command, no backticks and none of the verbs an agent would read as a step. The reason is not theoretical: the imperative arrives immediately before somebody else's agent takes its next tool call, an agent that simply does as it is told abandons the customer's task, and `teamflow login` opens a browser and blocks on a loopback listener for three minutes, so obeying it can hang the turn. It is not injection — the string is a constant and no report ever reaches it — it is this plugin instructing an agent that is not ours to instruct. A test asserts the split per channel and fails if either branch stops being exercised.
+- **No channel means the day is not spent.** `sayOnce` asks the table first and claims only when there is something to print. This is not hypothetical: Junie's `Stop` looked like the obvious place, and JetBrains' own page says the Stop executor does not surface `systemMessage` in the TUI — so it printed into nothing *and* burnt the notice a Junie-and-Cursor user would have read in Cursor.
+- **The claim is an exclusive create**, `<plugin data>/notices/<day>.lock` opened `wx`. Read-then-write is not enough: Cursor sends `afterFileEdit` and `postToolUse` for one edit, Copilot registers six event names, and these are separate processes. Five concurrent hooks against a read-then-write claim produced five notices; against the lock, one.
+- **It is the transport, not the credential.** A machine with a `dataUri` and no credential is on the legacy S3 transport and its reports land, so it hears nothing.
+
+| Tool | Install-time notice | Run-time channel | Audience |
+| --- | --- | --- | --- |
+| Claude Code | n/a — the plugin carries its own hooks | `SessionStart` `additionalContext`, once a session (row above), via `claudeContext` rather than this table | person |
+| Cursor | yes | `additional_context` on **`sessionStart`**, "additional context to add to the conversation's initial system context". The installer now registers `sessionStart` for the notice alone — it reports no stage. `postToolUse` / `postToolUseFailure` remain as the fallback for a `.cursor/hooks.json` written before this release. Nothing on `afterFileEdit`, `afterShellExecution` or `stop`; `user_message` is what a *denial* shows on the `before*` hooks and is not used | agent — gets the declarative text |
+| VS Code + Copilot | yes | `systemMessage`, one of the three fields documented for every hook beside `continue` and `stopReason`: it "displays a warning to the user in the chat" | person |
+| Windsurf | yes | **none.** Cascade documents exit codes and no output schema at all, and a hook's output reaches its UI only when the hook is configured `show_output` — which would be a line in front of the developer on every edit and every command rather than once | — |
+| Cline | yes | `contextModification` beside `cancel: false`: "inject text into the conversation" without cancelling | agent — gets the declarative text |
+| OpenAI Codex CLI | yes | `systemMessage`, Claude Code's field kept field for field, "surfaced as a warning in the UI or event stream" | person |
+| Gemini CLI | yes | `systemMessage`, documented as a non-blocking informational display, printed in place of the bare `{}`; `decision` is the field that blocks and is never set | person |
+| JetBrains Junie | yes | `systemMessage` on **`SessionStart`**, which the installer now registers for the notice alone. The page says `systemMessage` is "honoured by the SessionStart, SessionEnd and UserPromptSubmit executors" and, in so many words, that "the Stop executor does not currently surface it in the TUI" — so **not `Stop`**, and not `SessionEnd` either, where hook output is discarded. `PreToolUse` `additionalContext` is the fallback for a `~/.junie/config.json` written before this release, and it is "agent-facing, never published to the TUI": on an old install the model is told and the person is not, until the installer is re-run | person on `SessionStart`; agent on the fallback, which gets the declarative text |
+| git fallback (Zed, Aider) | yes | **none.** Two of the three installed hooks redirect both streams to `/dev/null` so a commit stays quiet, so a line there would be burnt unread | — |
+
+The doc URLs are in `plugin/scripts/tools.mjs` beside each record, with the vendor wording each claim rests on quoted in the record itself; the fields above were read on 2026-09-19.
+
+Re-running an installer is safe and is how an existing checkout gains the new `sessionStart` / `SessionStart` entry: hook configs are merged, not replaced, and array entries are unioned, so nothing already in the file moves.
+
+**There is no `teamflow hooks uninstall` today**, and that is a gap rather than a decision. Coming back out is by hand: delete `.teamflow/hooks/<tool>.sh` (and the `.ps1` beside it), which is what the header of each shim says; remove TeamFlow's entries from that tool's hook config; and for the git fallback delete the block between `# BEGIN teamflow` and `# END teamflow` in `.git/hooks/post-commit`, `post-merge` and `pre-push`, which is what the comment inside the block says. Every one of those files is safe to edit by hand because the installer only ever merges into it. An `uninstall` that reversed the same writes is worth having and is ticketed separately; nothing here should grow one as a side effect.
+
+**Afterwards**, `teamflow status` is still the surface that answers in full — the credential, the repository and the project in one answer, with `not signed in; run /teamflow:login` when that is the problem — and `teamflow doctor` is the longer form, which on a machine with nothing configured answers with the one line to act on rather than with the legacy S3 probe.
 
 ### A machine with no browser
 

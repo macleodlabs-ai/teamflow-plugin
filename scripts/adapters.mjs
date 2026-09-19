@@ -25,6 +25,7 @@
 
 
 import { projectId, repositoryRoot } from './core.mjs';
+import { BY_ID } from './tools.mjs';
 
 // A tool that has no session concept still needs a stable key, because
 // the session file is where the last published state lives and a fresh
@@ -148,6 +149,81 @@ export const PASSIVE_STDOUT = {
   jetbrains: '',
   git: '',
 };
+
+/**
+ * The one thing a hook is allowed to say out loud (MACLEOD-569).
+ *
+ * PASSIVE_STDOUT above is the rule: stdout is how these tools are told
+ * to deny an action, so a reporter says nothing on it. But several of
+ * them document a *field* on that same stdout that is explicitly not a
+ * denial, and without one there is no way at all to tell a customer
+ * that nobody has signed in and the board will stay empty.
+ *
+ * Which field, on which of that tool's events, is data rather than code
+ * — `notice` in tools.mjs, beside the doc URL it was read from. This is
+ * the only reader. Three properties it has to keep:
+ *
+ * 1. **The passive value is the floor.** The notice is that same object
+ *    with one field added, so a notice can never say less than silence
+ *    does: Cline still hears `cancel: false`, Gemini still gets valid
+ *    JSON, and nothing here can introduce `decision`, `continue`,
+ *    `permissionDecision` or `cancel: true` because nothing here writes
+ *    a key the table did not name.
+ * 2. **No channel means undefined**, never an empty object and never a
+ *    guess. Undefined is what stops hook-cli.mjs spending the machine's
+ *    one notice for the day on a surface nobody would read it on —
+ *    which is exactly what Junie's `Stop` did until 2026-09-19, when
+ *    the page turned out to say that the Stop executor does not
+ *    surface `systemMessage` at all.
+ * 3. **Order is preference.** The first channel whose events include
+ *    this one wins, so a tool can have a person-facing event first and
+ *    an agent-facing fallback for installs that predate it.
+ */
+/**
+ * The tools with a channel table that is not a capability record.
+ *
+ * `git` is the fallback for tools that have no hook system of their
+ * own, so it is not in TOOL_CAPABILITIES and has no record to carry a
+ * `notice`. Its answer is written down here rather than arriving as a
+ * lookup miss, because "this tool has no record" and "this tool has no
+ * channel" are different facts and only one of them is a decision
+ * anybody made.
+ */
+const NOTICE_CHANNELS = {
+  // Two of the three hooks `hooks install --git` writes redirect both
+  // streams to /dev/null so a commit stays quiet, so a line here would
+  // be burnt unread. The install-time notice is the git fallback's
+  // whole channel.
+  git: [],
+};
+
+/** This tool's channels, or undefined if nothing here has heard of it. */
+export function noticeChannels(tool) {
+  if (Object.hasOwn(NOTICE_CHANNELS, tool)) return NOTICE_CHANNELS[tool];
+  return BY_ID[tool]?.notice;
+}
+
+export function noticeFor(tool, event, text) {
+  const channel = (noticeChannels(tool) || []).find((one) => one.events.includes(event));
+  if (!channel) return undefined;
+  // Which of the two texts, decided by the vendor's own answer about
+  // who reads this field (MACLEOD-569 review). A person can be told to
+  // run a command; somebody else's agent, reading this immediately
+  // before its next tool call, must not be.
+  const said = typeof text === 'string' ? text : text?.[channel.audience];
+  if (!said) return undefined;
+  let base = {};
+  const passive = PASSIVE_STDOUT[tool];
+  if (passive) {
+    try { base = JSON.parse(passive); } catch { base = {}; }
+  }
+  return JSON.stringify({ ...base, [channel.field]: said });
+}
+
+/** The channel `noticeFor` would use, for the tests and the docs. */
+export function noticeChannel(tool, event) {
+  return (noticeChannels(tool) || []).find((one) => one.events.includes(event));
+}
 
 // --- Cursor -----------------------------------------------------------
 //

@@ -10,21 +10,32 @@
 // Claude Code would mean two classifiers, and two classifiers drift.
 
 import {
+  absorbRootActor,
+  resolveActorKey,
   applyTransition,
   chooseBinding,
+  claimLaunch,
   classifyTool,
   credentialKind,
   detectCandidates,
   enrichBinding,
   isAdHocKey,
+  isAgentTool,
   loadConfig,
+  matchLaunch,
+  parseAgentId,
   publishState,
   readJson,
+  recordLaunch,
   reporterInfo,
   repositoryRoot,
   saveSession,
+  sessionActors,
+  pendingEndActors,
+  serviceUrl,
   sessionPath,
   tenantId,
+  trace,
   staleBuildNotice,
 } from './core.mjs';
 import { NO_PROJECT_SENTENCE, resolveProject } from './project.mjs';
@@ -33,15 +44,20 @@ import { NO_PROJECT_SENTENCE, resolveProject } from './project.mjs';
 // waiting on them before it shows the developer anything.
 const FAST = ['SessionStart', 'UserPromptSubmit'];
 
-export function newSession(sessionId, cwd) {
+export function newSession(sessionId, cwd, agentKey = undefined) {
   return {
     sessionId,
+    // Absent on the main actor, so its state file keeps the name it has
+    // always had and an install that upgrades mid-session reads it back.
+    ...(agentKey ? { agentKey } : {}),
     cwd,
     stage: 'BACKLOG',
     status: 'running',
     summary: 'Issue work detected',
     loopCount: 0,
-    subagentCount: 0,
+    // When this actor first reported, which is what the board's session
+    // row shows as "running for" (MACLEOD-574).
+    startedAt: new Date().toISOString(),
     updatedAt: new Date().toISOString(),
   };
 }
@@ -92,6 +108,13 @@ function projectSentence(project) {
 
 // `signedIn` defaults to true so that a caller which cannot answer the
 // question says nothing rather than accusing a signed-in machine.
+//
+// `state` is one actor's, never the session's pooled state (MACLEOD-574).
+// It used to be the latter, and the main session was consequently told
+// "working on MACLEOD-571" because a team in a worktree had bound that
+// ticket under the same `session_id` minutes earlier — its context
+// flipped between whichever worktree had bound last. An agent reads its
+// own binding and the session reads its own; neither can see the other's.
 export function claudeContext(event, state, justBound, stale = staleBuildNotice(), project = undefined,
   signedIn = true) {
   if (!FAST.includes(event)) return undefined;
@@ -134,6 +157,154 @@ export function claudeContext(event, state, justBound, stale = staleBuildNotice(
   });
 }
 
+/**
+ * Who this actor is, if it is an agent (MACLEOD-574).
+ *
+ * Three jobs, none of which may throw and all of which are no-ops for a
+ * payload that carries none of the fields — an older Claude Code, and
+ * every other tool, which go on behaving exactly as they did.
+ *
+ * 1. In the parent, the `Agent` (formerly `Task`) tool's PreToolUse is
+ *    the only place an agent's human-readable name and its one-line
+ *    task exist, so they are written to a launch registry beside the
+ *    session. Never the prompt, which sits in the same `tool_input`.
+ * 2. Its PostToolUse sometimes answers with a line `agentId: <id>` for
+ *    a background agent; where it does, that launch is claimed by id.
+ * 3. On the agent's own `SubagentStart` the launch is matched — by the
+ *    claimed id, else the oldest unmatched launch of the same type —
+ *    and the identity is written onto the agent's own state. An agent
+ *    nobody named is "Agent" and its type. `SubagentStop` ends it and
+ *    keeps its last stage; `last_assistant_message`, which that event
+ *    also carries, is model output and is never read.
+ *
+ * `launched` is what stops a person becoming an agent (audit finding 3).
+ * A developer who `cd`s into a second repository, or opens a worktree by
+ * hand, gets an actor of their own — two repositories must not overwrite
+ * each other's stage, and that half was always right — but in a session
+ * that has never launched an `Agent` there is no agent to name, so no
+ * `agent` block is written and the row stays the person's own work.
+ */
+export function withAgentIdentity(event, input, state, sessionId, agentKey, launched = false) {
+  const tool = input.tool_name || '';
+  if (event === 'PreToolUse' && isAgentTool(tool) && !agentKey) {
+    const launch = recordLaunch(sessionId, input.tool_input || {});
+    // Remembered on the session's own state so a later worktree event
+    // can tell "this session runs agents" from "this person opened a
+    // second repository", without listing a directory per event.
+    return launch ? { ...state, launched: true } : state;
+  }
+  if (event === 'PostToolUse' && isAgentTool(tool) && !agentKey) {
+    claimLaunch(sessionId, parseAgentId(input.tool_response), input.tool_input?.subagent_type);
+    return { ...state, launched: true };
+  }
+  if (!agentKey) return state;
+
+  const type = typeof input.agent_type === 'string' ? input.agent_type.slice(0, 40) : undefined;
+  // An actor is an agent when its tool said so, or when the session it
+  // belongs to has launched one. Neither, and this is somebody working
+  // in a second repository.
+  const isAgentActor = Boolean(input.agent_id || type || state.agent || launched
+    || event === 'SubagentStart' || event === 'SubagentStop');
+  if (!isAgentActor) return state;
+  if (event === 'SubagentStart' || !state.agent) {
+    const launch = event === 'SubagentStart' ? matchLaunch(sessionId, input.agent_id, type) : undefined;
+    const name = launch?.name || state.agent?.name
+      || (type ? `Agent ${type}` : 'Agent');
+    state = {
+      ...state,
+      agent: {
+        id: String(input.agent_id || agentKey).slice(0, 80),
+        name,
+        task: launch?.task || state.agent?.task,
+        type: type || launch?.type || state.agent?.type,
+        parent: sessionId,
+        startedAt: state.agent?.startedAt || new Date().toISOString(),
+      },
+    };
+  }
+  if (event === 'SubagentStop') {
+    state = {
+      ...state,
+      status: 'idle',
+      agent: { ...(state.agent || {}), endedAt: new Date().toISOString() },
+    };
+  }
+  return state;
+}
+
+/**
+ * Publish the ends `SessionEnd` could not (MACLEOD-574, audit finding 6).
+ *
+ * `SessionEnd` has 1.5 seconds and may not spend them on the network, so
+ * it writes `pendingEnd` and stops. Until something carries that to the
+ * service, a session that was killed — crash, `/clear`, kill -9 — leaves
+ * its agents standing at `status: running` on the wire and the board
+ * counts them for ever.
+ *
+ * Bounded on purpose: three per turn, so a machine with a backlog of
+ * them drains over a few turns rather than making one hook slow. Fails
+ * open like everything else here — an actor that cannot be published
+ * keeps its flag and is tried again.
+ */
+export async function flushPendingEnds(config, limit = 3, sessionId = undefined) {
+  let scope;
+  try { scope = { tenantId: tenantId(config), serviceUrl: serviceUrl(config) }; } catch { return 0; }
+  let flushed = 0;
+  for (const actor of pendingEndActors(sessionId, scope)) {
+    if (flushed >= limit) break;
+    flushed += 1;
+    /*
+     * Its OWN repository's configuration, never the caller's.
+     *
+     * `sessions/` is one directory per machine, shared by every
+     * repository and every client on it, and `publishState` takes the
+     * tenant and the credential from the config it is handed. Flushing
+     * with the current event's config therefore posted one client's
+     * ticket, stage, summary, repository and branch to another client's
+     * service under another client's key — which is the one thing this
+     * codebase exists not to do. A report goes out under the
+     * credential of the repository it describes, or it does not go out.
+     */
+    const own = loadConfig(actor.cwd);
+    if (!credentialKind(own)) {
+      // Nothing there can report, so the flag is a promise that cannot
+      // be kept. Cleared rather than retried on every turn for ever.
+      try { saveSession({ ...actor, pendingEnd: false }); } catch { /* next turn */ }
+      continue;
+    }
+    /*
+     * And only if that configuration is still the one the actor was
+     * written under. A repository whose `.teamflow.json` now names a
+     * different tenant is not a repository whose old ends may be posted
+     * to the new one: the state is left pending, never rewritten, for
+     * whoever can deliver it honestly.
+     */
+    let ownTenant;
+    try { ownTenant = tenantId(own); } catch { continue; }
+    if (actor.tenantId && ownTenant !== actor.tenantId) continue;
+    if (actor.serviceUrl && serviceUrl(own) !== actor.serviceUrl) continue;
+    try {
+      /*
+       * No git, and the actor's own tenant. `skipGit` because a `Stop`
+       * hook may not run git against a directory this session has
+       * nothing to do with; `keepTenant` because the state already
+       * records whose it is and the check above is what earned the
+       * right to send it at all.
+       */
+      await publishState(
+        actor,
+        own,
+        { repository: actor.reportedRepository, branch: actor.reportedBranch ?? actor.git?.branch },
+        { force: true, keepTenant: true, skipGit: true },
+      );
+      saveSession({ ...actor, pendingEnd: false });
+    } catch {
+      // Left flagged, tried again by the next turn.
+    }
+  }
+  return flushed;
+}
+
 // Everything between reading an event and having published it. Returns
 // the state it saved and whether the binding is new, so a caller can
 // decide what, if anything, to say on stdout.
@@ -141,7 +312,10 @@ export async function handleEvent(input = {}) {
   const event = input.hook_event_name || 'Unknown';
   const sessionId = input.session_id || 'unknown-session';
   const given = input.cwd || process.cwd();
-  const saved = readJson(sessionPath(sessionId));
+  // The session's own actor, which is also how a worktree is recognised:
+  // a repository root that is not this one is somebody else working
+  // under the same `session_id` (MACLEOD-574).
+  const main = readJson(sessionPath(sessionId));
 
   // The repository root, never the directory the tool happened to run
   // the hook from: the project id, the binding, `.teamflow.json` and
@@ -151,19 +325,81 @@ export async function handleEvent(input = {}) {
   // budget may not be spent on git: every earlier event in the session
   // resolved the root and saved it, so shutdown reuses that answer and
   // resolves only when there is no session on disk to reuse.
-  const cwd = event === 'SessionEnd' && saved?.cwd ? saved.cwd : repositoryRoot(given);
+  const cwd = event === 'SessionEnd' && main?.cwd ? main.cwd : repositoryRoot(given);
+
+  /*
+   * An actor is (session, agent) — MACLEOD-574.
+   *
+   * A subagent's events carry the parent's `session_id`, so one state
+   * per session meant the main session and every team in every worktree
+   * rewrote each other's `cwd`, binding, stage and summary: whoever
+   * fired last decided the ticket for everybody, and a team's stage
+   * landed on another team's ticket. The key is the `agent_id` where the
+   * payload has one, else an agent that has already claimed this
+   * directory, else a digest of the directory when it is not the
+   * session's own, else nothing at all — which is the main actor, whose
+   * file name and behaviour are exactly what they were.
+   *
+   * A digest and never the directory: the path is an OS username, a
+   * client's name and a repository's name, and the first cut of this put
+   * all three on the wire through the execution id and `agent.id`.
+   */
+  const agentKey = resolveActorKey(input, cwd, main, sessionId);
+  const saved = agentKey ? readJson(sessionPath(sessionId, agentKey)) : main;
+  /*
+   * An agent that has just named itself in a directory that was working
+   * unnamed (MACLEOD-574, audit blocker A). Two agents that start before
+   * either shows a worktree cannot be told apart by directory, so each
+   * gets an unnamed actor; the first event carrying an `agent_id` is what
+   * finally says which is which, and the work moves across here.
+   */
+  const absorbed = agentKey && input.agent_id && cwd !== main?.cwd
+    ? absorbRootActor(sessionId, agentKey, cwd)
+    : undefined;
   // The resolved root travels on the event, so anything reading the
   // event rather than this function's `cwd` sees the same directory.
   const resolved = { ...input, cwd };
 
+  // Names and booleans only, off unless TEAMFLOW_HOOK_TRACE=1, never
+  // sent anywhere. It exists to settle one undocumented question about
+  // what Claude Code puts on a subagent's events (MACLEOD-573).
+  trace(input, { sameRoot: main?.cwd ? cwd === main.cwd : undefined });
+
   const config = loadConfig(cwd);
-  const previous = saved ?? newSession(sessionId, cwd);
+  /*
+   * The absorbed actor's work, under the named actor's identity. The
+   * ticket, the stage, the loop and the rework are what that directory
+   * did; the agent block, and the publish bookkeeping, are this actor's.
+   */
+  const previous = absorbed
+    ? {
+      ...absorbed,
+      ...(saved ?? {}),
+      agentKey,
+      binding: absorbed.binding ?? saved?.binding,
+      stage: absorbed.stage,
+      status: absorbed.status,
+      summary: absorbed.summary,
+      evidence: absorbed.evidence,
+      loopCount: absorbed.loopCount,
+      rework: absorbed.rework,
+      reworkFrom: absorbed.reworkFrom,
+      // A new execution id, so the first report under it must go out
+      // rather than be deduplicated against the old one's hash.
+      lastPublishHash: undefined,
+      lastPublishedAt: undefined,
+      absorbedInto: undefined,
+      pendingEnd: false,
+      ended: false,
+    }
+    : saved ?? newSession(sessionId, cwd, agentKey);
   // What is reporting (MACLEOD-532). `reporter_tool` is set by hook-cli.mjs
   // from `--for`; Claude Code's own entry passes nothing, because its hook is
   // the one this plugin ships and there is no ambiguity about what ran it.
   let state = {
     ...previous,
     sessionId,
+    ...(agentKey ? { agentKey } : {}),
     cwd,
     ended: false,
     tenantId: tenantId(config),
@@ -173,9 +409,30 @@ export async function handleEvent(input = {}) {
   // SessionEnd has a 1.5s default lifecycle budget. Keep it local and fast:
   // no git inspection, issue detection or S3 calls during shutdown.
   if (event === 'SessionEnd') {
+    // Every actor of the session, not only the one the event names: a
+    // session that stopped stopped its teams too, and an agent left
+    // `running` is an agent the board counts forever. Still local and
+    // still a handful of small writes, so the budget holds.
+    const at = new Date().toISOString();
+    const ending = sessionActors(sessionId).filter((one) => one.agentKey);
+    for (const other of ending) {
+      saveSession({
+        ...other,
+        ended: true,
+        status: other.status === 'running' ? 'idle' : other.status,
+        agent: other.agent ? { ...other.agent, endedAt: other.agent.endedAt || at } : other.agent,
+        // The wire has not been told. It cannot be told here — this
+        // event has 1.5s and no budget for a network call — so the end
+        // is left for the next publish by anything on this machine to
+        // carry (audit finding 6). Without it a killed session's agents
+        // stand at `running` for ever and the board counts them.
+        pendingEnd: Boolean(other.binding?.key),
+        updatedAt: at,
+      });
+    }
     state.ended = true;
     if (state.status === 'running') state.status = 'idle';
-    state.updatedAt = new Date().toISOString();
+    state.updatedAt = at;
     saveSession(state);
     return { state, justBound: false, event, signedIn: true };
   }
@@ -191,8 +448,7 @@ export async function handleEvent(input = {}) {
   const justBound = Boolean(state.binding?.key && state.binding.key !== beforeKey);
   state = enrichBinding(state, resolved);
 
-  if (event === 'SubagentStart') state.subagentCount = (state.subagentCount || 0) + 1;
-  if (event === 'SubagentStop') state.subagentCount = Math.max(0, (state.subagentCount || 0) - 1);
+  state = withAgentIdentity(event, input, state, sessionId, agentKey, Boolean(main?.launched));
 
   const transition = classifyTool(resolved, state, config);
   state = applyTransition(state, transition);
@@ -233,6 +489,12 @@ export async function handleEvent(input = {}) {
     await publishState(state, config, info, { force: event === 'Stop' });
     saveSession(state);
   }
+
+  // Once a turn, on the event that already forces a publish. Anything on
+  // this machine flushes anything else's unreported ends, so a session
+  // that was killed has its agents taken off the board by the next
+  // session that does any work at all.
+  if (event === 'Stop' || absorbed) await flushPendingEnds(config, 3, sessionId);
 
   // After the publish, never before: the board's last word on the item
   // is the state above, and forgetting the key first would have

@@ -31,6 +31,7 @@ import {
   writeLocalBinding,
   pluginVersion,
   staleBuild,
+  tracePath,
 } from './core.mjs';
 
 // Two subcommands live in their own modules because they are the two a
@@ -355,6 +356,18 @@ async function doctor() {
     ],
   };
 
+  /*
+   * The names-only hook trace (MACLEOD-573), when somebody has turned it
+   * on. Named here because a file collecting on a developer's machine
+   * that nothing mentions is a file nobody remembers to delete -- and
+   * because the answer it is collecting is one a reader of this report
+   * may be the person waiting for.
+   */
+  if (fs.existsSync(tracePath())) {
+    report.hookTrace = `${tracePath()} (TEAMFLOW_HOOK_TRACE=1; event and field NAMES only, `
+      + 'never a value, never sent anywhere. Delete it when you are done with it.)';
+  }
+
   if (transport === 'service') {
     // Which project this repository's work appears under (MACLEOD-565).
     // A repository in no project still reports and nothing is lost —
@@ -449,13 +462,36 @@ function orgFlag(list) {
 // a browser anywhere. The third is the only one that works when the
 // browser is on another machine, because the loopback redirect the
 // first two come back to is 127.0.0.1 -- this machine and no other.
+/**
+ * What was here before this sign-in, in words, or nothing (MACLEOD-572,
+ * plugin audit row 9).
+ *
+ * Signing in again is a normal thing to do and is not refused: the
+ * service only objects when a *different* organisation is named. But
+ * the session on disk is replaced, and a machine that was reporting as
+ * somebody else — a shared box, a demo account, a colleague's laptop —
+ * stops doing so without a word. One line, only when there was
+ * something to replace, and only when it is not the same thing again.
+ */
+function replacedSession(before, after) {
+  if (!before) return '';
+  const was = [before.email, before.account].filter(Boolean).join(', org ');
+  const now = [after.email, after.account].filter(Boolean).join(', org ');
+  if (!was) return 'The session that was on this machine has been replaced.\n';
+  if (was === now) return `This replaced the session already here (${was}).\n`;
+  return `This replaced the session that was here: ${was}.\n`;
+}
+
 async function login() {
+  // Read before anything is written: auth.login overwrites the file.
+  const before = auth.readSession();
   const noBrowser = args.includes('--no-browser') || Boolean(config.noBrowser);
   const wantsDevice = args.includes('--device');
   const canOpen = auth.browserPossible();
   if (wantsDevice || ((noBrowser || !canOpen) && await serviceOffersDevice())) {
     return deviceLogin(wantsDevice ? undefined
-      : `No browser can be opened here${canOpen ? '' : ' (no display)'}, so TeamFlow is asking for a code instead.`);
+      : `No browser can be opened here${canOpen ? '' : ' (no display)'}, so TeamFlow is asking for a code instead.`,
+    before);
   }
   const result = await auth.login(config, {
     account: orgFlag(args),
@@ -487,6 +523,7 @@ async function login() {
   const probe = await fetchAccount(config);
   const org = result.accountName || result.account || (probe.ok ? probe.account?.account : undefined);
   print(`TeamFlow signed in${result.email ? ` as ${result.email}` : ''}${org ? `, org ${org}` : ''}.\n`
+    + replacedSession(before, { email: result.email, account: org })
     + `${await signedInLines()}\n`
     + `Reporting now uses a one-hour access token refreshed in the background; `
     + `the refresh token is at ${auth.sessionPath()} and /teamflow:logout removes it.`);
@@ -517,7 +554,7 @@ async function serviceOffersDevice() {
   return Boolean((await auth.discoverAuth(config)).device);
 }
 
-async function deviceLogin(because) {
+async function deviceLogin(because, before) {
   if (because) print(because);
   if (orgFlag(args)) {
     // The organisation is chosen in the browser, by the person
@@ -541,6 +578,7 @@ async function deviceLogin(because) {
   const org = result.account || (probe.ok ? probe.account?.account : undefined);
   print(`TeamFlow signed in${result.email ? ` as ${result.email}` : ''}${org ? `, org ${org}` : ''}, `
     + `as device "${result.label}".\n`
+    + replacedSession(before, { email: result.email, account: org })
     + `${await signedInLines()}\n`
     + `Reporting uses a revocable device credential stored at `
     + `${auth.sessionPath()}; /teamflow:logout revokes it here and at the service, and the `

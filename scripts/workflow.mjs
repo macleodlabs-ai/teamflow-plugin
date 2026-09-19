@@ -80,7 +80,7 @@ export const USAGE = `teamflow workflow — the pool of tickets a run works thro
   teamflow workflow ready [--to <name>]
       What the current phase has open. This is what a run starts next.
 
-  teamflow workflow ticket <KEY> [--state <s>] [--cycle <c>] [--to <name>]
+  teamflow workflow ticket <KEY> [--state <s>] [--cycle <c>] [--reason <why>] [--to <name>]
       Move one ticket through the cycle. States: waiting, running, done,
       blocked, skipped, rework. Cycle: build, test, audit, status,
       deploy, verified, rework.`;
@@ -266,6 +266,90 @@ export function move(workflow, key, { state, cycle } = {}) {
   // is what finishes a phase and lets the next one start.
   relevel(workflow);
   return ticket;
+}
+
+// --- a gate's verdict, on the ticket ---------------------------------
+//
+// The hooks report a rework when a command fails: a test run that exits
+// non-zero, an audit script that does. A gate held by a REVIEWER has no
+// command to fail. An auditor reads a diff and answers "rejected", the
+// orchestrator sends the ticket back, and until this existed the only
+// place that was written down was the workflow's own list -- so the
+// board showed a ticket sitting quietly at Local Test while the most
+// important thing that had happened to it all day, that it had been
+// turned away, was drawn nowhere (MACLEOD-579).
+//
+// So sending a ticket back says so on the ticket, as the same runtime
+// sidecar a background reporter writes: a failed execution at the gate
+// that refused it. The dashboard already draws a failed execution at a
+// later stage as the loop back from that gate, with its reason, and
+// already clears it when the same gate is reached again -- which is the
+// second half of this: when the reworked ticket is put back at the gate
+// that refused it the same sidecar is written as running, and when it
+// leaves that gate for a later one, as passed.
+//
+// Derived state only. The reason is the orchestrator's own sentence
+// about the verdict -- which gate, how many findings of what weight --
+// never the findings' text, which quotes code.
+
+const GATES = {
+  test: { slot: 'ci', kind: 'test', stage: 'LOCAL_TEST', label: 'Test gate' },
+  audit: { slot: 'audit-local', kind: 'audit', stage: 'LOCAL_AUDIT', label: 'Audit gate' },
+  deploy: { slot: 'deploy', kind: 'deploy', stage: 'DEPLOY_DEV', label: 'Deploy gate' },
+};
+
+/** Cycles in the order a ticket passes through them. */
+const CYCLE_ORDER = ['build', 'test', 'audit', 'status', 'deploy', 'verified'];
+
+/**
+ * The sidecar a verdict writes, or undefined when the move is not one.
+ *
+ * `before` is the ticket as it was; `ticket` as it is now. A move TO
+ * rework at a gate is a refusal. A move to a cycle past the gate that
+ * last refused it (or to done) is that gate passing, and only then: a
+ * ticket that was never sent back has nothing to clear, and writing a
+ * pass for every ticket at every step would be a sidecar per keystroke.
+ */
+export function gateReport(workflow, before, ticket, reason, at = now()) {
+  const verdict = (gate, status, summary) => ({
+    slot: gate.slot,
+    payload: {
+      jiraKey: ticket.key,
+      slot: gate.slot,
+      // One id per gate per workflow, so a pass replaces the refusal it
+      // answers instead of sitting beside it.
+      id: `${workflow.id}-${gate.slot}`.slice(0, 120),
+      kind: gate.kind,
+      label: gate.label,
+      stage: gate.stage,
+      status,
+      summary: String(summary).slice(0, 180),
+      updatedAt: at,
+    },
+  });
+
+  if (ticket.state === 'rework' && GATES[ticket.cycle]) {
+    const gate = GATES[ticket.cycle];
+    ticket.refusedAt = ticket.cycle;
+    return verdict(gate, 'failed', reason || `${gate.label} sent this back`);
+  }
+  const refused = before.refusedAt;
+  if (!refused || !GATES[refused] || ticket.state === 'rework') return undefined;
+  // Back AT the gate that refused it: the rework is done and the ticket
+  // is standing where it was turned away. The arrow said "sent back";
+  // it is not sent back any more, so the loop clears here and not only
+  // once the gate has passed. If the gate refuses it again the failed
+  // run replaces this one and the loop is drawn again. `refusedAt`
+  // stays, because the gate has not passed yet and its pass is still to
+  // be written.
+  if (ticket.state === 'running' && ticket.cycle === refused && before.state === 'rework') {
+    return verdict(GATES[refused], 'running', `Back at the ${GATES[refused].label.toLowerCase()} after rework`);
+  }
+  const past = ticket.state === 'done'
+    || CYCLE_ORDER.indexOf(ticket.cycle) > CYCLE_ORDER.indexOf(refused);
+  if (!past) return undefined;
+  delete ticket.refusedAt;
+  return verdict(GATES[refused], 'success', `${GATES[refused].label} passed on the way back`);
 }
 
 // --- printing --------------------------------------------------------
@@ -478,11 +562,21 @@ export async function main(args, {
 
   if (sub === 'ticket') {
     const key = rest.filter((a) => !a.startsWith('--'))[0];
+    const before = { ...((target.tickets || []).find((t) => t.key === key) || {}) };
     const ticket = move(target, key, {
       state: flag(rest, 'state'), cycle: flag(rest, 'cycle'),
     });
+    const said = gateReport(target, before, ticket, flag(rest, 'reason'));
     save(state, config);
     await publish(target, config);
+    // After the workflow, so a board that draws the loop already knows
+    // the ticket is in rework. Never fatal: the plan is saved either way.
+    if (said) {
+      const sent = await sendReport('runtime', said.slot, said.payload, config).catch(() => ({ ok: false }));
+      print(sent.ok
+        ? `${ticket.key}: the ${said.payload.label.toLowerCase()} is on the board as ${said.payload.status}.`
+        : `${ticket.key}: the ${said.payload.label.toLowerCase()} could not be sent to the board${sent.queued ? '; it is queued' : ''}.`);
+    }
     const open = ready(target);
     print(`${ticket.key} is ${ticket.state}${ticket.cycle ? ` at ${ticket.cycle}` : ''}.`);
     print(open.phase

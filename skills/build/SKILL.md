@@ -52,6 +52,18 @@ plan` with no keys does the listing itself, with the same ordering rule as
 `teamflow next`. For Linear and Jira the CLI cannot reach your MCP tools, so
 you list them and pass them in.
 
+**Every ticket in the pool is the user's from this moment, and the tracker
+has to say so.** Assign each one to the person running the workflow, with the
+tracker's MCP, as soon as it is in the pool — the ones in later phases too,
+and any you add or create while the run is going. A ticket you created
+through the tracker's API has no assignee at all unless you give it one. The
+board counts work as somebody's from the tracker's assignee and from the
+plugin's reports, and a queued ticket has no report yet: unassigned, a run of
+fifteen tickets reads on Home as the nine that happen to have been touched,
+and the rest as work nobody holds. `teamflow next` already assigns the one
+ticket it picks; a workflow picks many, so this is the same rule applied to
+all of them.
+
 **Work in the run that has no ticket goes in the pool too.** Mint it a key
 first — `teamflow adhoc start "<a short sentence saying what the work is>"` —
 and add it like any other:
@@ -143,6 +155,9 @@ reaches the board under no key or a stale one. Mark the ticket as you go:
 teamflow workflow ticket MACLEOD-538 --state running --cycle build
 ```
 
+Move the tracker's own ticket to its started state at the same moment, so
+the tracker and the board agree that it is under way and not merely queued.
+
 **Test.** The suite for what changed.
 
 **Audit.** A separate reviewer, with the ticket and the diff. Not the team
@@ -174,14 +189,33 @@ batches its updates to the end is a board that was wrong for the whole run.
 
 ### When a gate fails
 
-Send the ticket back with the gate that failed:
+Send the ticket back with the gate that failed, and say why:
 
 ```bash
-teamflow workflow ticket MACLEOD-538 --state rework --cycle test
+teamflow workflow ticket MACLEOD-538 --state rework --cycle audit \
+  --reason "Audit rejected: 2 blocking findings, 2 should fix"
 ```
 
-`ready` offers it again. The hooks already report the rework stage and the
-board draws the loop from the gate that failed, so you do not report it.
+`ready` offers it again, and **this command is what puts the rejection on the
+board**. A test command that exits non-zero is reported by the hooks on their
+own. A reviewer who reads a diff and says no has failed no command, so
+nothing else reports it: without this the board shows a rejected ticket
+sitting quietly where its team left it, and the most important thing that
+happened to it is drawn nowhere. The command writes the verdict onto the
+ticket as a failed run at that gate, which the board draws as the loop back
+from the gate with your reason on the arrow.
+
+The reason is a sentence about the verdict — which gate, how many findings of
+what weight. Never the findings themselves: they quote code, and code does
+not leave the machine.
+
+The loop clears when the rework reaches the gate that refused it. Put the
+ticket back at that gate when its team says the rework is done
+(`--state running --cycle audit`): the same run is rewritten as running, a
+card standing at the gate is no longer a card sent back, and the arrow goes.
+If the gate refuses it again, send it back again and the loop is drawn
+again. Moving it on past the gate (`--cycle status`, `--state done`) writes
+the gate as passed. Nothing is cleared by hand.
 
 ### When a team finds a new dependency
 
