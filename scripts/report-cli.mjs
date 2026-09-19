@@ -202,14 +202,19 @@ export function buildPayload(options, config, info, now = new Date()) {
     status,
     summary,
     updatedAt,
+    // The one event shape (MACLEOD-548), the same one the hooks write:
+    // `at` and `source`, not `updatedAt`. A report typed at a terminal and
+    // a report a hook derived are the same event to whoever reads the
+    // timeline, so they are the same shape on the wire.
     executions: [{
       id: String(options.id || `cli-${act.id}`).slice(0, 80),
+      at: updatedAt,
+      source: 'plugin',
       kind,
       label: String(options.label || 'teamflow report').slice(0, 80),
       stage,
       status,
       summary,
-      updatedAt,
       ...(evidence.length ? { evidence } : {}),
     }],
   };

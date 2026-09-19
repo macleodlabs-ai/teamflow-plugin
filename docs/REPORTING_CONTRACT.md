@@ -111,13 +111,41 @@ The dashboard tenant selector is **navigation, not authorization**. For external
 - `git`: `branch`, `head.sha` and `head.subject`, `commitsSinceMain`, `ahead`, `behind`, `pushed`, `dirty` — where the branch stands, as counts and flags. Derived state: a count of commits is not the commits, and the subject line is capped at one line's length so a hunk cannot ride in as prose.
 - `pr`: `number`, `url`, `state`, `mergeable`, `checks.{passing,failing,pending}`, `review` — what the forge already publishes about the pull request. Derived state: how many checks are in each state, never which ones and never their output.
 
+### One event
+
+A ticket's events used to be stored in three shapes — the issue document's `executions[]`, the tracker sidecar's `history[]` and the pull request sidecar's `history[]` — and the dashboard folded all three into one timeline in the browser, on every read, for every ticket. They are one shape now, folded once by whoever writes it:
+
+```jsonc
+{
+  "id": "gh-7",                    // the writer's own id for it; a delivery id, or an execution id
+  "at": "2026-09-19T05:12:00Z",    // when it happened
+  "source": "ci",                  // who says so: a slot, or "plugin"
+  "kind": "test",                  // the execution vocabulary
+  "label": "Unit tests",
+  "stage": "LOCAL_TEST",           // optional: not every event moves a ticket
+  "status": "failed",              // optional: not every event is a run
+  "summary": "3 of 214 failed",
+  "evidence": [ /* the capped list above */ ]
+}
+```
+
+`source` is a slot — `ci`, `audit-local`, `deploy`, `dev-test`, `audit-dev`, `security`, `tracker`, `pr` — or `plugin`, for the hooks, which write the issue document and have no slot of their own. `kind` is the execution vocabulary, which gained `tracker` and `forge` with this shape: a status change in Linear and a delivery from GitHub are neither a run nor a person, and calling either of them `ci` would say a build happened when none did.
+
+`stage` and `status` are both optional because not every event is a run. A tracker renaming a status moves no ticket and has no verdict, and a row claiming `success` for it would light a timeline green for an issue nobody has touched.
+
+Identifiers travel in `evidence`, where identifiers already live: a webhook's delivery id is `{"label": "Delivery", "value": "<id>"}` and not a field of its own. Still derived state, on the same rule as everything else here — no title, no branch, no body, no comment, no log.
+
+The issue document's `executions[]` is a list of this too, written by the plugin's hooks and by `teamflow report` with `source: "plugin"`. It is the ticket's own list of what ran, so every row in it names a stage and a verdict even though the shape allows either to be absent.
+
+Documents written before this shape are still read, and so are reports still sent in it. `executions[]` accepts both: a row with `at` is an event, a row without it is the older execution, with `updatedAt` for the clock and no source. A plugin in the field is on somebody's laptop and an upgrade is not something the service gets to require, so the older shape is accepted for as long as one is sending it. A sidecar or an issue document on file keeps rendering until its next report rewrites it, which for an active tenant is minutes; `src/lib/ticketDetail.ts` and `src/lib/dataSource.ts` hold the blocks that read the older spellings, and they go when nothing is left in them.
+
 ### The `pr` sidecar
 
 `runtime/<KEY>/pr.json` is the same `pr` block as above, written by the connector webhook instead of by a reporter, and it is an **execution**: `id`, `kind`, `label`, `stage`, `status` and `summary` beside the block, so the dashboard merges it with `ci.json` and `deploy.json` rather than down a path of its own. It also carries `occurredAt` (the forge's clock for the delivery it last applied), `updatedAt`, `deliveryId`, `provider`, `repository`, `headSha`, `checkRuns` and a `history` of the last twenty deliveries.
 
 `checkRuns` maps a runner to its verdict — `passing`, `failing` or `pending` — keyed by the numeric id GitHub gives the workflow or the app that owns the check suite, never by a name and never with a log, an annotation or a step. It exists so the counts are a tally of runners rather than of deliveries: a flaky job that reran four times is one check, and a green rerun cannot clear a different job's genuine failure. It is dropped whole when the head commit changes, because a run that passed against a commit nobody is on says nothing about the code on screen.
 
-`history` rows are `event`, `action`, `occurredAt`, `state` and `deliveryId`. No title, no branch, no body, no review comment.
+`history` rows are events in the one shape above, written with `source: "pr"` and `kind: "forge"`: the forge's `action` is the row's sentence and the delivery id is its evidence. No title, no branch, no body, no review comment.
 
 ### The `detail` block on the `tracker` sidecar
 
@@ -189,6 +217,24 @@ saying why one ticket waits on another, capped exactly as `summary` is, and
 it never quotes code, a diff, a log line or a prompt. `adapters/teamflow/schema.py`'s
 `WORKFLOW` tables are the enforcement and drop anything else.
 
+### The `workflow` block on a report
+
+`workflow: { id, phase }` says which run the ticket was in when the report was
+made. Two fields and no more.
+
+It exists because the event was always arriving and the run was not. Every
+hook already writes an execution on the issue document, and `executions[]` is
+where a ticket's events have always gone; what nothing said was which pool the
+ticket belonged to and which phase it was at, so a dashboard could not show a
+run's activity from reports it was already receiving. Adding a second event log
+on the workflow document would have been a second answer to a question
+`executions` answers, so there is not one.
+
+The plugin fills it from the workflow state on the machine, keyed by the
+ticket, so a report is attributed whether it came from the build skill, a
+teammate, or somebody working the ticket by hand. A ticket in no run carries no
+block. `adapters/teamflow/schema.py`'s `WORKFLOW_REF` table is the enforcement.
+
 Never persist prompts/transcripts, source contents/diffs, raw shell commands/tool output, secrets, issue descriptions/comments/attachments, or raw CI/test logs.
 
 ## What TeamFlow writes back to a tracker
@@ -229,10 +275,16 @@ never for a ticket the tracker has already marked done, cancelled or
 deleted — the tracker wins on closure, and two-way only ever moves forward
 from what the skill proved. It never reopens and never closes.
 
-**What is kept about it.** One `wrote_back` row on `runtime/<KEY>/tracker.json`'s
-history: `event`, `stage`, `wrote` (`comment`, `state`, or both) and
-`occurredAt`, plus `lastWriteBackAt` on the sidecar. The words themselves are
-not kept — they are in the tracker, where they were posted.
+**What is kept about it.** One row on the tracker sidecar's history, in the
+one event shape, beside the tracker's own: `source: "tracker"`,
+`kind: "tracker"`, the stage that earned it, `status: "success"`, and a
+summary naming which parts went out (`Wrote comment, state`). Its `id` is
+`wrote_back-<STAGE>`, which is what proves the pair has been written once.
+Plus `lastWriteBackAt` on the sidecar. The words themselves are not kept —
+they are in the tracker, where they were posted. A sidecar on file from
+before this carries the older `wrote_back` row, and that still counts as
+proof: reading only the new one would comment a second time on every ticket
+TeamFlow has ever verified.
 
 ## Caching
 

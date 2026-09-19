@@ -326,6 +326,66 @@ export function writeLocalBinding(cwd, value) {
   return file;
 }
 
+// --- the workflows this machine knows about (MACLEOD-540) -----------
+//
+// The file lives here rather than in workflow.mjs because a hook has to
+// read it -- every report says which run it belongs to -- and core.mjs
+// is what a hook already imports. workflow.mjs owns deciding what goes
+// in it; this owns where it is and how it is keyed.
+//
+// Keyed by tenant: a member can hold seats in several organisations and
+// switches between them per session, so one org's runs must not appear
+// in another's, and must never be published to it.
+
+export function workflowsPath() {
+  return path.join(dataDir(), 'workflows.json');
+}
+
+export function workflowScope(config = {}) {
+  return tenantId(config) || 'unknown';
+}
+
+export function readWorkflows(config = {}) {
+  const all = readJson(workflowsPath(), {}) || {};
+  const mine = all[workflowScope(config)] || {};
+  return { current: mine.current || null, workflows: mine.workflows || {} };
+}
+
+export function writeWorkflows(state, config = {}) {
+  const all = readJson(workflowsPath(), {}) || {};
+  all[workflowScope(config)] = { current: state.current, workflows: state.workflows };
+  fs.mkdirSync(path.dirname(workflowsPath()), { recursive: true });
+  writeJson(workflowsPath(), all);
+}
+
+/**
+ * Which run a ticket is in, for the report about to be sent.
+ *
+ * Two fields and no more. The event itself is already an execution on
+ * the issue document, which is where every event has always gone; what
+ * was missing was the run it happened inside, so a dashboard could show
+ * a workflow's activity from the reports it already receives rather
+ * than from a second log nobody else writes to.
+ *
+ * An unfinished run wins over a finished one when two hold the ticket,
+ * for the same reason the dashboard prefers it: showing the run that is
+ * actually working on it beats showing whichever came first.
+ */
+export function workflowRef(key, config = {}) {
+  if (!key) return undefined;
+  const { workflows } = readWorkflows(config);
+  const holding = Object.values(workflows)
+    .filter((w) => (w.tickets || []).some((t) => t.key === key));
+  if (!holding.length) return undefined;
+  const live = (w) => (w.status === 'done' || w.status === 'cancelled' ? 1 : 0);
+  const chosen = [...holding].sort((a, b) => live(a) - live(b)
+    || String(b.updatedAt || '').localeCompare(String(a.updatedAt || '')))[0];
+  const ticket = chosen.tickets.find((t) => t.key === key);
+  const ref = { id: chosen.id };
+  if (ticket && ticket.phase !== undefined) ref.phase = ticket.phase;
+  return ref;
+}
+
 export function sessionPath(sessionId) {
   return path.join(dataDir(), 'sessions', `${sessionId}.json`);
 }
@@ -1201,6 +1261,71 @@ export function pluginVersion() {
   return cachedVersion || undefined;
 }
 
+// --- is this the build that is installed? (MACLEOD-538) -------------
+//
+// Claude Code loads plugin code when a session starts. A session that
+// began before an upgrade keeps running the old build all day, and the
+// board keeps showing yesterday's behaviour with nothing saying why.
+// That happened here on 2026-09-18: hooks reported every piece of work
+// under the ticket the session opened with, while `teamflow status` in
+// the same repository named the right one. Two fixes that would have
+// corrected it were installed and not running.
+//
+// An install is a directory named for its version, so the other builds
+// on this machine are this one's siblings. Nothing is fetched and no
+// registry is asked; if the layout is not that -- a checkout, a copy
+// somewhere else -- the answer is "cannot tell", which is honest.
+
+const SEMVER = /^(\d+)\.(\d+)\.(\d+)(?:-[\w.]+)?$/;
+
+export function compareVersions(a, b) {
+  const left = SEMVER.exec(String(a));
+  const right = SEMVER.exec(String(b));
+  if (!left || !right) return 0;
+  for (let i = 1; i <= 3; i += 1) {
+    const diff = Number(left[i]) - Number(right[i]);
+    if (diff) return diff < 0 ? -1 : 1;
+  }
+  // A prerelease sorts before the release of the same numbers, so an
+  // installed 0.4.0 beats a running 0.4.0-rc1 and says so.
+  const pre = (v) => (String(v).includes('-') ? 0 : 1);
+  return pre(a) - pre(b);
+}
+
+export function newestInstalled(from = path.dirname(new URL(import.meta.url).pathname)) {
+  try {
+    const here = path.dirname(from);            // .../<version>/
+    const mine = path.basename(here);
+    if (!SEMVER.test(mine)) return undefined;   // a checkout, not an install
+    const versions = fs.readdirSync(path.dirname(here))
+      .filter((name) => SEMVER.test(name));
+    if (!versions.length) return undefined;
+    return versions.sort(compareVersions)[versions.length - 1];
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * `{ running, newest }` when an older build is the one in memory.
+ *
+ * `undefined` means either that this is the newest build or that the
+ * question cannot be answered, and those are deliberately the same
+ * answer to a caller: a warning nobody can act on is noise, and this
+ * one is printed into a hook's context where noise is expensive.
+ */
+export function staleBuild(running = pluginVersion(), newest = newestInstalled()) {
+  if (!running || !newest) return undefined;
+  return compareVersions(running, newest) < 0 ? { running, newest } : undefined;
+}
+
+/** The one sentence, or nothing. */
+export function staleBuildNotice(stale = staleBuild()) {
+  if (!stale) return undefined;
+  return `TeamFlow ${stale.running} is running; ${stale.newest} is installed. `
+    + 'Run /reload-plugins so this session reports what it should.';
+}
+
 // The one id that is not a tool. A repository whose editor has no hook
 // system reports on commit, merge and push instead, and "git" on
 // somebody's dashboard would read as a tracker rather than as the
@@ -1257,17 +1382,33 @@ export function issuePayload(state, config, info) {
     // MACLEOD-532. Absent on a session that never named a tool, which is
     // what the dashboard reads as "connected, version unknown".
     reporter: state.reporter,
+    // Filled here rather than by whoever is driving, so a report is
+    // attributed whether it came from the build skill, a teammate or
+    // somebody working the ticket by hand.
+    workflow: workflowRef(key, config),
     evidence: (state.evidence || []).slice(0, 8),
+    /*
+     * The one event shape (MACLEOD-548): `at` and `source`, not
+     * `updatedAt`. The tracker sidecar and the pull request sidecar
+     * already write it, and this was the last writer that did not, which
+     * is why `DetailEvent` in the dashboard still had a branch per shape.
+     *
+     * `source: 'plugin'` because a hook has no runtime slot of its own —
+     * it writes the issue document. The service takes either shape here
+     * while tenants still hold documents from before the change, so an
+     * older plugin keeps reporting and its board keeps drawing.
+     */
     executions: [
       {
         id: `claude-${state.sessionId}`,
+        at: state.updatedAt || new Date().toISOString(),
+        source: 'plugin',
         kind: 'claude',
         label: state.subagentCount ? `Claude Code + ${state.subagentCount} subagent${state.subagentCount === 1 ? '' : 's'}` : 'Claude Code',
         stage: state.stage || 'BACKLOG',
         status: state.status || 'running',
         summary: String(state.summary || 'Work detected').slice(0, 180),
         evidence: (state.evidence || []).slice(0, 4),
-        updatedAt: state.updatedAt || new Date().toISOString(),
       },
       /*
        * The gate that sent this ticket back, for as long as it has not passed
@@ -1278,13 +1419,14 @@ export function issuePayload(state, config, info) {
        */
       ...(state.rework ? [{
         id: `gate-${state.rework.stage}`,
+        at: state.rework.updatedAt,
+        source: 'plugin',
         kind: GATE_KINDS[state.rework.stage] || 'ci',
         label: state.rework.label,
         stage: state.rework.stage,
         status: 'failed',
         summary: String(state.rework.summary || `${state.rework.label} failed`).slice(0, 180),
         evidence: (state.rework.evidence || []).slice(0, 4),
-        updatedAt: state.rework.updatedAt,
       }] : []),
     ],
   };
@@ -1306,20 +1448,39 @@ export function sanitizePayload(value) {
     // allowlist is that a reporter talked into attaching a hostname or a path
     // cannot reach the service by hanging it off a field that is allowed.
     'reporter','tool','version',
+    // MACLEOD-546: which run this report belongs to. Two fields, and
+    // `id` is already allowed above. The event itself is still an
+    // execution on the issue document -- this only says where it
+    // happened, so a run's activity can be read from the reports the
+    // service already receives instead of from a second log.
+    'workflow','phase',
   ]);
-  function walk(v) {
-    if (Array.isArray(v)) return v.slice(0, 50).map(walk);
+  /*
+   * MACLEOD-548: the one event shape. `at` is when the event happened and
+   * `source` is who says so — the two fields that replace `updatedAt` on an
+   * `executions[]` row.
+   *
+   * They are allowed inside `executions` and nowhere else, rather than being
+   * added to the flat set above. `source` is also the name of the thing that
+   * must never travel: an event's provenance is worth carrying, a field
+   * called `source` hanging off the payload is exactly what this allowlist
+   * exists to drop, and `plugin/tests/integration/report.test.mjs` asserts
+   * the payload has none.
+   */
+  const eventOnly = new Set(['at', 'source']);
+  function walk(v, inEvent) {
+    if (Array.isArray(v)) return v.slice(0, 50).map((item) => walk(item, inEvent));
     if (!v || typeof v !== 'object') {
       return typeof v === 'string' ? v.slice(0, 300) : v;
     }
     const out = {};
     for (const [key, item] of Object.entries(v)) {
-      if (!allowed.has(key)) continue;
-      out[key] = walk(item);
+      if (!allowed.has(key) && !(inEvent && eventOnly.has(key))) continue;
+      out[key] = walk(item, inEvent || key === 'executions');
     }
     return out;
   }
-  return walk(value);
+  return walk(value, false);
 }
 
 // --- transports ----------------------------------------------------

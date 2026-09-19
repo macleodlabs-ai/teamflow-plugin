@@ -22,9 +22,9 @@
 // The skill reads the sentence and calls this with flags.
 
 import crypto from 'node:crypto';
-import fs from 'node:fs';
-import path from 'node:path';
-import { dataDir, readJson, resolveGithubRepo, sendReport, tenantId, trackerOf, writeJson } from './core.mjs';
+import {
+  readWorkflows, resolveGithubRepo, sendReport, trackerOf, workflowsPath, writeWorkflows,
+} from './core.mjs';
 
 // Mirrors adapters/teamflow/schema.py. The service is the enforcement;
 // these exist so a typo is a message here rather than a 400 there.
@@ -86,29 +86,12 @@ export function newId() {
   return `wf-${crypto.randomBytes(4).toString('hex')}`;
 }
 
-export function statePath() {
-  return path.join(dataDir(), 'workflows.json');
-}
-
-// Keyed by tenant. A member can hold seats in several organisations and
-// switches between them per session; workflows in one must not appear
-// in another's `show`, and must never be published to it.
-function scope(config) {
-  return tenantId(config) || 'unknown';
-}
-
-export function load(config) {
-  const all = readJson(statePath(), {}) || {};
-  const mine = all[scope(config)] || {};
-  return { current: mine.current || null, workflows: mine.workflows || {} };
-}
-
-export function save(state, config) {
-  const all = readJson(statePath(), {}) || {};
-  all[scope(config)] = { current: state.current, workflows: state.workflows };
-  fs.mkdirSync(path.dirname(statePath()), { recursive: true });
-  writeJson(statePath(), all);
-}
+// Where the file is and how it is keyed belongs to core.mjs, because a
+// hook reads it too and core is what a hook already imports. What goes
+// in it belongs here.
+export const statePath = workflowsPath;
+export const load = readWorkflows;
+export const save = writeWorkflows;
 
 // Name or id, and the current one when neither is given. Names are what
 // a person says ("add MACLEOD-540 to Backlog sweep"); ids are what the

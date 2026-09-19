@@ -1,4 +1,6 @@
-// `teamflow admin code ...`: superadmin invite codes.
+// `teamflow admin ...`: the superadmin commands.
+//
+// Two of them. `code` issues invite codes; `launch` ends demo mode.
 //
 // An invite code lets an organisation sign up without paying: the
 // holder opens /signup/?code=TF-XXXX-XXXX, names the org, and the
@@ -14,15 +16,22 @@
 import * as auth from './auth.mjs';
 import { serviceUrl } from './core.mjs';
 
-const USAGE = `teamflow admin code \u2014 invite codes, for superadmins
+const USAGE = `teamflow admin \u2014 operator commands, for superadmins
 
   teamflow admin code create --email owner@acme.com --seats 5 --days 365 [--note "Acme pilot"]
   teamflow admin code list
   teamflow admin code revoke TF-XXXX-XXXX
+  teamflow admin launch [--confirm]
 
 --email is the organisation's admin. The service emails them the code and its
 redeem link, and locks the code to that address: anyone else redeeming it is
-turned away. --note is a reminder for the list, never shown to the recipient.`;
+turned away. --note is a reminder for the list, never shown to the recipient.
+
+launch ends demo mode: every demo account loses its free credits, moves onto
+the team plan and must subscribe to carry on. Nothing else is touched -- the
+organisations, their members, keys, connections and boards all stay. Without
+--confirm it only prints what it would do. Run it once, on the day Stripe goes
+live, and never before.`;
 
 // Exit codes, so a script can tell the two failures apart: 2 means "you
 // are not allowed to do this, or you asked for something impossible",
@@ -225,6 +234,28 @@ async function revoke(config, code) {
   return EXIT_OK;
 }
 
+// `teamflow admin launch`. The only command here that destroys
+// anything, so it is a dry run unless it is told otherwise: typing it
+// to see what it would do must not be the thing that does it.
+export async function launch(config, { confirm = false } = {}) {
+  const apply = Boolean(confirm);
+  const result = await adminCall(config, 'POST', '/v1/admin/demo/launch', { apply });
+  if (!result.ok) return report(result);
+  const body = result.body;
+  const rows = Array.isArray(body.accounts) ? body.accounts : [];
+  if (!rows.length) {
+    out('No account is still in demo mode. Nothing to launch.');
+    return EXIT_OK;
+  }
+  out(apply
+    ? `Launched ${rows.length} account${rows.length === 1 ? '' : 's'} onto ${body.plan}.`
+    : `Would launch ${rows.length} account${rows.length === 1 ? '' : 's'} onto ${body.plan}. Re-run with --confirm.`);
+  for (const row of rows) {
+    out(`  ${cell(row.account)}  ${cell(row.name)}  ${cell(row.owner)}  ${cell(row.forfeited)} credits forfeited`);
+  }
+  return EXIT_OK;
+}
+
 // --- entry point ----------------------------------------------------
 
 const HELP = new Set(['help', '--help', '-h']);
@@ -235,9 +266,20 @@ export async function main(args, config = {}) {
     out(USAGE);
     return EXIT_OK;
   }
-  if (group !== 'code') {
+  if (group !== 'code' && group !== 'launch') {
     fail(`Unknown admin command: ${[group, action].filter(Boolean).join(' ') || '(none)'}\n\n${USAGE}`);
     return EXIT_REFUSED;
+  }
+  if (group === 'launch') {
+    // `--confirm` carries no value, which the flag parser above would
+    // read as a missing one, so it is matched here instead.
+    const words = [action, ...rest].filter(Boolean);
+    const unknown = words.filter((word) => word !== '--confirm');
+    if (unknown.length) {
+      fail(`launch takes no arguments but --confirm\n\n${USAGE}`);
+      return EXIT_REFUSED;
+    }
+    return launch(config, { confirm: words.length > 0 });
   }
   const parsed = parseFlags(rest);
   if (parsed.error) { fail(`${parsed.error}\n\n${USAGE}`); return EXIT_REFUSED; }

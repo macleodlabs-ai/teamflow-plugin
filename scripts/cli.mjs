@@ -27,6 +27,8 @@ import {
   saveSession,
   writeJson,
   writeLocalBinding,
+  pluginVersion,
+  staleBuild,
 } from './core.mjs';
 
 // Two subcommands live in their own modules because they are the two a
@@ -55,13 +57,14 @@ const USAGE = `teamflow \u2014 delivery reporting for TeamFlow
                                    authorise a tracker; prints the URL to open
   teamflow repos [list|add]        register a repository for CI OIDC
   teamflow admin code [create|list|revoke]  invite codes, for superadmins
+  teamflow admin launch [--confirm]         end demo mode; run once, on the day
   teamflow report --issue ... --stage ...   report one stage transition
   teamflow skills install --for <tool>      install these skills into another tool
   teamflow hooks status | install           report automatically from that tool
   teamflow hook --for <tool>                the hook entry itself; tools call this
 
 \`teamflow report --help\`, \`teamflow skills --help\`, \`teamflow hooks --help\`
-and \`teamflow admin code --help\` list their own flags.`;
+and \`teamflow admin --help\` list their own flags.`;
 
 const BIND_USAGE = 'Usage: /teamflow:bind <issue> [--local]. Accepted: DAEMON-142, ENG-42, #123, owner/repo#123, or a Jira/Linear/GitHub issue URL. A bare #123 needs githubRepo configured or a GitHub origin remote.';
 
@@ -142,8 +145,14 @@ async function status() {
   // code, and these are the trackers allowed to report what happens to the
   // issue. Asked for only when there is a credential to ask with.
   const trackers = credentialKind(config) ? await trackerConnections(config) : undefined;
+  const stale = staleBuild();
   print({
     tenantId: tenantId(config),
+    pluginVersion: pluginVersion() || 'unknown',
+    ...(stale ? {
+      pluginBuild: `STALE: ${stale.running} is running, ${stale.newest} is installed. `
+        + 'Run /reload-plugins.',
+    } : {}),
     actor: actor(config, info),
     repository: info.repository,
     branch: info.branch,
@@ -259,8 +268,18 @@ async function doctor() {
   }[tracker];
   const transport = transportOf(config);
 
+  // A stale build is a finding rather than a line of trivia: every other
+  // answer in this report describes the build that is running, and if
+  // that is not the build that is installed then all of them describe
+  // something the next session will not do (MACLEOD-538).
+  const stale = staleBuild();
   const report = {
     claudeProbe: claudeBin ? 'ran' : `skipped: ${claudeSkipped}`,
+    pluginVersion: pluginVersion() || 'unknown',
+    pluginBuild: stale
+      ? `STALE: ${stale.running} is running, ${stale.newest} is installed. `
+        + 'Run /reload-plugins; until then this session reports the old behaviour.'
+      : 'current',
     node: process.version,
     gitRepository: info.repository || 'not detected',
     transport,

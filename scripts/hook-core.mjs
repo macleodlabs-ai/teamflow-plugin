@@ -23,6 +23,7 @@ import {
   saveSession,
   sessionPath,
   tenantId,
+  staleBuildNotice,
 } from './core.mjs';
 
 // Events that must stay synchronous and fast, because the tool is
@@ -51,11 +52,19 @@ export function newSession(sessionId, cwd) {
 const NO_ISSUE = 'TeamFlow: no issue is bound — run /teamflow:next '
   + '(the teamflow-next skill) to take the top-priority open ticket and bind it before editing.';
 
-export function claudeContext(event, state, justBound) {
+export function claudeContext(event, state, justBound, stale = staleBuildNotice()) {
   if (!FAST.includes(event)) return undefined;
+  // Said on SessionStart only. A session loads plugin code once, so
+  // the answer cannot change until it restarts, and repeating it on
+  // every prompt would be a line of noise per turn for something the
+  // reader can only act on once (MACLEOD-538).
+  const notice = event === 'SessionStart' && stale ? [stale] : [];
   if (!state.binding?.key) {
     return JSON.stringify({
-      hookSpecificOutput: { hookEventName: event, additionalContext: NO_ISSUE },
+      hookSpecificOutput: {
+        hookEventName: event,
+        additionalContext: [NO_ISSUE, ...notice].join(' '),
+      },
     });
   }
   const tracker = state.binding.tracker || 'jira';
@@ -65,6 +74,9 @@ export function claudeContext(event, state, justBound) {
     'TeamFlow reporting is automatic. Do not manually narrate tool calls for reporting.',
   ];
   if (justBound) context.push(`Binding source: ${state.binding.source}.`);
+  // Last, because it is about the tooling rather than the work, and
+  // the ticket is what the reader needs first.
+  context.push(...notice);
   return JSON.stringify({
     hookSpecificOutput: { hookEventName: event, additionalContext: context.join(' ') },
   });
