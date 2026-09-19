@@ -6,6 +6,7 @@ import { claudeBinary } from './claude-bin.mjs';
 import { NO_PROJECT, resolveProject } from './project.mjs';
 import {
   actor,
+  clearDiscards,
   credential,
   credentialKind,
   dataDir,
@@ -16,6 +17,8 @@ import {
   latestSessionForCwd,
   loadConfig,
   localBindingPath,
+  outboxLine,
+  outboxSummary,
   parseBindArgument,
   projectBindingPath,
   publishState,
@@ -186,6 +189,11 @@ async function status() {
   // organisation's default rather than an error.
   const project = await resolveProject(info.repository, config);
   const stale = staleBuild();
+  // What has not reached the service, and what a flush threw away and
+  // why. A hook cannot say either — it exits 0 and prints nothing — so
+  // this is where a person finds out, and saying it clears it.
+  const outbox = await outboxSummary(config);
+  if (outbox.discarded.ownerless || outbox.discarded.expired) clearDiscards();
   print({
     tenantId: tenantId(config),
     pluginVersion: pluginVersion() || 'unknown',
@@ -216,6 +224,9 @@ async function status() {
     summary: state?.summary,
     loopCount: state?.loopCount || 0,
     lastPublishResult: state?.lastPublishResult,
+    ...(outbox.queued || outbox.legacy || outbox.discarded.ownerless || outbox.discarded.expired
+      ? { outbox: outboxLine(outbox) }
+      : {}),
     transport: transportOf(config),
     serviceUrl: serviceUrl(config),
     credential: credentialKind(config) || 'none',
@@ -331,6 +342,8 @@ async function doctor() {
   // that is not the build that is installed then all of them describe
   // something the next session will not do (MACLEOD-538).
   const stale = staleBuild();
+  const outbox = await outboxSummary(config);
+  if (outbox.discarded.ownerless || outbox.discarded.expired) clearDiscards();
   const report = {
     claudeProbe: claudeBin ? 'ran' : `skipped: ${claudeSkipped}`,
     pluginVersion: pluginVersion() || 'unknown',
@@ -340,6 +353,9 @@ async function doctor() {
       : 'current',
     node: process.version,
     gitRepository: info.repository || 'not detected',
+    ...(outbox.queued || outbox.legacy || outbox.discarded.ownerless || outbox.discarded.expired
+      ? { outbox: outboxLine(outbox) }
+      : {}),
     transport,
     serviceUrl: serviceUrl(config),
     credential: credentialKind(config) || 'none',

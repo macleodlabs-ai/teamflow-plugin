@@ -102,6 +102,8 @@ On the service transport the account behind the credential is the tenant, so a w
 
 The dashboard tenant selector is **navigation, not authorization**. For external client viewers, enforce viewer isolation at CloudFront/edge/auth level or give each client a distribution/index that exposes only its tenant. Do not rely on hiding the selector for security.
 
+The account behind the credential being the tenant also decides what the plugin has to remember locally. A report that could not be sent is a report *for one organisation*, so each queued item records the organisation it was queued for — the id, or a truncated one-way fingerprint of a credential that names none locally — and is only ever sent by a session that resolves to the same one (MACLEOD-583, `docs/PLUGIN.md`). That lives in `outbox2/`, whose items each carry an `owner` block of `{ kind, serviceUrl, from, account | fingerprint }`. It never holds a credential, a token or a key, it is never sent anywhere, and nothing in it reaches a report.
+
 ## Allowed current-state data
 
 - `tenantId`
@@ -246,6 +248,7 @@ It may carry:
 
 - `id` (`wf-` and hex) and `name` — the workflow is addressable, so a ticket the filter missed can be added to it by name
 - `status`, `createdAt`, `updatedAt`
+- `actor`: `id`, `displayName` — who is running it, in exactly the two fields a report already uses for an actor and no others. A workflow's queued tickets have nobody on them by definition, so without this the board reads a run somebody is sitting in front of as nobody's work. No email, no machine, no account; optional, because a document written before the field existed is still valid. `id` is a slug (`[a-z0-9._-]`, capped at 80) and the service refuses anything else: a free-text id took a home directory path and a whole email address, and the first of those names a client the reader's organisation may not be allowed to know about. `displayName` is a stated identity — a configured actor name or the one the working copy is set up with — never the machine's login, because a run owned by a unix account is a person on the board who does not exist
 - `filter`: `tracker`, `project`, `state`, `label`, `order` — **what the order was turned into**
 - `scope.deploy` — whether deploying is in scope for this run
 - `tickets[]`: `key`, `rank`, `phase`, `state`, `cycle`, `addedBy`, `updatedAt`

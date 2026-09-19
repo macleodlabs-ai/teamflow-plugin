@@ -104,6 +104,12 @@ a field Claude Code adds tomorrow arrives as a number rather than a name —
 which is still the signal you need, and is a better trade than a debug file
 that can print a customer's access token.
 
+The event name and the tool name are values, so they are held to the same
+rule. The event is written only if it is one of the hook events that exist.
+A tool is written only if it is one of Claude Code's own, whose names are
+letters and nothing else; an MCP tool is named by its server, so every
+`mcp__…` is written as `mcp` and which one it was is given up.
+
 It is capped at forty names of forty characters per list, 2 KB per line and
 2 MB per file, it is never sent anywhere, it fails open like every other thing
 a hook does, and `teamflow doctor` names the file while it exists so nobody
@@ -326,6 +332,24 @@ The auth header is not hard-coded. `credential(config)` in `plugin/scripts/core.
 
 The outbox stores no credential. A queued report resolves one when it is finally sent, which is the only way a one-hour token survives an hour offline.
 
+It does store **whose** the report is (MACLEOD-583). The tenant comes from the credential, so a queued report is a report for one organisation, and one data directory sees more than one as soon as somebody switches between sessions. Each item carries an `owner`: the account the credential resolved to at queue time — the same string `teamflow status` prints — or, for a credential that names no account locally, a truncated SHA-256 fingerprint of it, alongside the service URL and the credential kind. A flush sends an item only when the current credential resolves to the same account and the same service. Anything else is left exactly where it is, unsent and unrescheduled, for the session that can send it, and is skipped rather than stopping the reports behind it — a foreign item does not count against the flush's limit, or one organisation's backlog would be a wall in front of another's. The same rule keys the legacy S3 branch on the tenant in the object's own key.
+
+**An item with no owner is never sent, by anybody.** Nothing on the machine can say which organisation queued it, and the file recording which organisations have reported here begins the day this version is installed, so "only one organisation has ever used this directory" is unknowable — and a rule that reads it is a rule the first flush after the upgrade satisfies by writing it. It is discarded instead, counted, and named in `teamflow status` and `teamflow doctor`. What that costs is one duplicate of nothing: a report is the ticket's whole current state, and the next event sends it again.
+
+A queued report is also given up on after seven days, whoever owns it. Nothing else empties the queue of reports nobody may deliver, and a week-old full-state document is wrong by the time it arrives.
+
+**The queue is `outbox2/`, and `outbox/` is somebody else's.** Recording an owner binds only the plugins that read it, and Claude Code runs its own cached copy of the plugin beside whatever a checkout or `npx` runs: an older `flushOutbox` knows nothing of owners and would post this version's items with its own credential and then delete them. It cannot list a directory it does not know. The legacy `outbox/` is never queued into and never sent from — the only thing done to it is the age horizon, which does delete from it — because an older copy still on the machine goes on managing its own queue with its own rules. Two consequences, stated rather than discovered: reports queued **by** a pre-0.3.14 copy stay exposed until every copy on the machine is updated, and a **downgrade** leaves recent reports waiting in a directory the older copy does not read, until the next upgrade — only the new plugin sweeps, so under a permanent downgrade they wait indefinitely rather than ageing out. `teamflow doctor` says so when it can see a legacy queue.
+
+Anything else that outlives a session and belongs to one organisation is filed under `accountScope(config)` for the same reason: the workflows in `workflows.json` and the projects cache. Not under `tenantId`, which is the S3 transport's tenant and is `default` on every service install. `accountScope` names the organisation the machine is **signed in to** — the account id the sign-in recorded, read from the session — and falls back to a credential fingerprint only when no account id is known. That is deliberately the stable answer rather than the true one: a token expiring mid-session must not rename the bucket a run is being written to, or the workflow would read as "no workflow yet" and the next write would start a second one beside it. Delivery asks a different question, `currentOwner`, which resolves the credential and so knows about the lapse; nothing compares the two.
+
+**A workflow from before 0.3.14 is not adopted automatically.** Unlike a report, discarding it would discard work nothing re-creates — and unlike a report, there is no safe way to guess whose it is. The rule that was here first said "the one organisation this machine has reported for", which read its evidence from a file that every successful report writes to, so it always answered in favour of whoever was signed in: one customer's plan in the other's terminal, publishable from there into the wrong tenant, and the mirror write destroying the first customer's run. So the plugin says what it has and the person decides. `teamflow workflow show` names it in one line; `teamflow workflow adopt` lists the runs by id, name, ticket count and the bucket each came from; `teamflow workflow adopt --yes <id>` copies one into this organisation, with `--from <bucket>` to choose when two buckets hold the same id. Local, nothing sent, and the older bucket is left exactly where it is, because an older copy of the plugin may still be reading it. A run already filed under this organisation ends the question — its own bucket wins, silently, and adopt refuses.
+
+The listing does show the *names* of workflows started before 0.3.14 to whoever is signed in on that machine, including ones another organisation may have started there. That is deliberate and it is the minimum needed to make an informed claim: the person reading it is the same human who created both runs, on their own machine, and the alternative — offering an unlabelled id — is asking somebody to guess. Nothing is read into a report, published, or claimed without the command.
+
+The projects cache goes cold on upgrade, because its file name changed; the first command after upgrading fetches the list again.
+
+A session that lapses to an API key does not inherit the session's queued reports: the key is a different owner and cannot be shown to be the same organisation without asking the service, so those reports wait for the session to come back, or expire.
+
 `slot` is present only for `kind: "runtime"`. The service validates the payload against the privacy allowlist, drops any field it does not recognise, lists what it dropped in `dropped_fields`, and writes the document under the tenant its own credential names. One accepted report costs one credit.
 
 Two fields the reporter deliberately does **not** send: `tenantId`, because the account behind the credential owns the tenant, and a payload-level `slot`, because the envelope already carries it where the service can check it against the known slots.
@@ -344,7 +368,7 @@ The actor rollup (`actors/<id>.json`) has no service equivalent yet. The allowli
 
 429 is the one retryable 4xx. The limit is 120 requests a minute for the whole account, shared by a Claude session, its subagents and CI, so it is reachable in ordinary use: nothing is wrong with the report, the caller simply arrived too fast, and the same body posted later is accepted. A queued report records `attempts` and `notBefore`; a flush skips anything not yet due, and a retry that is refused again is rewritten in place rather than re-queued, so a stale full-state document cannot sort to the back of the queue and overwrite a fresher one. `Retry-After` is honoured as seconds or as an HTTP-date, capped at five minutes, because a reporter that sleeps longer than that has stopped reporting.
 
-The outbox lives at `<plugin data>/outbox` and is drained, up to five at a time, after each successful report. Reporting is observability: no failure of it ever blocks Claude Code, a hook or CI.
+The outbox lives at `<plugin data>/outbox2` — `outbox/` is the pre-0.3.14 one, see above — and is drained, up to five deliverable items at a time, after each successful report. Reporting is observability: no failure of it ever blocks Claude Code, a hook or CI.
 
 ### Legacy S3 transport
 

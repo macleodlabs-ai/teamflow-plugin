@@ -450,27 +450,161 @@ export function writeLocalBinding(cwd, value) {
 // is what a hook already imports. workflow.mjs owns deciding what goes
 // in it; this owns where it is and how it is keyed.
 //
-// Keyed by tenant: a member can hold seats in several organisations and
-// switches between them per session, so one org's runs must not appear
-// in another's, and must never be published to it.
+// Keyed by the organisation the credential resolves to: a member can
+// hold seats in several and switches between them per session, so one
+// org's runs must not appear in another's, and must never be published
+// to it. It was keyed by `tenantId`, which reads as the same thing and
+// is not — see `workflowScope` (MACLEOD-583).
 
 export function workflowsPath() {
   return path.join(dataDir(), 'workflows.json');
 }
 
+// The organisation, not the S3 tenant (MACLEOD-583). `tenantId` is
+// `default` on every service install, so keying by it put two
+// organisations' runs in one bucket: `teamflow workflow ticket` under B
+// would find, advance and *publish* a plan created under A, with B's
+// credential and therefore into B's tenant.
 export function workflowScope(config = {}) {
-  return tenantId(config) || 'unknown';
+  return accountScope(config) || 'unknown';
 }
 
+/**
+ * A bucket keyed by something that is not an organisation: `default`,
+ * or whatever `TEAMFLOW_TENANT_ID` was set to, as written by any plugin
+ * before 0.3.14.
+ *
+ * `account-` and `fp-` are reserved prefixes: `accountScope` mints them
+ * and nothing else may. Two consequences, both accepted rather than
+ * fixed, because prefixing the tenant keys too would be a migration of
+ * the one file this whole ticket is about not migrating.
+ *
+ * A tenant literally named `account-x` reads as an organisation bucket,
+ * so its runs are never offered for adoption. That is a false negative
+ * — the person keeps their data and must move it by hand — and never a
+ * false positive, which is the right direction to fail in.
+ *
+ * And the two keyspaces are not disjoint: `accountScope` maps
+ * organisation `x` to `account-x`, so a credential-less S3 install with
+ * `TEAMFLOW_TENANT_ID=account-x` sharing a data directory with a
+ * service install for organisation `x` would share one bucket. It takes
+ * both installs, one directory and an adversarially chosen tenant name.
+ */
+function isLegacyScope(key) {
+  return !/^(account|fp)-/.test(String(key));
+}
+
+/**
+ * Runs an older plugin left under a tenant name, waiting to be claimed.
+ *
+ * They are NOT read as this organisation's, ever. There was a rule here
+ * that said "the one organisation this data directory has reported
+ * for", and it could not work: the evidence was a file that begins the
+ * day this version is installed and that every successful report writes
+ * to, so the first organisation to send one hook event answered the
+ * question in its own favour. On the exposed machine — a consultant,
+ * two organisations, one data directory — that showed one customer's
+ * plan in the other's terminal, let `teamflow workflow ticket` publish
+ * it into the wrong tenant, and overwrote the first customer's run.
+ *
+ * There is no safe automatic answer: the fact needed is history from
+ * before anything recorded it. So it is asked out loud instead —
+ * `teamflow workflow show` says a run is there and `teamflow workflow
+ * adopt` claims it, on the say-so of the one person who knows.
+ *
+ * This organisation having runs of its own ends the question: its own
+ * bucket wins, silently, and nothing is offered.
+ */
+export function unclaimedWorkflows(config = {}) {
+  const all = readJson(workflowsPath(), {}) || {};
+  const scope = workflowScope(config);
+  if (Object.keys(all[scope]?.workflows || {}).length) return [];
+  const found = [];
+  for (const [key, bucket] of Object.entries(all)) {
+    if (key === scope || !isLegacyScope(key)) continue;
+    for (const [id, workflow] of Object.entries(bucket?.workflows || {})) {
+      found.push({
+        from: key,
+        id,
+        name: workflow?.name || id,
+        status: workflow?.status,
+        tickets: (workflow?.tickets || []).length,
+      });
+    }
+  }
+  return found.sort((a, b) => a.id.localeCompare(b.id));
+}
+
+/**
+ * Claim one of them for this organisation, by id.
+ *
+ * Copies, never moves and never deletes: an older plugin on this
+ * machine goes on reading the bucket it wrote, and nothing a newer
+ * version does destroys what an older one left.
+ *
+ * `from` names the bucket when two of them hold the same id — two
+ * `TEAMFLOW_TENANT_ID` values on one machine — because otherwise this
+ * would silently take whichever sorted first and the person could not
+ * ask for the other. Undefined when the id is not on offer, when it is
+ * ambiguous and `from` does not resolve it, or when the file changed
+ * under us between the offer and the write.
+ */
+export function adoptWorkflow(id, config = {}, { from } = {}) {
+  const matches = unclaimedWorkflows(config)
+    .filter((row) => row.id === id && (!from || row.from === from));
+  if (matches.length !== 1) return undefined;
+  const [offered] = matches;
+  const all = readJson(workflowsPath(), {}) || {};
+  const source = all[offered.from]?.workflows?.[id];
+  // The listing was read a moment ago and this is a second read of the
+  // same file. A CLI is the only caller, so a race here is somebody
+  // editing the file by hand — answer "no" rather than throwing.
+  if (!source) return undefined;
+  const scope = workflowScope(config);
+  const mine = all[scope] || { current: null, workflows: {} };
+  mine.workflows = { ...(mine.workflows || {}), [id]: source };
+  // Cannot clobber a live `current`, and the reason is two functions
+  // away: `unclaimedWorkflows` offers nothing once this scope holds any
+  // workflow, so adopt is unreachable unless `current` is already null.
+  // Relax that guard, or add a caller that skips the offer, and this
+  // line starts overwriting whatever run somebody is in the middle of.
+  mine.current = id;
+  all[scope] = mine;
+  fs.mkdirSync(path.dirname(workflowsPath()), { recursive: true });
+  writeJson(workflowsPath(), all);
+  return offered;
+}
+
+/**
+ * Reading never migrates, never falls back and never writes.
+ *
+ * Two plugin versions share this file in ordinary life — Claude Code
+ * runs the cached release while a checkout or `npx` runs another, and
+ * an upgrade can be followed by a downgrade. Re-keying in place would
+ * take the customer's running workflow away from whichever version did
+ * not do the re-keying; reading another key would take another
+ * organisation's run. This organisation's bucket, and nothing else.
+ */
 export function readWorkflows(config = {}) {
   const all = readJson(workflowsPath(), {}) || {};
   const mine = all[workflowScope(config)] || {};
   return { current: mine.current || null, workflows: mine.workflows || {} };
 }
 
+/**
+ * Writing is additive and touches one key: this organisation's.
+ *
+ * It used to mirror into the tenant-keyed bucket as well, so an older
+ * plugin would keep reading the same run. That mirror overwrote
+ * whatever was in that bucket — which, on a machine two organisations
+ * share, is the other organisation's work. An older plugin catching up
+ * is not worth destroying a run nothing re-creates, so it does not, and
+ * `teamflow workflow adopt` is how a run crosses the versions instead.
+ */
 export function writeWorkflows(state, config = {}) {
   const all = readJson(workflowsPath(), {}) || {};
-  all[workflowScope(config)] = { current: state.current, workflows: state.workflows };
+  const scope = workflowScope(config);
+  all[scope] = { current: state.current, workflows: state.workflows };
   fs.mkdirSync(path.dirname(workflowsPath()), { recursive: true });
   writeJson(workflowsPath(), all);
 }
@@ -650,7 +784,12 @@ const TOOL_INPUT_FIELDS = new Set([
  * One `appendFileSync` of one finished line is atomic enough: the write
  * is a single syscall on an O_APPEND handle.
  */
-const TRACE_NAME = /^[A-Za-z_][A-Za-z0-9_]{0,39}$/;
+const TRACE_EVENTS = new Set([
+  'PreToolUse', 'PostToolUse', 'UserPromptSubmit', 'Notification', 'Stop',
+  'SubagentStart', 'SubagentStop', 'PreCompact', 'SessionStart', 'SessionEnd',
+  'PostToolUseFailure', 'TaskCompleted',
+]);
+const TRACE_BUILTIN = /^[A-Z][A-Za-z]{0,29}$/;
 const TRACE_MAX_KEYS = 40;
 const TRACE_MAX_LINE = 2 * 1024;
 const TRACE_MAX_BYTES = 2 * 1024 * 1024;
@@ -685,16 +824,20 @@ export function traceLine(input = {}, { sameRoot = undefined } = {}) {
   const top = traceKeys(input, HOOK_FIELDS);
   const toolInput = traceKeys(input?.tool_input, TOOL_INPUT_FIELDS);
   /*
-   * `event` and `tool` are VALUES rather than key names, and both are
-   * vocabularies: `PreToolUse`, `Bash`, `mcp__linear__get_issue`. They
-   * are shape-checked rather than allowlisted, because the set of MCP
-   * tool names is open by design and which one ran is worth knowing.
+   * `event` and `tool` are VALUES rather than key names, so neither is
+   * written as it arrived. The events are a closed vocabulary and are
+   * listed. A tool is written only when it is one of Claude Code's own,
+   * which Claude Code names and which are letters and nothing else; an
+   * MCP tool is named by its server, a 40-character identifier is also
+   * the shape of an access token, and so every `mcp__…` is written as
+   * `mcp` and which one it was is given up.
    */
+  const event = String(input?.hook_event_name || '');
   const tool = String(input?.tool_name || '');
   return {
     at: new Date().toISOString(),
-    event: TRACE_NAME.test(String(input?.hook_event_name || '')) ? input.hook_event_name : 'Unknown',
-    tool: TRACE_NAME.test(tool) ? tool : undefined,
+    event: TRACE_EVENTS.has(event) ? event : 'Unknown',
+    tool: tool.startsWith('mcp__') ? 'mcp' : TRACE_BUILTIN.test(tool) ? tool : undefined,
     keys: top.names,
     otherKeys: top.other || undefined,
     toolInputKeys: toolInput.names,
@@ -2475,6 +2618,225 @@ export function credentialKind(config = {}) {
   return undefined;
 }
 
+// --- whose report is this (MACLEOD-583) -----------------------------
+//
+// The service takes the tenant from the credential and never from the
+// body, so a report that could not be delivered is not "a report": it
+// is a report *for one organisation*. One plugin data directory sees
+// more than one of them as soon as somebody switches organisation
+// between sessions (MACLEOD-524), and state that records only what to
+// send hands one customer's work to whichever credential flushes it.
+//
+// An owner is therefore decided at queue time, and decided without a
+// round trip, because at queue time the service is by definition
+// unreachable:
+//
+//   * a signed-in session, browser or device, already knows the
+//     organisation it was bound to -- `account` in session.json, the
+//     same string `teamflow status` prints. That is the owner.
+//   * an API key and a CI OIDC access token know nothing locally. They
+//     get a fingerprint: a truncated SHA-256, one way, never the
+//     credential and never a prefix of it. It is the same shape
+//     auth.mjs already uses to tell one refresh token from another.
+//
+// A fingerprint names a credential, not an organisation, so two keys on
+// one organisation do not match each other and a report queued under
+// one key waits for that key. That is the safe direction to be wrong
+// in: the failure is a report that waits, never one that is delivered
+// to somebody else.
+const OWNER_FINGERPRINT_CHARS = 16;
+
+/**
+ * A one-way name for a credential. Not reversible to the credential:
+ * SHA-256 truncated to 64 bits over a domain-separated input, with a
+ * preimage space the size of the credential's own entropy. Nothing here
+ * is ever printed, logged or sent.
+ */
+export function ownerFingerprint(from, value) {
+  return crypto.createHash('sha256')
+    .update(`teamflow-owner:${from}:${value}`)
+    .digest('hex')
+    .slice(0, OWNER_FINGERPRINT_CHARS);
+}
+
+// `from` says what the fingerprint was taken over, which is the one
+// thing a reader of a queued item cannot otherwise work out, and it is
+// also what decides whether an owner is stable enough to remember: a CI
+// access token is a different string every job.
+//
+// `kind` is diagnostic and is deliberately NOT compared: an
+// organisation is the same organisation whether this session reached it
+// with a browser session, a device credential or a key, and requiring
+// the kinds to match would strand a report every time somebody signed
+// in. `mayDeliver` compares the account (or the fingerprint) and the
+// service, and nothing else.
+function ownerFrom(kind, secret, config) {
+  const base = { kind, serviceUrl: serviceUrl(config) };
+  if (kind !== 'api_key') {
+    const session = auth.readSession();
+    if (session?.account) return { ...base, from: 'account', account: String(session.account) };
+    // A session bound by a service that predates organisations, and a
+    // device grant that named none. The device id is a stable id rather
+    // than a secret; the address is the next best thing. Both are
+    // fingerprinted anyway, because neither needs to be on disk in the
+    // clear to answer the only question asked of it.
+    if (session?.deviceId) return { ...base, from: 'device', fingerprint: ownerFingerprint('device', session.deviceId) };
+    if (session?.email) return { ...base, from: 'email', fingerprint: ownerFingerprint('email', session.email) };
+  }
+  if (kind === 'api_key' && secret) {
+    return { ...base, from: 'api_key', fingerprint: ownerFingerprint('api_key', secret) };
+  }
+  // A token handed in directly: CI, which exchanged its GitHub Actions
+  // OIDC token a moment ago and was told the account it was bound to.
+  if (config.account) return { ...base, from: 'account', account: String(config.account) };
+  // A token and no account: an exchange against a service that named
+  // none. It cannot be fingerprinted — the token is replaced every hour
+  // and the queued report has to outlive it — so it is recorded as
+  // unidentified and matches only another unidentified token on the
+  // same service. That is the one credential this fix cannot pin to an
+  // organisation, and it is no weaker than it was.
+  return { ...base, from: kind === 'api_key' ? 'api_key' : 'token' };
+}
+
+/**
+ * The owner of the credential this config *would* use, answered without
+ * a network call and without a token refresh.
+ *
+ * This is the one for naming local state (`accountScope`). The outbox
+ * uses `currentOwner`, which asks what credential was actually
+ * resolved: a session that will not refresh falls back to an API key,
+ * and the report then belongs to the key's organisation rather than to
+ * the session's.
+ */
+/**
+ * The owner of the credential this config would use.
+ *
+ * Synchronous, so it can be asked on a hook's path, where a token
+ * refresh is not affordable. It is a guess in one case only — a session
+ * that will not refresh falls back to an API key, which only resolving
+ * the credential discovers — and it is deliberately the *stable* answer
+ * rather than the true one, because its whole job is naming local files
+ * (`accountScope`). A name that changed halfway through a process would
+ * move the workflow store and the projects cache out from under the
+ * session using them. Nothing compares this to a queued item's owner;
+ * `currentOwner` is what delivery asks.
+ */
+export function credentialOwner(config = {}) {
+  const kind = credentialKind(config);
+  if (!kind) return undefined;
+  return ownerFrom(kind, kind === 'api_key' ? config.apiKey : config.accessToken, config);
+}
+
+/**
+ * The owner of the credential a request will actually carry.
+ *
+ * The one the outbox records and compares, because the organisation
+ * that receives a report is the one behind the credential that carried
+ * it — not the one the config names.
+ */
+export async function currentOwner(config = {}) {
+  const cred = await credential(config);
+  if (!cred) return undefined;
+  // The header value, back to the credential itself, so this and
+  // `credentialOwner` fingerprint the same string.
+  const secret = cred.kind === 'api_key' ? cred.value : String(cred.value).replace(/^Bearer\s+/i, '');
+  return ownerFrom(cred.kind, secret, config);
+}
+
+/** The owner as one comparable string. Never a credential. */
+export function ownerId(owner) {
+  if (!owner) return undefined;
+  if (owner.account) return `account:${owner.account}`;
+  if (owner.fingerprint) return `fp:${owner.fingerprint}`;
+  return undefined;
+}
+
+/**
+ * A queued service report from a plugin that did not record an owner.
+ *
+ * Nothing on this machine can say whose it was. Any record of which
+ * organisations have used this directory begins the day the upgrade
+ * runs, so "only one has ever used it" is unknowable from here — and a
+ * rule reading such a record is one the first flush after the upgrade
+ * satisfies by writing the record itself, whichever organisation
+ * happens to be signed in. There is no safe version of the guess.
+ *
+ * Unreachable for anything this plugin queued, and deliberately kept.
+ * `sendReport` is the only caller of `queueOutbox` and always passes
+ * `result.owner`; `postEnvelope` attaches an owner to every return path
+ * past its credential check, and the one return without one is not
+ * retryable and so is never queued. Every item in `outbox2` therefore
+ * has an owner by construction. This is for a file somebody edited by
+ * hand, and for the next writer who forgets — the branch that is only
+ * ever taken when something has already gone wrong is the one that must
+ * not guess.
+ */
+export function isOwnerless(item) {
+  return Boolean(item?.endpoint && item?.envelope) && !item?.owner;
+}
+
+/**
+ * Whether the session flushing may deliver this queued service report.
+ *
+ * Same organisation, same service, and an owner that says so. An
+ * ownerless item is never deliverable by anybody: see `isOwnerless`,
+ * and `flushOutbox` for what happens to it instead.
+ */
+export function mayDeliver(item, current) {
+  if (!current) return false;
+  const owner = item?.owner;
+  if (!owner) return false;
+  const me = ownerId(current);
+  if (String(owner.serviceUrl || '') !== String(current.serviceUrl || '')) return false;
+  // Two unidentified CI tokens on one service. Neither says whose it
+  // is, so neither can be told apart; see `ownerFrom`.
+  if (!me && owner.from === 'token' && current.from === 'token') return true;
+  return Boolean(me) && ownerId(owner) === me;
+}
+
+/**
+ * The same rule for the legacy S3 branch, which needs nothing recorded:
+ * the key already says whose it is. `<dataUri>/tenants/<tenant>/...`,
+ * and the current config resolves both halves.
+ */
+export function mayPut(item, config = {}) {
+  const base = String(config.dataUri || '').replace(/\/+$/, '');
+  if (!base) return false;
+  const uri = String(item?.uri || '');
+  if (!uri.startsWith(`${base}/`)) return false;
+  const rest = uri.slice(base.length + 1);
+  // Not tenant-scoped at all: there is no tenant in it to misdeliver.
+  if (!rest.startsWith('tenants/')) return true;
+  try {
+    return rest.startsWith(tenantPath(config, ''));
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * The name per-organisation local state is filed under.
+ *
+ * Not `tenantId`: that is the S3 transport's tenant, it comes from
+ * config and `TEAMFLOW_TENANT_ID`, and it is `default` on every service
+ * install — so it does not tell two organisations on one machine apart,
+ * which is the whole job here. The credential's account does. An install
+ * with no service credential keeps the tenant, which is what it has
+ * always been keyed by.
+ *
+ * Pure, and stable for the life of a process. Asking which
+ * organisation this is must never write anything — every hook asks, a
+ * sandboxed agent's data directory is read-only, and a read path that
+ * writes is a read path that can corrupt a store two plugin versions
+ * share — and it must never change its answer mid-run, because the
+ * answer is a file name.
+ */
+export function accountScope(config = {}) {
+  const id = ownerId(credentialOwner(config));
+  if (!id) return tenantId(config);
+  return id.replace(':', '-').toLowerCase().replace(/[^a-z0-9._-]+/g, '-').slice(0, 80);
+}
+
 // The service wins when both are configured. An org that has a service
 // credential has migrated, and writing both would bill one report and
 // orphan the other.
@@ -2494,14 +2856,49 @@ function s3Put(uri, payload, config) {
   return result;
 }
 
+/**
+ * Where this plugin queues, and it is deliberately not where 0.3.13
+ * queued (MACLEOD-583).
+ *
+ * Recording an owner on an item only binds the plugins that read it.
+ * Claude Code runs its cached copy of the plugin while a checkout or
+ * `npx` runs another, so an older `flushOutbox` — which has no notion
+ * of an owner — sits on the same machine and would happily post this
+ * plugin's owner-tagged items with whatever credential it holds, and
+ * then delete them. A directory it does not know about is the only
+ * thing that stops it: it cannot send, and cannot destroy, what it
+ * never lists.
+ *
+ * The cost is stated rather than hidden: after a DOWNGRADE the older
+ * plugin does not see this directory, so those reports wait for the
+ * next upgrade or age out. And reports queued BY an older copy stay
+ * exposed to that copy until every copy on the machine is updated —
+ * a binary that is not ours to run is not ours to fix.
+ */
 function outboxDir() {
+  return path.join(dataDir(), 'outbox2');
+}
+
+/**
+ * Where 0.3.13 and earlier queued, and still do.
+ *
+ * Never queued into and never sent from — though the age horizon does
+ * delete from it, and deleting is writing. An older plugin on this
+ * machine goes on managing its own queue with its own rules until it is
+ * upgraded, and taking its fresh items away would lose a single
+ * organisation's reports for it. The one thing done here is that
+ * horizon: an item nothing has delivered in a week is wrong by now, and
+ * without this nothing would ever empty the directory.
+ */
+function legacyOutboxDir() {
   return path.join(dataDir(), 'outbox');
 }
 
 // Two item shapes share the directory: { uri, payload } is an S3 put and
-// { endpoint, envelope, idempotencyKey } is a service report. flushOutbox
-// only drains the shape the configured transport can deliver, so an
-// install that switches over does not lose whatever the old one queued.
+// { endpoint, envelope, idempotencyKey, owner } is a service report.
+// flushOutbox only drains the shape the configured transport can
+// deliver, so an install that switches over does not lose whatever the
+// old one queued — and only the items whose owner it is (MACLEOD-583).
 function queueOutbox(item) {
   fs.mkdirSync(outboxDir(), { recursive: true });
   const name = `${Date.now()}-${crypto.randomUUID()}.json`;
@@ -2594,6 +2991,13 @@ export function resetPaymentNotice() {
 async function postEnvelope(endpoint, envelope, idempotencyKey, config) {
   const cred = await credential(config);
   if (!cred) return { ok: false, retry: false, reason: 'no service credential available' };
+  // Whose report this was, taken from the credential that is about to
+  // carry it rather than from the one config would have chosen: a
+  // session that will not refresh falls back to an API key, and the
+  // organisation that receives the report is the key's.
+  const secret = cred.kind === 'api_key' ? cred.value : String(cred.value).replace(/^Bearer\s+/i, '');
+  const owner = ownerFrom(cred.kind, secret, config);
+  const answer = (result) => ({ ...result, owner });
   let response;
   try {
     response = await fetch(endpoint, {
@@ -2608,55 +3012,198 @@ async function postEnvelope(endpoint, envelope, idempotencyKey, config) {
     });
   } catch (error) {
     // Offline, DNS, TLS, timeout. The report is still true, so keep it.
-    return { ok: false, retry: true, reason: `service unreachable: ${error instanceof Error ? error.message : String(error)}` };
+    return answer({ ok: false, retry: true, reason: `service unreachable: ${error instanceof Error ? error.message : String(error)}` });
   }
   let body;
   try { body = await response.json(); } catch { body = undefined; }
   const status = response.status;
   if (status === 402) {
     notePaymentRequired(config, body);
-    return { ok: false, retry: false, status, paymentRequired: true, reason: body?.message || 'account is out of credits' };
+    return answer({ ok: false, retry: false, status, paymentRequired: true, reason: body?.message || 'account is out of credits' });
   }
   const retryAfterMs = parseRetryAfter(response.headers.get('retry-after'));
   if (status === 429) {
     // The only retryable 4xx. Nothing about the report is wrong; the
     // caller simply arrived too fast, and the same body posted later
     // is accepted.
-    return { ok: false, retry: true, status, retryAfterMs, reason: body?.message || 'rate limited' };
+    return answer({ ok: false, retry: true, status, retryAfterMs, reason: body?.message || 'rate limited' });
   }
   if (status >= 500) {
-    return { ok: false, retry: true, status, retryAfterMs, reason: body?.message || `service returned ${status}` };
+    return answer({ ok: false, retry: true, status, retryAfterMs, reason: body?.message || `service returned ${status}` });
   }
   if (status >= 400) {
     // 400, 401, 403, 413. Re-posting the same body cannot change the
     // answer, and one refused report must never dam the outbox in
     // front of the good reports behind it.
-    return { ok: false, retry: false, status, reason: body?.message || `service refused the report (${status})` };
+    return answer({ ok: false, retry: false, status, reason: body?.message || `service refused the report (${status})` });
   }
-  return {
+  return answer({
     ok: true,
     status,
     replay: Boolean(body?.replay),
     droppedFields: Array.isArray(body?.dropped_fields) ? body.dropped_fields : [],
-  };
+  });
+}
+
+/**
+ * How many files one flush will look at.
+ *
+ * `limit` bounds the requests a flush makes; this bounds the reading it
+ * does to find them, and only unreadable-or-foreign files are read for
+ * nothing. It has to be far larger than `limit`, because another
+ * organisation's queued reports sit in the same directory, sort by the
+ * time they were queued, and are never attempted: a cap anywhere near
+ * `limit` would let one long offline stretch under A put a permanent
+ * wall in front of every report B queues afterwards. Nothing prunes
+ * them except the age horizon below, so the wall would never come down.
+ */
+const OUTBOX_SCAN_LIMIT = 1000;
+
+/**
+ * How long a queued report is worth sending.
+ *
+ * Every report is a full-state document, so a week-old one describes a
+ * ticket that has since been re-reported several times: posting it
+ * costs a credit to write something already known and, for a document
+ * that sorts after the current one, wrong. This is the only thing that
+ * empties the queue of reports nobody can deliver — a foreign item is
+ * never attempted, so nothing else ever would.
+ */
+const OUTBOX_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
+
+/** When an item was queued: the file name is `<epoch ms>-<uuid>.json`. */
+function queuedAt(file, full) {
+  const stamp = Number(String(file).split('-')[0]);
+  if (Number.isFinite(stamp) && stamp > 0) return stamp;
+  try { return fs.statSync(full).mtimeMs; } catch { return undefined; }
+}
+
+function discardsPath() {
+  return path.join(dataDir(), 'outbox-discards.json');
+}
+
+/**
+ * What a flush threw away and why, kept until somebody is told.
+ *
+ * A hook cannot print — every hook exits 0 and says nothing its tool
+ * could read as a denial — so the tally waits here for `teamflow
+ * status` or `teamflow doctor`, which say it once and clear it.
+ */
+export function readDiscards() {
+  const kept = readJson(discardsPath(), {}) || {};
+  return { ownerless: Number(kept.ownerless) || 0, expired: Number(kept.expired) || 0 };
+}
+
+export function noteDiscards({ ownerless = 0, expired = 0 } = {}) {
+  if (!ownerless && !expired) return;
+  const kept = readDiscards();
+  try {
+    writeJson(discardsPath(), {
+      ownerless: kept.ownerless + ownerless,
+      expired: kept.expired + expired,
+      updatedAt: new Date().toISOString(),
+    });
+  } catch {}
+}
+
+export function clearDiscards() {
+  try { fs.unlinkSync(discardsPath()); } catch {}
+}
+
+/** Files in a queue directory, oldest first, bounded. */
+function queueFiles(dir) {
+  if (!fs.existsSync(dir)) return [];
+  return fs.readdirSync(dir).filter((name) => name.endsWith('.json')).sort().slice(0, OUTBOX_SCAN_LIMIT);
+}
+
+/**
+ * The only thing done to the directory an older plugin owns: remove
+ * what it has not managed to deliver in a week.
+ *
+ * Nothing here is ever sent. The items are that plugin's, queued under
+ * rules that could not say whose they were, and this plugin has no way
+ * to learn the answer. What it can do is stop them accumulating for
+ * ever on a machine whose older copy has since been removed.
+ */
+function sweepLegacyOutbox(now) {
+  let expired = 0;
+  for (const file of queueFiles(legacyOutboxDir())) {
+    const full = path.join(legacyOutboxDir(), file);
+    const queued = queuedAt(file, full);
+    if (queued === undefined || now - queued <= OUTBOX_MAX_AGE_MS) continue;
+    try {
+      fs.unlinkSync(full);
+      expired += 1;
+    } catch {}
+  }
+  return expired;
+}
+
+/** How many reports an older copy of the plugin still has queued here. */
+export function legacyQueued() {
+  return queueFiles(legacyOutboxDir()).length;
 }
 
 export async function flushOutbox(config, limit = 5) {
   const mode = transportOf(config);
-  if (mode === 'none' || !fs.existsSync(outboxDir())) return { sent: 0, dropped: 0, deferred: 0, remaining: 0 };
-  const files = fs.readdirSync(outboxDir()).filter((name) => name.endsWith('.json')).sort().slice(0, limit);
+  const now = Date.now();
+  if (mode === 'none') return { sent: 0, dropped: 0, deferred: 0, foreign: 0, ownerless: 0, expired: 0, remaining: 0 };
+  // The older plugin's directory first, and only ever to age it out.
+  let expired = sweepLegacyOutbox(now);
+  if (!fs.existsSync(outboxDir())) {
+    noteDiscards({ expired });
+    return { sent: 0, dropped: 0, deferred: 0, foreign: 0, ownerless: 0, expired, remaining: 0 };
+  }
+  const files = queueFiles(outboxDir());
+  // Resolved once. postEnvelope resolves the same credential a moment
+  // later and the access token is cached in memory, so this costs
+  // nothing a report was not already paying.
+  const owner = mode === 'service' ? await currentOwner(config) : undefined;
   let sent = 0;
   let dropped = 0;
   let deferred = 0;
+  let foreign = 0;
+  let ownerless = 0;
+  let attempted = 0;
   for (const file of files) {
+    if (attempted >= limit) break;
     const full = path.join(outboxDir(), file);
     const item = readJson(full);
+    // Too old to be true, whoever owns it. Checked before ownership,
+    // because an item nobody can deliver is exactly the one that would
+    // otherwise sit here for ever.
+    const queued = item ? queuedAt(file, full) : undefined;
+    if (queued !== undefined && now - queued > OUTBOX_MAX_AGE_MS) {
+      fs.unlinkSync(full);
+      expired += 1;
+      continue;
+    }
     if (item?.endpoint && item?.envelope) {
       if (mode !== 'service') continue;
-      if (item.notBefore && Date.now() < item.notBefore) {
+      // Queued by a plugin that did not record whose it was. It is not
+      // sent — not by this organisation and not by any other, because
+      // nothing here can know which one queued it — and it is not kept
+      // either: the ticket's current state goes out again on the next
+      // event, so throwing it away costs a duplicate of nothing.
+      if (isOwnerless(item)) {
+        fs.unlinkSync(full);
+        ownerless += 1;
+        continue;
+      }
+      // Somebody else's. Left exactly as it is — not sent, not retried,
+      // not rescheduled, not renamed, and counted as neither dropped
+      // nor failed — for the session that can deliver it. Skipped and
+      // not a stop, because the reports behind it may well be ours, and
+      // it does not count against `limit` for the same reason.
+      if (!mayDeliver(item, owner)) {
+        foreign += 1;
+        continue;
+      }
+      if (item.notBefore && now < item.notBefore) {
         deferred += 1;
         continue;
       }
+      attempted += 1;
       const result = await postEnvelope(item.endpoint, item.envelope, item.idempotencyKey, config);
       if (result.retry) {
         // Rewritten in place, not re-queued: a new file name would sort
@@ -2672,6 +3219,11 @@ export async function flushOutbox(config, limit = 5) {
     }
     if (item?.uri && item?.payload) {
       if (mode !== 's3') continue;
+      if (!mayPut(item, config)) {
+        foreign += 1;
+        continue;
+      }
+      attempted += 1;
       if (!s3Put(item.uri, item.payload, config).ok) break;
       fs.unlinkSync(full);
       sent += 1;
@@ -2680,10 +3232,65 @@ export async function flushOutbox(config, limit = 5) {
     fs.unlinkSync(full);
     dropped += 1;
   }
+  noteDiscards({ ownerless, expired });
   const remaining = fs.existsSync(outboxDir())
     ? fs.readdirSync(outboxDir()).filter((name) => name.endsWith('.json')).length
     : 0;
-  return { sent, dropped, deferred, remaining };
+  return { sent, dropped, deferred, foreign, ownerless, expired, remaining };
+}
+
+/**
+ * What is in the outbox and what a flush has thrown away, for the two
+ * commands a person runs when a ticket stops moving.
+ *
+ * Reads; never delivers, never discards. `discarded` is cleared by
+ * whoever prints it — see `clearDiscards`.
+ */
+export async function outboxSummary(config = {}) {
+  const discarded = readDiscards();
+  // Evidence of an older copy of the plugin on this machine, which is
+  // the one thing this fix cannot reach: items in the directory only a
+  // pre-0.3.14 plugin writes to. Cheap, read-only, and the only honest
+  // way to say the machine is not fully fixed yet.
+  const legacy = legacyQueued();
+  if (!fs.existsSync(outboxDir())) return { queued: 0, foreign: 0, legacy, discarded };
+  const files = fs.readdirSync(outboxDir()).filter((name) => name.endsWith('.json')).sort()
+    .slice(0, OUTBOX_SCAN_LIMIT);
+  const mode = transportOf(config);
+  const owner = mode === 'service' ? await currentOwner(config) : undefined;
+  let queued = 0;
+  let foreign = 0;
+  for (const file of files) {
+    const item = readJson(path.join(outboxDir(), file));
+    if (!item) continue;
+    queued += 1;
+    if (item.endpoint && item.envelope) {
+      if (mode === 'service' && !isOwnerless(item) && !mayDeliver(item, owner)) foreign += 1;
+    } else if (item.uri && item.payload && mode === 's3' && !mayPut(item, config)) {
+      foreign += 1;
+    }
+  }
+  return { queued, foreign, legacy, discarded };
+}
+
+/** The one sentence `status` and `doctor` both say about the outbox. */
+export function outboxLine(summary) {
+  const parts = [`${summary.queued} report${summary.queued === 1 ? '' : 's'} queued`];
+  if (summary.foreign) parts.push(`${summary.foreign} waiting for another organisation`);
+  if (summary.legacy) {
+    parts.push(`${summary.legacy} in the queue an older plugin owns — a copy before 0.3.14 is `
+      + 'still installed on this machine and will send them with whatever credential it holds; '
+      + 'update every copy');
+  }
+  if (summary.discarded.ownerless) {
+    parts.push(`${summary.discarded.ownerless} discarded: queued by an older version `
+      + 'without saying which organisation they were for; the current state is sent '
+      + 'again on the next event');
+  }
+  if (summary.discarded.expired) {
+    parts.push(`${summary.discarded.expired} discarded: queued more than seven days ago`);
+  }
+  return parts.join('; ');
 }
 
 // POST one report to the service. kind is the envelope kind
@@ -2697,7 +3304,10 @@ export async function sendReport(kind, slot, payload, config) {
   const idempotencyKey = reportIdempotencyKey(kind, slot, document);
   const result = await postEnvelope(endpoint, envelope, idempotencyKey, config);
   if (result.retry) {
-    queueOutbox(scheduleRetry({ endpoint, envelope, idempotencyKey }, result));
+    // `owner` is the whole fix: where to send it, what to send, and
+    // whose it is. Never the credential — that is resolved again when
+    // the report finally goes out.
+    queueOutbox(scheduleRetry({ endpoint, envelope, idempotencyKey, owner: result.owner }, result));
     return { ok: false, queued: true, status: result.status, reason: result.reason };
   }
   if (result.ok) await flushOutbox(config);

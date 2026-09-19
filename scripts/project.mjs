@@ -15,11 +15,11 @@
 
 import path from 'node:path';
 import {
+  accountScope,
   credential,
   dataDir,
   readJson,
   serviceUrl,
-  tenantId,
   writeJson,
 } from './core.mjs';
 
@@ -77,9 +77,18 @@ export function projectFor(repository, projects) {
     ?? projects.find((project) => has(project, (repo) => leaf(repo) === tail));
 }
 
-/** Beside the bindings and the workflows, and keyed by tenant for the same reason. */
+/**
+ * Beside the workflows, and keyed by the organisation for the same
+ * reason (MACLEOD-583).
+ *
+ * Not by `tenantId`, which is the S3 transport's tenant and is
+ * `default` on every service install: one file for two organisations
+ * meant a session on B could be told, out of A's cache, that this
+ * repository is in one of A's projects — A's project names, read in B's
+ * terminal.
+ */
 export function projectsCachePath(config = {}) {
-  return path.join(dataDir(), 'projects', `${tenantId(config)}.json`);
+  return path.join(dataDir(), 'projects', `${accountScope(config)}.json`);
 }
 
 /**

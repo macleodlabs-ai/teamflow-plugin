@@ -53,6 +53,11 @@ const payload = {
 const ci = await auth.githubOidcAccessToken(config);
 if (ci.ok) {
   config.accessToken = ci.token;
+  // The exchange already said which organisation the repository is
+  // registered to. Carried so a report queued offline knows whose it is
+  // without a second call, and so a token replaced an hour later still
+  // matches it (MACLEOD-583).
+  if (ci.account) config.account = ci.account;
 } else if (ci.attempted) {
   process.stderr.write(`TeamFlow: OIDC sign-in failed (${ci.reason}); ${config.apiKey ? 'falling back to TEAMFLOW_API_KEY' : 'no fallback credential is configured'}\n`);
 }

@@ -23,7 +23,8 @@
 
 import crypto from 'node:crypto';
 import {
-  readWorkflows, resolveGithubRepo, sendReport, trackerOf, workflowsPath, writeWorkflows,
+  adoptWorkflow, readWorkflows, resolveGithubRepo, sendReport, trackerOf, unclaimedWorkflows,
+  workflowsPath, writeWorkflows,
 } from './core.mjs';
 
 // Mirrors adapters/teamflow/schema.py. The service is the enforcement;
@@ -56,6 +57,15 @@ export const USAGE = `teamflow workflow — the pool of tickets a run works thro
 
   teamflow workflow show [<name>]
       The plan: phases, tickets and what waits on what.
+
+  teamflow workflow adopt [--yes <id>] [--from <bucket>]
+      Workflows started before 0.3.14, when this machine filed them by
+      tenant rather than by organisation, and which organisation each
+      belongs to cannot be worked out from anything here. Lists them,
+      naming the bucket each came from; --yes <id> copies one into this
+      organisation, and --from picks between two buckets holding the
+      same id. Local, nothing is sent, and the older copy is left
+      exactly where it is.
 
   teamflow workflow status <planning|running|blocked|done|cancelled> [--to <name>]
       Move the whole workflow.
@@ -137,6 +147,54 @@ function pick(source, names) {
   return out;
 }
 
+/**
+ * One field of an owner, as the service will take it (MACLEOD-578, audit F6).
+ *
+ * The cap is not cosmetic. `ACTOR_MAX` is 80 characters on the wire and a git
+ * `user.name` longer than that would have made every publish of that
+ * workflow a 400 — a run that silently stops reaching the board, which is
+ * the failure mode this whole ticket exists to remove. Sliced here the way
+ * `report-cli.mjs` already slices an actor's name, and non-strings are
+ * dropped rather than coerced: `String({})` is "[object Object]", which the
+ * service would accept and a reader would not understand.
+ */
+const capped = (value) => (typeof value === 'string' ? value.trim().slice(0, 80) : '');
+
+/**
+ * The two fields, or nothing (audit F9).
+ *
+ * Half an owner is a lane with no label, and an owner whose id is an empty
+ * string is worse than none: it reads as owned, so nothing ever fills it in.
+ * Both or neither, at every door.
+ */
+function ownerFields(source) {
+  // The service's alphabet for an owner's id, and it refuses the WHOLE
+  // document over one that is not: an id written into workflows.json by
+  // anything but `stated()` would make every later publish of that run a
+  // 400. Not a slug is no owner, which `own()` then repairs.
+  const id = /^[a-z0-9._-]{1,80}$/.test(capped(source?.id)) ? capped(source.id) : '';
+  const displayName = capped(source?.displayName);
+  return id && displayName ? { id, displayName } : undefined;
+}
+
+/**
+ * Who this machine can honestly say is running a workflow (audit F4).
+ *
+ * Deliberately NOT `actor(config, info)`. That function falls back to
+ * `os.userInfo().username` so that a report always has some actor, which is
+ * right for a report — the board would otherwise lose the row entirely. As a
+ * run's OWNER it is wrong: it puts the operating system login on a workflow
+ * and re-creates the phantom person this ticket set out to remove. A stated
+ * identity or nothing, and nothing is a workflow that can be owned later.
+ */
+export function stated(config = {}, info = {}) {
+  const displayName = capped(config.actorName || info.name);
+  if (!displayName) return undefined;
+  const source = capped(config.actorId) || capped(info.email?.split('@')[0]) || displayName;
+  const id = source.toLowerCase().replace(/[^a-z0-9._-]+/g, '-').replace(/^-+|-+$/g, '');
+  return ownerFields({ id, displayName });
+}
+
 export function published(workflow) {
   const out = {
     id: workflow.id,
@@ -153,6 +211,18 @@ export function published(workflow) {
     createdAt: workflow.createdAt,
     updatedAt: workflow.updatedAt,
   };
+  /*
+   * Who is running it (MACLEOD-578). The same two fields a report already
+   * carries and no more: an id and the name to draw. A workflow's queued
+   * tickets have nobody on them by definition -- nobody has touched the
+   * code yet -- so without this the board had no answer but "Unassigned"
+   * for every ticket of a run somebody is sitting in front of.
+   *
+   * Optional, because a document written before this change has no owner
+   * and must go on validating.
+   */
+  const owner = ownerFields(workflow.actor);
+  if (owner) out.actor = owner;
   const filter = pick(workflow.filter, ['tracker', 'project', 'state', 'label', 'order']);
   if (Object.keys(filter).length) out.filter = filter;
   if (workflow.scope) out.scope = pick(workflow.scope, ['deploy']);
@@ -192,7 +262,30 @@ export function buildFilter(args) {
   return filter;
 }
 
-export function create(name, args, state) {
+/**
+ * Stamp the owner on a running workflow that has none (MACLEOD-578).
+ *
+ * Written once and never overwritten: a run started on one machine and
+ * moved on by a teammate's `teamflow workflow status` stays the first
+ * person's, which is what "a running workflow's tickets are its owner's"
+ * means. It is also how a workflow created before this change gains an
+ * owner -- the next command that publishes it stamps it.
+ *
+ * Running only (audit F8). A planned run is a draft and a finished one is
+ * history; putting whoever happened to type `teamflow workflow show` on
+ * either of them would write an owner into somebody else's record of what
+ * was done, and the board attributes nothing from them anyway.
+ */
+export function own(workflow, config, info) {
+  if (!workflow) return workflow;
+  if (ownerFields(workflow.actor)) return workflow;
+  if (workflow.status !== 'running') return workflow;
+  const owner = stated(config || {}, info || {});
+  if (owner) workflow.actor = owner;
+  return workflow;
+}
+
+export function create(name, args, state, owner) {
   const clean = String(name || '').trim();
   if (!clean) throw new Error('Usage: teamflow workflow create <name>');
   if (clean.length > NAME_MAX) {
@@ -212,6 +305,8 @@ export function create(name, args, state) {
     createdAt: at,
     updatedAt: at,
   };
+  const stamped = ownerFields(owner);
+  if (stamped) workflow.actor = stamped;
   // Local only. Never copied into `published`.
   const order = flag(args, 'order-text');
   if (order) workflow.order = order;
@@ -432,7 +527,7 @@ export async function main(args, {
 
   if (sub === 'create') {
     const name = rest.filter((a) => !a.startsWith('--'))[0];
-    const workflow = create(name, rest, state);
+    const workflow = create(name, rest, state, stated(config, info));
     save(state, config);
     const sent = await publish(workflow, config);
     print(`TeamFlow started workflow "${workflow.name}" (${workflow.id}).`);
@@ -446,13 +541,77 @@ export async function main(args, {
     return 0;
   }
 
-  const target = find(state, flag(rest, 'to'));
-  if (!target) {
-    print(Object.keys(state.workflows).length
-      ? 'No workflow chosen. Name one with --to, or `teamflow workflow show <name>`.'
-      : 'No workflow yet. Start one with `teamflow workflow create <name>`.');
+  /*
+   * Workflows this machine holds under a pre-0.3.14 key (MACLEOD-583).
+   *
+   * Before 0.3.14 a run was filed by tenant, which is `default` on
+   * every service install and therefore the same bucket for every
+   * organisation a person holds a seat on. Nothing on the machine
+   * records which organisation started one, and every way of guessing
+   * turned out to answer in favour of whoever is signed in now — so it
+   * is said out loud and claimed by hand, and until then this
+   * organisation simply does not have it.
+   */
+  if (sub === 'adopt') {
+    const offered = unclaimedWorkflows(config);
+    const wanted = flag(rest, 'yes');
+    if (!offered.length) {
+      print('Nothing to adopt: every workflow on this machine already belongs to an organisation.');
+      return 0;
+    }
+    if (!wanted) {
+      print('Workflows from before 0.3.14 are on this machine. Which organisation each belongs to '
+        + 'is not recorded anywhere, so nothing is claimed until you say so:');
+      for (const row of offered) {
+        // The bucket is named on every row, not only when it matters:
+        // two `TEAMFLOW_TENANT_ID` values on one machine can hold the
+        // same id, and a listing that hid where each came from would
+        // make the pair indistinguishable.
+        print(`  ${row.id}  ${row.name}  ${row.tickets} ticket${row.tickets === 1 ? '' : 's'}`
+          + `${row.status ? `, ${row.status}` : ''}  [${row.from}]`);
+      }
+      print('Adopt one with `teamflow workflow adopt --yes <id>`. It is copied, not moved: an older '
+        + 'copy of the plugin on this machine goes on reading its own.');
+      return 0;
+    }
+    const from = flag(rest, 'from');
+    const matching = offered.filter((row) => row.id === wanted && (!from || row.from === from));
+    if (matching.length > 1) {
+      print(`Two workflows on this machine are called ${wanted}, in ${matching.map((r) => r.from).join(' and ')}. `
+        + `Say which: \`teamflow workflow adopt --yes ${wanted} --from ${matching[0].from}\`.`);
+      return 1;
+    }
+    const taken = adoptWorkflow(wanted, config, { from });
+    if (!taken) {
+      print(`No workflow ${wanted}${from ? ` in ${from}` : ''} to adopt. `
+        + '`teamflow workflow adopt` lists what there is.');
+      return 1;
+    }
+    print(`TeamFlow adopted "${taken.name}" (${taken.id}) into this organisation. `
+      + 'Nothing was sent and nothing was removed.');
     return 0;
   }
+
+  const target = find(state, flag(rest, 'to'));
+  if (!target) {
+    if (Object.keys(state.workflows).length) {
+      print('No workflow chosen. Name one with --to, or `teamflow workflow show <name>`.');
+      return 0;
+    }
+    print('No workflow yet. Start one with `teamflow workflow create <name>`.');
+    // One line, and only when there is something to say: a run from
+    // before 0.3.14 reads as "no workflow yet" otherwise, which is how
+    // the owner's nineteen-ticket run appeared to vanish.
+    if (unclaimedWorkflows(config).length) {
+      print('A workflow from before 0.3.14 is on this machine. If it is this organisation\'s, '
+        + 'run `teamflow workflow adopt`.');
+    }
+    return 0;
+  }
+  // A workflow from before MACLEOD-578 has no owner. The first command
+  // that touches it gives it one rather than leaving its tickets
+  // permanently nobody's.
+  own(target, config, info);
 
   if (sub === 'add') {
     const key = rest.filter((a) => !a.startsWith('--'))[0];
@@ -469,6 +628,9 @@ export async function main(args, {
       throw new Error(`A workflow status is one of ${STATUSES.join(', ')}`);
     }
     target.status = wanted;
+    // Owned again here: the call above ran while this was still a draft,
+    // so a run that goes live in this command would publish ownerless once.
+    own(target, config, info);
     target.updatedAt = now();
     save(state, config);
     await publish(target, config);
@@ -504,6 +666,7 @@ export async function main(args, {
     const before = (target.tickets || []).length;
     seed(target, keys);
     if (target.status === 'planning' && target.tickets.length) target.status = 'running';
+    own(target, config, info);
     save(state, config);
     await publish(target, config);
     print(`TeamFlow put ${target.tickets.length - before} tickets in "${target.name}" `
