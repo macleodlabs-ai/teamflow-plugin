@@ -26,6 +26,7 @@ import {
   tenantId,
   staleBuildNotice,
 } from './core.mjs';
+import { NO_PROJECT_SENTENCE, resolveProject } from './project.mjs';
 
 // Events that must stay synchronous and fast, because the tool is
 // waiting on them before it shows the developer anything.
@@ -53,27 +54,52 @@ export function newSession(sessionId, cwd) {
 const NO_ISSUE = 'TeamFlow: no issue is bound — run /teamflow:next '
   + '(the teamflow-next skill) to take the top-priority open ticket and bind it before editing.';
 
-export function claudeContext(event, state, justBound, stale = staleBuildNotice()) {
+/**
+ * The one line about the project, or nothing (MACLEOD-565).
+ *
+ * Said on SessionStart only, for the same reason the stale-build notice
+ * is: a session's repository does not change under it, and a line per
+ * turn about something the reader can act on once is noise. An
+ * `unknown` answer — the service was not reachable, or nobody is signed
+ * in — says nothing at all rather than worrying anybody: reporting is
+ * unaffected either way, and the other surfaces name the real problem.
+ */
+function projectSentence(project) {
+  if (!project?.known) return undefined;
+  if (project.none) {
+    return `TeamFlow: ${NO_PROJECT_SENTENCE}. `
+      + 'Reports still land; they just appear under no project.';
+  }
+  return project.name ? `Project: ${project.name}.` : undefined;
+}
+
+export function claudeContext(event, state, justBound, stale = staleBuildNotice(), project = undefined) {
   if (!FAST.includes(event)) return undefined;
   // Said on SessionStart only. A session loads plugin code once, so
   // the answer cannot change until it restarts, and repeating it on
   // every prompt would be a line of noise per turn for something the
   // reader can only act on once (MACLEOD-538).
   const notice = event === 'SessionStart' && stale ? [stale] : [];
+  const named = event === 'SessionStart' ? projectSentence(project) : undefined;
   if (!state.binding?.key) {
     return JSON.stringify({
       hookSpecificOutput: {
         hookEventName: event,
-        additionalContext: [NO_ISSUE, ...notice].join(' '),
+        additionalContext: [NO_ISSUE, ...(named ? [named] : []), ...notice].join(' '),
       },
     });
   }
   const tracker = state.binding.tracker || 'jira';
   const context = [
     `TeamFlow: working on ${tracker} issue ${state.binding.key}.`,
+  ];
+  // After the ticket, because the ticket is what the work is and the
+  // project is only where it will be drawn.
+  if (named) context.push(named);
+  context.push(
     'Treat the issue as the work definition; continue normal development.',
     'TeamFlow reporting is automatic. Do not manually narrate tool calls for reporting.',
-  ];
+  );
   if (justBound) context.push(`Binding source: ${state.binding.source}.`);
   // Last, because it is about the tooling rather than the work, and
   // the ticket is what the reader needs first.
@@ -191,7 +217,17 @@ export async function handleEvent(input = {}) {
     saveSession(state);
   }
 
-  return { state, justBound, event };
+  // Asked once a session, and only on the event that is allowed to say
+  // it. The cache in project.mjs means at most one request per five
+  // minutes per organisation, and the timeout is far tighter than the
+  // CLI's because a tool is waiting on this event: a service that does
+  // not answer in a second and a half is answered as "unknown", which
+  // prints nothing and costs the session nothing.
+  const project = event === 'SessionStart'
+    ? await resolveProject(info?.repository, config, { timeoutMs: 1500 })
+    : undefined;
+
+  return { state, justBound, event, project };
 }
 
 // Every hook entry runs inside this. Reporting must never break the

@@ -3,6 +3,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import * as auth from './auth.mjs';
 import { claudeBinary } from './claude-bin.mjs';
+import { NO_PROJECT, resolveProject } from './project.mjs';
 import {
   actor,
   credential,
@@ -178,6 +179,11 @@ async function status() {
   // code, and these are the trackers allowed to report what happens to the
   // issue. Asked for only when there is a credential to ask with.
   const trackers = credentialKind(config) ? await trackerConnections(config) : undefined;
+  // Which board view this session's work will land in (MACLEOD-565). The
+  // repository decides it, so the answer is the same in a worktree as in
+  // the checkout it was made from, and a session outside git gets the
+  // organisation's default rather than an error.
+  const project = await resolveProject(info.repository, config);
   const stale = staleBuild();
   print({
     tenantId: tenantId(config),
@@ -188,6 +194,7 @@ async function status() {
     } : {}),
     actor: actor(config, info),
     repository: info.repository,
+    project: project.line,
     branch: info.branch,
     tracker: state?.binding?.tracker || trackerOf(config),
     trackerConnections: trackers
@@ -343,6 +350,14 @@ async function doctor() {
   };
 
   if (transport === 'service') {
+    // Which project this repository's work appears under (MACLEOD-565).
+    // A repository in no project still reports and nothing is lost —
+    // but every board view filters by project, so the work is landing
+    // where nobody is looking and no other line here would say so.
+    const project = await resolveProject(info.repository, config);
+    report.project = project.line;
+    if (project.none) report.projectFindings = [NO_PROJECT];
+
     // The one question a reporter cannot answer locally: does the org
     // still have credits? A 402 during a session is silent by design,
     // so doctor is where it has to be visible.
@@ -456,9 +471,25 @@ async function login() {
   }
   const probe = await fetchAccount(config);
   const org = result.accountName || result.account || (probe.ok ? probe.account?.account : undefined);
-  print(`TeamFlow signed in${result.email ? ` as ${result.email}` : ''}${org ? `, org ${org}` : ''}. `
+  print(`TeamFlow signed in${result.email ? ` as ${result.email}` : ''}${org ? `, org ${org}` : ''}.\n`
+    + `${await signedInLines()}\n`
     + `Reporting now uses a one-hour access token refreshed in the background; `
     + `the refresh token is at ${auth.sessionPath()} and /teamflow:logout removes it.`);
+}
+
+/**
+ * What a person wants to know the moment sign-in finishes: which board
+ * their next report lands on, and that one is coming (MACLEOD-565).
+ *
+ * Asked after the session is written, so the credential that resolves
+ * the projects is the one that was just minted. Fails open like every
+ * other project lookup: an unreachable service prints "unknown" and the
+ * sign-in is still a success, because it is.
+ */
+async function signedInLines() {
+  const project = await resolveProject(info.repository, config);
+  return `Project: ${project.line}\n`
+    + 'Your next report will appear on the board.';
 }
 
 // Whether asking for a code is an option at all. A service that
@@ -484,7 +515,9 @@ async function deviceLogin(because) {
   const probe = await fetchAccount(config);
   const org = result.account || (probe.ok ? probe.account?.account : undefined);
   print(`TeamFlow signed in${result.email ? ` as ${result.email}` : ''}${org ? `, org ${org}` : ''}, `
-    + `as device "${result.label}". Reporting uses a revocable device credential stored at `
+    + `as device "${result.label}".\n`
+    + `${await signedInLines()}\n`
+    + `Reporting uses a revocable device credential stored at `
     + `${auth.sessionPath()}; /teamflow:logout revokes it here and at the service, and the `
     + 'members page lists every machine signed in this way.');
 }

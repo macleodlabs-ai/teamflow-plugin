@@ -257,6 +257,78 @@ enforcement.
 Deleting a project deletes no ticket, no sidecar and no workflow. A project is
 a view.
 
+**A repository belongs to at most one project** (MACLEOD-565). A session is in
+one repository and `teamflow status` has to be able to name the project that
+session belongs to, so `POST` and `PUT` answer 409 `repo_taken` — naming the
+repository and the owning project's `id` and `name` — rather than letting two
+projects claim one. Linear and Jira projects are *not* exclusive: several
+TeamFlow projects may watch one tracker project, because nothing locates a
+session by a tracker.
+
+**A project is also the import scope** (MACLEOD-565). On `POST`, `PUT` and
+`DELETE`, every tracker connection's chosen scope (MACLEOD-559) is set to the
+union of that provider's entries across all of the organisation's projects —
+the union, because a connection carries one scope and narrowing it to the
+project being saved would empty every other project's board. What was *added*
+is marked for import through the existing backfill request; what was removed
+imports nothing and deletes nothing. An organisation with no projects keeps its
+connections unscoped, which is what every one of them was before projects
+existed. The response carries `importing`: the connections a slice was asked
+for. No import ever runs inside the request.
+
+Two read-only routes serve the dialog and the wizard, and neither writes
+anything:
+
+| Route | Answers |
+| --- | --- |
+| `GET /v1/members/projects/options` (any member) | `repositories[] {name, source: "app"｜"plugin", lastSeenAt, project}`, `linear[] {id, name, connection}`, `jira[]`, `listable {github, linear, jira}` |
+| `POST /v1/members/projects/preview` (owners and admins) | `{issues: number｜null, exact: bool}` — a real dry-run count from the far end, `null` where none can be had |
+
+`repositories[]` has two sources and stores neither. One is what each installed
+GitHub App connection covers (`provider_scope`). The other is **derived from
+the reports themselves**: the `repository` field an issue document already
+carries, with its newest `updatedAt` as `lastSeenAt`, which is how an
+organisation with no App still gets a checkbox list. There is no registry of
+repositories anywhere and there must not be one — it would be a second answer
+to what the reports already say. A repository known both ways is `source:
+"app"` and keeps its `lastSeenAt`. `project` is the project that already holds
+it, or `null`.
+
+### The onboarding document
+
+`onboarding/state.json` (MACLEOD-565) is the fifth document kind and the
+smallest. It carries **two fields**, `step` (1–4) and `finished`, and nothing
+else — not even an `updatedAt`, because that field is the board's watermark and
+a wizard step must not push a tenant's clock past its newest ticket.
+
+It exists because setup progress is the organisation's and not a browser's: a
+person signs up on a laptop and installs the plugin on the desktop where they
+write code, and a teammate who is also an owner must not be shown step one
+again.
+
+| Route | Who |
+| --- | --- |
+| `GET /v1/members/onboarding` | any member |
+| `PUT /v1/members/onboarding` | owners and admins. Body `{step}` or `{finished: true}` |
+
+Everything else in the answer is derived where it already lives, because a copy
+here is a copy that goes stale:
+
+- `connected {github, linear, jira}` — counted off the connections
+- `projects` — counted off the project documents
+- `firstReportAt` — the oldest `updatedAt` among issue documents carrying a
+  `reporter` block, which is what tells a report written by a plugin from an
+  issue imported off a tracker
+- `outside[] {repository, lastSeenAt}` — repositories plugins are reporting
+  from that are in no project. **Such a report is accepted and stored exactly
+  as any other**; it is simply outside every project's view, and this is what
+  lets the switcher offer to put it inside one
+
+The bundle carries the same block as `onboarding`, because the wizard opens on
+first paint. It is deliberately *not* in the index's subject lists and not in
+`documents`: the board draws issues, workflows and projects, and setup progress
+is none of them.
+
 The bundle carries the documents under `documents.projects`, keyed by id, and
 the index lists their ids under `projects` — the same way workflows are
 carried, because `projects/<id>.json` is a subject document under the one path

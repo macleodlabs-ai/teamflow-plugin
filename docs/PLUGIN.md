@@ -335,6 +335,31 @@ teamflow status
 
 `docs/TRACKERS.md` is the reference: who decides what, the mapping table both sides test, the Jira, Linear and GitHub setup walkthroughs, and the order to check things in when a ticket does not appear.
 
+### Projects
+
+A session connects to exactly one project, and it does so by its repository. A project is an organisation-level named set of repositories and tracker projects; a repository belongs to at most one project per organisation and the service enforces that, so the answer is never ambiguous and never needs to be chosen.
+
+The plugin does not stamp a project on a report and never will. A project's membership can change after a report was written, so the repository the report already carries is what decides where it is drawn, and the dashboard filters by project at read time. What the plugin does is *say* which project the work will appear under, because every board view filters by project and work from a repository in none is invisible with nothing anywhere explaining why.
+
+`teamflow status` prints it as `project`, and there are four answers:
+
+```text
+teamflow status
+  repository: macleodlabs-ai/teamflow
+  project: TeamFlow
+```
+
+| `project` | What it means |
+| --- | --- |
+| a name | this repository is in that project, and the work appears there |
+| `none — this repository is in no project; add it from the header's project switcher` | the work still lands and nothing is lost, but no board view will draw it |
+| `the organisation's default` | the session is not in a git repository at all, so there is nothing to match on |
+| `unknown` | the service could not be asked. Not the same as `none`: one says try again, the other says add the repository to a project |
+
+`teamflow doctor` prints the same line and raises the `none` case as `projectFindings`, in the same words. The matching is `src/lib/projectFilter.ts`'s — case-insensitive `owner/repo`, falling back to the last path segment — deliberately, because a plugin that decided a repository was in one project while the board drew it in another would be two answers to one question. A worktree resolves to the same project as the repository it was made from: it is its own repository root, but it is the same repository.
+
+The list is fetched from `GET /v1/members/projects` and cached for five minutes beside the bindings, keyed by tenant. Everything about it fails open. No credential, no network, a service with no projects route, a data directory that cannot be written: reporting is untouched in every case, `/teamflow:login` prints the project line as `unknown`, and the `SessionStart` hook — which is the only event that mentions the project, once, after the ticket — says nothing at all rather than raising an alarm about something that does not affect the work.
+
 ## Ticket binding confidence
 
 | Source | Confidence |
