@@ -134,7 +134,10 @@ function skillInstruction(tracker) {
     + 'picks by the rule below, assigns the issue to you and runs `teamflow bind <key>`.';
 }
 
-function ghIssues(repo) {
+// Exported so `teamflow workflow plan` selects with the same call and
+// the same fields. A second `gh issue list` would be a second ordering
+// rule the day somebody changed one of them.
+export function ghIssues(repo) {
   const listed = safeExec('gh', ['issue', 'list', '--repo', repo, '--state', 'open', '--limit', '100',
     '--json', 'number,title,labels,assignees,milestone,createdAt'], { timeout: 15000 });
   if (!listed.ok) return { ok: false, reason: listed.stderr || `gh issue list exited ${listed.status}` };

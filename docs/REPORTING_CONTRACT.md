@@ -30,20 +30,32 @@ The legacy transport writes the same documents straight to S3 at the paths below
 
 ## Discovery and tenant paths
 
+One rule for everything a tenant holds (MACLEOD-548):
+
+```text
+<kind>/<id>.json             the subject's own state
+<kind>/<id>/<source>.json    what one source contributes to it
+```
+
+`kind` is `issues` or `workflows`. `id` is the issue key or the workflow id. `source` is who wrote it. No prefix is special, so a new kind of subject needs no new reader and no new branch in the bundle route.
+
 ```text
 /data/index.json
 /data/tenants/<tenant>/team.json
 /data/tenants/<tenant>/actors/<actor>.json
 /data/tenants/<tenant>/issues/<ISSUE-KEY>.json
-/data/tenants/<tenant>/runtime/<ISSUE-KEY>/ci.json
-/data/tenants/<tenant>/runtime/<ISSUE-KEY>/audit-local.json
-/data/tenants/<tenant>/runtime/<ISSUE-KEY>/deploy.json
-/data/tenants/<tenant>/runtime/<ISSUE-KEY>/dev-test.json
-/data/tenants/<tenant>/runtime/<ISSUE-KEY>/audit-dev.json
-/data/tenants/<tenant>/runtime/<ISSUE-KEY>/security.json
-/data/tenants/<tenant>/runtime/<ISSUE-KEY>/tracker.json
-/data/tenants/<tenant>/runtime/<ISSUE-KEY>/pr.json
+/data/tenants/<tenant>/issues/<ISSUE-KEY>/ci.json
+/data/tenants/<tenant>/issues/<ISSUE-KEY>/audit-local.json
+/data/tenants/<tenant>/issues/<ISSUE-KEY>/deploy.json
+/data/tenants/<tenant>/issues/<ISSUE-KEY>/dev-test.json
+/data/tenants/<tenant>/issues/<ISSUE-KEY>/audit-dev.json
+/data/tenants/<tenant>/issues/<ISSUE-KEY>/security.json
+/data/tenants/<tenant>/issues/<ISSUE-KEY>/tracker.json
+/data/tenants/<tenant>/issues/<ISSUE-KEY>/pr.json
+/data/tenants/<tenant>/workflows/<WORKFLOW-ID>.json
 ```
+
+`runtime/<ISSUE-KEY>/<source>.json` is the old spelling of a contribution and is still read as the same thing. Everything published before this change keeps rendering, and an object moves to the new path when its next report rewrites it. `team.json` is the tenant's own state and has no id, so the rule leaves it alone without naming it.
 
 `<ISSUE-KEY>` is the canonical key: `DAEMON-142` for Jira, `ENG-42` for Linear, `daemon-core#123` (repo name plus number) for GitHub Issues.
 
@@ -64,6 +76,10 @@ It exists so the signed-out demo stops asking for the 79 sidecars that are not t
 - **Live tenants never use it.** No reporter writes one, no adapter generates one, and the service ignores it. It describes the checked-in fixtures and nothing else. A production tenant's sidecar list comes from the store listing behind `/bundle`, which is current by construction; an index file there would be a second source of truth that could only go stale.
 - **It is generated at data-edit time**, by `npm run data:index` (`scripts/runtime-index.mjs`), and a test compares the committed bytes against the files on disk so it cannot drift. There is no per-report regeneration anywhere.
 - **It is optional.** A tenant directory without one falls back to probing the slots `team.json` declares, so a hand-copied S3 tree still renders.
+
+A workflow document is read by the index as well as the bundle, so its
+`updatedAt` folds into the tenant watermark. Without that a run could advance
+every ticket's cycle and a polling dashboard would never see it move.
 
 ## Concurrency model
 
@@ -143,6 +159,35 @@ instead of asserting that a plugin is connected. Nothing else about the
 machine belongs in it: no hostname, no working directory, no user, no account,
 no path. `adapters/teamflow/schema.py`'s `REPORTER` table is the enforcement
 and drops anything else.
+
+### The workflow document
+
+`workflows/<id>.json` is the third document kind, beside the issue document
+and the runtime sidecar. A workflow is a pool of tickets and the plan for
+driving them through build, test, audit and status; the orchestrating skill
+owns it and rewrites it as the run advances, which is what makes the plan
+live on the board rather than in a session.
+
+It may carry:
+
+- `id` (`wf-` and hex) and `name` — the workflow is addressable, so a ticket the filter missed can be added to it by name
+- `status`, `createdAt`, `updatedAt`
+- `filter`: `tracker`, `project`, `state`, `label`, `order` — **what the order was turned into**
+- `scope.deploy` — whether deploying is in scope for this run
+- `tickets[]`: `key`, `rank`, `phase`, `state`, `cycle`, `addedBy`, `updatedAt`
+- `dependencies[]`: `from`, `on`, `reason`, `found` — which ticket waits on which, and whether planning or a team building found it
+- `phases[]`: `n`, `state`, `tickets[]`
+
+**The user's order does not travel.** The order is a prompt, and the rule
+above admits no exception for this one: it selects tickets on the machine and
+only the filter it was turned into is published. A reader of the dashboard
+learns that a workflow selected every open Linear ticket in priority order.
+They do not learn the sentence that asked for it.
+
+`reason` is the one piece of prose here. It is a short derived sentence
+saying why one ticket waits on another, capped exactly as `summary` is, and
+it never quotes code, a diff, a log line or a prompt. `adapters/teamflow/schema.py`'s
+`WORKFLOW` tables are the enforcement and drop anything else.
 
 Never persist prompts/transcripts, source contents/diffs, raw shell commands/tool output, secrets, issue descriptions/comments/attachments, or raw CI/test logs.
 

@@ -45,6 +45,9 @@ const USAGE = `teamflow \u2014 delivery reporting for TeamFlow
                                    name the ticket by hand, or stop; --local writes
                                    the binding inside the repository, for a worktree
   teamflow next [--dry-run]        take the top-priority open ticket and bind it
+  teamflow workflow create <name> | add <KEY> | show | status <s>
+                                   the pool of tickets a run works through;
+                                   \`teamflow workflow --help\` lists its flags
   teamflow sync                    publish the current state now
   teamflow doctor                  transport, account, credits, tracker MCP and connections
   teamflow trackers [list]         the issue trackers this org has connected
@@ -581,6 +584,10 @@ try {
     // because what it prints then is the workflow to run instead.
     const { main } = await import('./next.mjs');
     process.exit(await main(args, { cwd, config, info, bind }));
+  }
+  else if (command === 'workflow') {
+    const { main } = await import('./workflow.mjs');
+    process.exit(await main(args, { cwd, config, info }));
   }
   else if (command === 'unbind') unbind();
   else if (command === 'sync') await sync();

@@ -1431,7 +1431,16 @@ function queueOutbox(item) {
 // these would put a line of noise in dropped_fields on every report.
 // tenantId comes from the credential and slot from the envelope;
 // neither is the reporter's to assert.
-function serviceDocument(payload) {
+function serviceDocument(payload, kind) {
+  // A workflow is a different document with a different shape, and
+  // `sanitizePayload` is an issue report's allowlist: it is a flat set
+  // of key names, so it knows none of the workflow's fields, and it
+  // caps every array at fifty, which would quietly drop most of a
+  // backlog sweep's pool. The workflow's own allowlist is `published`
+  // in workflow.mjs, which is structural rather than flat -- a `reason`
+  // is allowed inside a dependency and nowhere else -- and the
+  // service's WORKFLOW tables are the second line as always.
+  if (kind === 'workflow') return payload;
   const clean = sanitizePayload(payload);
   delete clean.tenantId;
   delete clean.slot;
@@ -1601,7 +1610,7 @@ export async function flushOutbox(config, limit = 5) {
 // an issue, because it is a path segment the service checks.
 export async function sendReport(kind, slot, payload, config) {
   if (!credentialKind(config)) return { ok: false, skipped: true, reason: 'no service credential configured' };
-  const document = serviceDocument(payload);
+  const document = serviceDocument(payload, kind);
   const envelope = slot ? { kind, slot, payload: document } : { kind, payload: document };
   const endpoint = `${serviceUrl(config)}/v1/report`;
   const idempotencyKey = reportIdempotencyKey(kind, slot, document);
