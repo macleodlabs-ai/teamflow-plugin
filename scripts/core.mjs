@@ -493,6 +493,25 @@ export function repositoryRoot(cwd) {
   return root;
 }
 
+// Whether this repository root is a worktree rather than the checkout
+// git's own metadata lives in. A worktree's `.git` is a file pointing at
+// the main checkout's `.git/worktrees/<name>`, not a directory, and its
+// `--git-dir` and `--git-common-dir` differ for the same reason. Either
+// signal alone answers it; both are checked because a repository with no
+// `git` binary on PATH still has the file.
+export function isWorktree(cwd) {
+  const root = repositoryRoot(cwd);
+  let gitEntryIsFile = false;
+  try { gitEntryIsFile = fs.statSync(path.join(root, '.git')).isFile(); } catch {
+    // No `.git` entry at all — fall through to the git-dir comparison.
+  }
+  const gitDir = git(root, ['rev-parse', '--git-dir']);
+  const commonDir = git(root, ['rev-parse', '--git-common-dir']);
+  const dirsDiffer = gitDir.ok && commonDir.ok
+    && path.resolve(root, gitDir.stdout) !== path.resolve(root, commonDir.stdout);
+  return gitEntryIsFile || dirsDiffer;
+}
+
 export function gitInfo(cwd) {
   const branch = git(cwd, ['branch', '--show-current']).stdout || undefined;
   const remote = git(cwd, ['remote', 'get-url', 'origin']).stdout || undefined;

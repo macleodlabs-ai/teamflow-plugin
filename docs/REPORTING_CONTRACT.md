@@ -37,7 +37,7 @@ One rule for everything a tenant holds (MACLEOD-548):
 <kind>/<id>/<source>.json    what one source contributes to it
 ```
 
-`kind` is `issues` or `workflows`. `id` is the issue key or the workflow id. `source` is who wrote it. No prefix is special, so a new kind of subject needs no new reader and no new branch in the bundle route.
+`kind` is `issues`, `workflows` or `projects`. `id` is the issue key, the workflow id or the project id. `source` is who wrote it. No prefix is special, so a new kind of subject needs no new reader and no new branch in the bundle route.
 
 ```text
 /data/index.json
@@ -53,6 +53,7 @@ One rule for everything a tenant holds (MACLEOD-548):
 /data/tenants/<tenant>/issues/<ISSUE-KEY>/tracker.json
 /data/tenants/<tenant>/issues/<ISSUE-KEY>/pr.json
 /data/tenants/<tenant>/workflows/<WORKFLOW-ID>.json
+/data/tenants/<tenant>/projects/<PROJECT-ID>.json
 ```
 
 `runtime/<ISSUE-KEY>/<source>.json` is the old spelling of a contribution and is still read as the same thing. Everything published before this change keeps rendering, and an object moves to the new path when its next report rewrites it. `team.json` is the tenant's own state and has no id, so the rule leaves it alone without naming it.
@@ -216,6 +217,53 @@ They do not learn the sentence that asked for it.
 saying why one ticket waits on another, capped exactly as `summary` is, and
 it never quotes code, a diff, a log line or a prompt. `adapters/teamflow/schema.py`'s
 `WORKFLOW` tables are the enforcement and drop anything else.
+
+### The project document
+
+`projects/<id>.json` is the fourth document kind. A project is an
+organisation-level named set: some GitHub repositories, some Linear projects,
+some Jira projects. A ticket belongs to it when its repository is one of the
+project's repositories or its tracker project is one of its tracker projects,
+and the dashboard shows the active project and nothing else.
+
+**No reporter writes one.** `project` is deliberately not in
+`schema.KINDS` and `POST /v1/report` refuses it. A reporting credential sits
+on every developer's laptop, and one that could rewrite the organisation's
+project set could hide every ticket on the board from everybody. Projects are
+written by members, through routes:
+
+| Route | Who |
+| --- | --- |
+| `GET /v1/members/projects` | any member — which projects exist is navigation |
+| `POST /v1/members/projects` | owners and admins. The service mints the id |
+| `PUT /v1/members/projects/{id}` | owners and admins. Replaces the document whole |
+| `DELETE /v1/members/projects/{id}` | owners and admins. Removes the document and nothing else |
+
+It may carry:
+
+- `id` (`prj-` and 8–32 hex, a safe path segment) and `name` — capped exactly as a workflow name is
+- `repos[]`: `owner/repo` strings
+- `linear[]`: `{ id, name }` — the far end's project id and the name a person picked it by
+- `jira[]`: `{ key, name }`
+- `default` — the project a member lands on until they choose. **Exactly one** may hold it: creating or saving a default clears the previous one
+- `createdAt`, `updatedAt` — set by the service, not by the body
+
+Identifiers and display names, and nothing else. A project is filled in by a
+person in a dialog, which is exactly where a description, a README or a pasted
+note would arrive from, so the same allowlist drops them.
+`adapters/teamflow/schema.py`'s `PROJECT` tables and `validate_project` are the
+enforcement.
+
+Deleting a project deletes no ticket, no sidecar and no workflow. A project is
+a view.
+
+The bundle carries the documents under `documents.projects`, keyed by id, and
+the index lists their ids under `projects` — the same way workflows are
+carried, because `projects/<id>.json` is a subject document under the one path
+rule and needed no reader of its own. The bundle's `scopedProjects` is a
+different and narrower thing: every tracker connection's chosen scope,
+flattened, which the source pills filter *within* the active project. It was
+called `projects` until MACLEOD-562 gave that word one meaning.
 
 ### The `workflow` block on a report
 
