@@ -18,6 +18,7 @@ import os from 'node:os';
 import path from 'node:path';
 
 import { defaultServiceUrl, readJson, safeExec, serviceUrl, writeJson } from './core.mjs';
+import { BY_ID } from './tools.mjs';
 
 // Fixed and small on purpose: every one of these has to be registered
 // as a callback URL on the Cognito app client, so the range cannot
@@ -452,9 +453,31 @@ export async function login(config = {}, {
 // into a terminal.
 
 function deviceLabel() {
-  // What this machine will be called on the members page. A hostname
+  // What this computer will be called on the members page. A hostname
   // is the one name a person recognises without being told it.
   return String(os.hostname() || 'unnamed machine').slice(0, 64);
+}
+
+/**
+ * Which tool this is running in, for the page that asks (MACLEOD-604).
+ *
+ * The consent page's question is "did I start this?", and a hostname
+ * alone does not answer it: the same laptop runs several tools and
+ * `teamflow login` is the same command in every one of them. So the
+ * request says which, and the page reads the display name out of
+ * `tools.mjs` rather than out of a second list.
+ *
+ * Detected, never guessed. `CLAUDECODE` is set in a real Claude Code
+ * session and is the one marker confirmed by running in one; anything
+ * else comes from `--tool`, and an unset value is not a failure — the
+ * page falls back to naming the plugin alone, which is true whatever
+ * asked. Inventing markers for tools nobody has watched would put a
+ * wrong tool name on a security decision, which is worse than none.
+ */
+export function detectTool(env = process.env) {
+  if (env.TEAMFLOW_TOOL && BY_ID[env.TEAMFLOW_TOOL]) return env.TEAMFLOW_TOOL;
+  if (env.CLAUDECODE === '1' || env.CLAUDE_CODE_ENTRYPOINT) return 'claude-code';
+  return '';
 }
 
 const wait = (ms) => new Promise((resolve) => { setTimeout(resolve, ms); });
@@ -524,10 +547,10 @@ const DEVICE_REFUSALS = {
 };
 
 export async function deviceLogin(config = {}, {
-  notify = printLine, label = deviceLabel(), timeoutMs = LOGIN_TIMEOUT_MS,
-  sleep = wait, now = () => Date.now(),
+  notify = printLine, label = deviceLabel(), tool = detectTool(),
+  timeoutMs = LOGIN_TIMEOUT_MS, sleep = wait, now = () => Date.now(),
 } = {}) {
-  const started = await deviceCall(config, '/v1/auth/device', { label });
+  const started = await deviceCall(config, '/v1/auth/device', { label, client: tool });
   if (!started.ok) {
     return { ok: false, reason: `the service would not start a device sign-in: ${started.reason}` };
   }
@@ -537,7 +560,15 @@ export async function deviceLogin(config = {}, {
   }
   const url = verificationUrl(
     grant.verification_url_complete || grant.verification_url, config);
-  notify(`TeamFlow sign-in: open ${url} in a browser on ANY machine and enter the code ${grant.user_code}`);
+  // What the person is doing is connecting the plugin, not signing a
+  // machine in, and the two addresses are for two different people: the
+  // short one is typed on a phone, the long one is tapped (RFC 8628
+  // §3.3.1). Both are printed, because which is useful depends on where
+  // the browser is (MACLEOD-604).
+  const short = verificationUrl(grant.verification_url, config);
+  notify(`To connect the TeamFlow plugin, open ${short} in a browser on any`
+    + ` device and confirm the code ${grant.user_code}`);
+  if (url && url !== short) notify(`Or open this link, which carries the code: ${url}`);
 
   let interval = Math.max(1000, (Number(grant.interval) || 0) * 1000 || DEVICE_INTERVAL_MS);
   // Whichever runs out first: the caller's patience or the code's own

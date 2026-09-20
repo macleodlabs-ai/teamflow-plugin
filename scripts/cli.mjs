@@ -659,13 +659,18 @@ async function deviceLogin(because, before) {
   }
   const probe = await fetchAccount(config);
   const org = result.account || (probe.ok ? probe.account?.account : undefined);
-  print(`TeamFlow signed in${result.email ? ` as ${result.email}` : ''}${org ? `, org ${org}` : ''}, `
-    + `as device "${result.label}".\n`
+  // Syncing to TeamFlow, with the organisation as the board it lands
+  // on rather than as who is being told (MACLEOD-604). `report` stays
+  // the word for the mechanism everywhere else.
+  print(`TeamFlow plugin connected${result.email ? ` as ${result.email}` : ''}`
+    + `, syncing your work from "${result.label}".\n`
+    + `${org ? `Your work appears on the ${org} board.\n` : ''}`
     + replacedSession(before, { email: result.email, account: org })
     + `${await signedInLines()}\n`
-    + `Reporting uses a revocable device credential stored at `
-    + `${auth.sessionPath()}; /teamflow:logout revokes it here and at the service, and the `
-    + 'members page lists every machine signed in this way.');
+    + 'It stays connected on this computer until you sign it out: the '
+    + `credential is at ${auth.sessionPath()}, /teamflow:logout revokes it here `
+    + 'and at the service, and the members page lists every computer connected '
+    + 'this way.');
 }
 
 // `teamflow org`, and `teamflow org switch <id>`.

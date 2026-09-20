@@ -3,6 +3,27 @@
 What changed in each published version of the TeamFlow plugin, newest first.
 Only what a person using it would notice.
 
+## 0.3.17
+
+- **`teamflow login --device` now sends you to a page that asks one
+  question.** Before, the link went to the dashboard, which asked you to sign
+  in to a board you had not come for and then offered a code field with
+  nothing to compare it against. It now goes to `https://codercat.io/device`
+  — a short address you can type on a phone, with
+  `https://codercat.io/device?code=WXYZ-1234` for one tap — and that page
+  shows the code, names the tool and the computer that asked and when, and
+  offers Approve and Deny. Signing in happens inside it: you come back to the
+  same question with the code still on it, never to the board.
+- **The terminal prints both addresses**, because which one is useful depends
+  on where the browser is.
+- **The request now says which tool it came from**, so the page can say
+  "Claude Code on your-laptop" rather than naming a computer and leaving you
+  to guess what on it was asking. Claude Code is detected; anywhere else,
+  `TEAMFLOW_TOOL=<id>` names it, and with neither the page says "The TeamFlow
+  plugin on your-laptop", which is true whatever asked.
+- Links that older plugins print still work: `/app/#device?code=…` lands on
+  the new page with the code intact.
+
 ## 0.3.16
 
 - **The first command after updating may send a burst of reports, and each
