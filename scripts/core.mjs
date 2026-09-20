@@ -3783,9 +3783,15 @@ function serviceDocument(payload, kind) {
   return clean;
 }
 
-// The same stable hash the publish dedupe uses. A report whose content
-// has not changed is therefore the same request to the service, which
-// replays the first answer instead of charging a second credit.
+// A retry of the same report is the same request, so the service
+// replays its first answer instead of charging a second credit.
+//
+// Deliberately NOT `reportDigest`, which the publish deduplication uses
+// (MACLEOD-613). That one ignores `executions[].at` so an unchanged
+// ticket is not re-sent; this one must not, because the report that
+// does go out after four quiet minutes exists precisely to move the
+// ticket's report time, and a replayed answer would leave the board
+// drawing it as stale.
 export function reportIdempotencyKey(kind, slot, document) {
   const stable = { kind, slot: slot || null, document: { ...document, updatedAt: undefined } };
   return crypto.createHash('sha256').update(JSON.stringify(stable)).digest('hex');
@@ -3826,6 +3832,78 @@ export function retryDelayMs(attempts, { status, retryAfterMs } = {}) {
 function scheduleRetry(item, result) {
   const attempts = (item.attempts || 0) + 1;
   return { ...item, attempts, notBefore: Date.now() + retryDelayMs(attempts, result) };
+}
+
+/**
+ * A refusal the kit names by `reason_code`, said in the plugin's own
+ * words (MACLEOD-613, for MACLEOD-610).
+ *
+ * `reason_code` is the kit's own convention and the only name it uses:
+ * `errors.py`'s `Reject`, `flow.py`'s `rate_limited` /
+ * `insufficient_credits` / `wall_cap_exceeded`, `mcp_http.py`'s
+ * `bad_json` / `input_too_large`, and `abuse.py`'s `reporting_paused`
+ * all carry it. There is no field called `slug` anywhere in the kit —
+ * the first cut of this read one, which made this table dead code that
+ * nothing could notice, because the kit's own `message` is good enough
+ * that the fall-through still read well.
+ *
+ * The table exists so the sentence is the plugin's, in the plugin's
+ * vocabulary — the kit says "account", everything a TeamFlow user reads
+ * says "organisation" — and so it survives the service rewording its
+ * `message`. A code this table has never heard of falls through to that
+ * message, which is what every refusal did before.
+ */
+// Null-prototyped, because the key is the service's to choose
+// (MACLEOD-613 audit, finding 3; the same fix MACLEOD-605 made to
+// `BY_ID`). On a plain object `reason_code: "toString"` looks up
+// `Object.prototype.toString`, which is truthy, so `reason` becomes a
+// Function — and `JSON.stringify` drops a Function, so the reason
+// disappears from the state file and from `teamflow status` entirely.
+// That is the exact failure this whole path exists to remove.
+const REFUSAL_REASONS = Object.assign(Object.create(null), {
+  reporting_paused: 'reporting is paused for this organisation — contact support',
+});
+
+/**
+ * How much of the service's own words are worth keeping.
+ *
+ * `serviceUrl` is settable from a cloned repository's `.teamflow.json`,
+ * so `message` is attacker-reachable and the session state file is the
+ * target: the audit persisted 5,038 characters of it, with ESC and CR
+ * in the middle. `JSON.stringify` escapes the control characters on the
+ * way to a terminal, so this is not an injection — it is a state file
+ * somebody else decides the size and shape of, which is reason enough.
+ * A sentence a person can read is under two hundred characters.
+ */
+const REASON_MAX = 200;
+
+function readableReason(text) {
+  // C0 and C1, which is every escape, newline and carriage return.
+  const clean = String(text).replace(/[\u0000-\u001f\u007f-\u009f]+/g, ' ').trim();
+  // By code point, not by code unit: `slice` cuts an emoji that straddles
+  // the limit in half and stores the lone high surrogate, which is a
+  // broken string every reader of the state file then carries around.
+  return [...clean].slice(0, REASON_MAX).join('');
+}
+
+/**
+ * What the service said, in the shape the kit actually answers in.
+ *
+ * Every kit refusal is `{status, reason_code, message, billing}` — see
+ * `flow.py:252`, which builds it from `errors.py`'s `Reject`, and
+ * `abuse.py:141`. Read in one place so a new refusal is named wherever
+ * it arrives rather than only on the branch somebody remembered, and so
+ * the reason never degrades to an HTTP number while the service was
+ * telling us in words.
+ */
+function refusalOf(body, fallback) {
+  const code = typeof body?.reason_code === 'string' ? body.reason_code : undefined;
+  const named = code ? REFUSAL_REASONS[code] : undefined;
+  const said = typeof body?.message === 'string' ? readableReason(body.message) : undefined;
+  return {
+    reasonCode: code,
+    reason: named || said || fallback,
+  };
 }
 
 let paymentNoticeShown = false;
@@ -3974,23 +4052,31 @@ async function postEnvelope(endpoint, envelope, idempotencyKey, config, account 
   const status = response.status;
   if (status === 402) {
     notePaymentRequired(config, body);
-    return answer({ ok: false, retry: false, status, paymentRequired: true, reason: body?.message || 'account is out of credits' });
+    return answer({
+      ok: false, retry: false, status, paymentRequired: true,
+      ...refusalOf(body, 'account is out of credits'),
+    });
   }
   const retryAfterMs = parseRetryAfter(response.headers.get('retry-after'));
   if (status === 429) {
     // The only retryable 4xx. Nothing about the report is wrong; the
     // caller simply arrived too fast, and the same body posted later
     // is accepted.
-    return answer({ ok: false, retry: true, status, retryAfterMs, reason: body?.message || 'rate limited' });
+    return answer({ ok: false, retry: true, status, retryAfterMs, ...refusalOf(body, 'rate limited') });
   }
   if (status >= 500) {
-    return answer({ ok: false, retry: true, status, retryAfterMs, reason: body?.message || `service returned ${status}` });
+    return answer({ ok: false, retry: true, status, retryAfterMs, ...refusalOf(body, `service returned ${status}`) });
   }
   if (status >= 400) {
     // 400, 401, 403, 413. Re-posting the same body cannot change the
     // answer, and one refused report must never dam the outbox in
     // front of the good reports behind it.
-    return answer({ ok: false, retry: false, status, reason: body?.message || `service refused the report (${status})` });
+    return answer({
+      ok: false,
+      retry: false,
+      status,
+      ...refusalOf(body, `service refused the report (${status})`),
+    });
   }
   return answer({
     ok: true,
@@ -4403,9 +4489,115 @@ export async function putReport(relativePath, payload, config) {
   return { ok: true };
 }
 
-function payloadHash(payload) {
+/**
+ * What a report SAYS, with every field that only says WHEN removed
+ * (MACLEOD-613).
+ *
+ * This used to blank the top-level `updatedAt` and nothing else, which
+ * missed `executions[0].at` — the same value, copied one level down by
+ * `issuePayload`. So every report that had bumped `updatedAt` hashed
+ * differently from the one before it even when it said exactly the same
+ * thing, and the deduplication below never fired for any of them.
+ *
+ * This fix is worth about a fifth on its own, and the honest split
+ * matters because the rest is a judgement rather than a bug. Replaying
+ * this machine's own 2026-09-17..20 history: 13,099 reports under the
+ * shipped rule; 10,759 with this digest and the old 30s keep-alive, so
+ * **18%**; 5,879 with the keep-alive also raised to `KEEP_ALIVE_MS`, so
+ * **55%**. The other 37 points are the keep-alive, which is a trade
+ * against how promptly a quiet card refreshes — not a defect repaired.
+ *
+ * Only the clock is removed. A commit sha, a loop count, a PR check
+ * count and a piece of evidence are all news, and a report that carries
+ * new news is a report that must go.
+ */
+export function reportDigest(payload) {
   const stable = { ...payload, updatedAt: undefined };
+  if (Array.isArray(stable.executions)) {
+    stable.executions = stable.executions.map((one) => ({ ...one, at: undefined }));
+  }
   return crypto.createHash('sha256').update(JSON.stringify(stable)).digest('hex');
+}
+
+/**
+ * How long an unchanged ticket waits before it is restated (MACLEOD-613).
+ *
+ * The board's freshness bands are `live ≤5min, active ≤15min, stale
+ * ≤60min` (src/lib/freshness.ts), driven by report times, so
+ * suppressing no-ops without a keep-alive would draw a developer who is
+ * quietly editing as stale.
+ *
+ * This is permission to send, NOT a send: nothing here has a timer, so
+ * the report goes out at the first hook AFTER the keep-alive elapses,
+ * and the gap a reader of the board actually experiences is the
+ * keep-alive plus however long until the next tool call. Measured on
+ * the replayed history, counting real gaps between consecutive reports
+ * of the same actor (baseline under the shipped rule: 222 gaps over
+ * five minutes) — 240s: 304 gaps, +37%. 150s: 241, +8.6%. 90s: 232, and
+ * 1,000 more reports for it.
+ *
+ * MACLEOD-617 then refitted the bands to those measured gaps rather
+ * than shortening this, so 150s plus the measured p90 wait for the next
+ * hook (92s) lands inside `live` with a minute to spare: a developer at
+ * the keyboard reads `live` between transitions, which is what the
+ * colour is for. Off all three band edges, and deliberately not the 30s
+ * it used to be, which sat exactly on the `live` one of the day — a
+ * value on a band edge decides the band by a race, which is the
+ * flakiness the fixtures are already forbidden from reproducing. The
+ * inequality is asserted from both sides: plugin/tests/coalesce.test.mjs
+ * and src/lib/freshnessContract.test.ts.
+ */
+export const KEEP_ALIVE_MS = 150000;
+
+/**
+ * Whether this report goes out now (MACLEOD-613).
+ *
+ * Three answers and no timer. There is no timer because there is
+ * nothing to hold a report in: every hook is a node process that
+ * classifies one event and exits, and a debounce would need a state
+ * file, a flush and a way for `SessionEnd`'s 1.5s to drain it. None of
+ * that is needed, because a burst of edits does not change what the
+ * report says — `LOCAL_DEV / running / Implementing locally` from the
+ * first edit to the last — so the digest above already collapses the
+ * burst to its first report, and the turn's `Stop` sends the last state.
+ *
+ * Nothing a person is waiting for is ever held: a stage change, a gate
+ * verdict, rework, a new commit and a session or agent ending all change
+ * the digest and go immediately, and `force` covers `Stop`, `teamflow
+ * sync` and the pending-end flush.
+ */
+export function coalesce(state, payload, { force = false, now = Date.now(), config = {} } = {}) {
+  const hash = reportDigest(payload);
+  if (force) return { send: true, hash, reason: 'forced' };
+  // `heartbeatMs` keeps its name: it has always meant "restate an
+  // unchanged ticket no more often than this", and a repository that
+  // set it — or a test that set it to 0 — means the same thing by it.
+  const keepAlive = Number(config.heartbeatMs ?? KEEP_ALIVE_MS);
+  /*
+   * Refused is not delivered, and the two are stored as two
+   * (MACLEOD-613 audit, finding 1).
+   *
+   * A report the service read and said no to used to be written down as
+   * the last thing published, so the state was lost: the pause lifted
+   * and the five hooks that followed sent nothing, because the board's
+   * copy and this machine's record disagreed and only this machine's
+   * was consulted. `lastPublishHash` is now only ever what was
+   * accepted or safely queued.
+   *
+   * But 0.3.16's rule still holds — a refusal that cannot change its
+   * mind must not be re-posted on every hook — so the refusal is
+   * remembered separately, and held for the same beat as an unchanged
+   * ticket. It is retried when that beat comes round and whenever
+   * anything forces a publish, which is every `Stop`: a paused
+   * organisation therefore re-attempts about once a turn rather than
+   * once a tool call, and the moment the pause lifts the state lands.
+   */
+  if (state.lastRefusedHash === hash && now - (state.lastRefusedAt || 0) < keepAlive) {
+    return { send: false, hash, reason: 'refused' };
+  }
+  if (state.lastPublishHash !== hash) return { send: true, hash, reason: 'changed' };
+  if (now - (state.lastPublishedAt || 0) >= keepAlive) return { send: true, hash, reason: 'keep-alive' };
+  return { send: false, hash, reason: 'unchanged' };
 }
 
 export function aggregateActor(config, info) {
@@ -4470,12 +4662,8 @@ export async function publishState(state, config, info, { force = false, keepTen
   if (info.branch) state.reportedBranch = info.branch;
   state.serviceUrl = serviceUrl(config);
   const now = Date.now();
-  const hash = payloadHash(payload);
-  const same = state.lastPublishHash === hash;
-  const heartbeatMs = Number(config.heartbeatMs || 30000);
-  if (!force && same && now - (state.lastPublishedAt || 0) < heartbeatMs) {
-    return { ok: true, skipped: true, reason: 'Deduplicated' };
-  }
+  const { send, hash } = coalesce(state, payload, { force, now, config });
+  if (!send) return { ok: true, skipped: true, reason: 'Deduplicated' };
 
   const transport = transportOf(config);
   let issueResult;
@@ -4514,8 +4702,25 @@ export async function publishState(state, config, info, { force = false, keepTen
     actorResult = await putReport(tenantPath(config, `actors/${actorPayload.id}.json`), actorPayload, config);
   }
 
-  state.lastPublishHash = hash;
-  state.lastPublishedAt = now;
+  /*
+   * Only what the far end actually took (MACLEOD-613 audit, finding 1).
+   * `queued` counts: the envelope is on disk with its payload and the
+   * outbox owns it from there. A refusal and a `skipped` do not, and
+   * writing them down as published is how a ticket's state stops
+   * existing anywhere — the board never had it and this machine has
+   * stopped intending to send it.
+   */
+  if (issueResult.ok || issueResult.queued) {
+    state.lastPublishHash = hash;
+    state.lastPublishedAt = now;
+    state.lastRefusedHash = undefined;
+    state.lastRefusedAt = undefined;
+  } else if (!issueResult.skipped) {
+    // Read and refused. Remembered so it is not re-posted on every
+    // hook, and deliberately NOT as a publish.
+    state.lastRefusedHash = hash;
+    state.lastRefusedAt = now;
+  }
   state.lastTransport = transport;
   state.lastPublishResult = issueResult.ok
     ? 'ok'
@@ -4540,7 +4745,11 @@ export async function publishState(state, config, info, { force = false, keepTen
           // deliver is `queued`.
           : issueResult.skipped
             ? 'not sent: this machine has nothing to send it with; run /teamflow:login'
-            : 'failed';
+            // The service read the report and answered no (MACLEOD-613).
+            // Its reason is the only thing that says why the board has
+            // stopped moving, and the bare word `failed` has sent people
+            // to debug the dashboard for a paused account.
+            : issueResult.reason || 'failed';
   return { ok: Boolean(issueResult.ok && actorResult.ok), transport, issueResult, actorResult };
 }
 

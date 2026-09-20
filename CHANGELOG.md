@@ -3,6 +3,47 @@
 What changed in each published version of the TeamFlow plugin, newest first.
 Only what a person using it would notice.
 
+## 0.3.20
+
+- **A ticket's state is now sent when it changes, rather than on every hook
+  that fires.** Replaying four days of this project's own work through the
+  reporter: **13,099 reports before, 5,879 after — 55% fewer.** Two changes
+  make that up, and they are not the same kind of thing:
+  - **A bug, worth 18 points of it.** Deduplication had been in the plugin
+    all along and never once fired, because it ignored the timestamp on the
+    outside of a report and missed the copy of it inside. So a run of forty
+    edits — all of them "Implementing locally" — was forty reports and forty
+    credits. It is now one. On its own this takes 13,099 to 10,759.
+  - **A judgement, worth the other 37.** An unchanged ticket used to be
+    restated every thirty seconds and is now restated every two and a half
+    minutes, which takes 10,759 to 5,879. That is a trade, not a repair: see
+    the next entry.
+  Nothing you watch for is held back either way. A stage change, a test or
+  audit verdict, rework, a new commit, the end of a turn and the end of a
+  session or an agent all go immediately, exactly as before.
+- **A quiet session still shows as working, and the trade is small.** Two and
+  a half minutes is half the width of the board's "active" band, because the
+  restatement goes out on the next hook after the interval rather than on a
+  timer — so the gap you actually see is the interval plus however long until
+  the next tool call. Measured over the same four days, gaps longer than five
+  minutes go from 222 to 241. (At four minutes they went to 304, which is why
+  they are not four minutes.) A session that has genuinely stopped doing
+  anything still goes quiet, because it always did.
+- **`teamflow status` and `teamflow doctor` now say *why* the service turned
+  a report down.** They used to print the single word `failed`, which has
+  sent people to debug the dashboard for a problem that was not there. An
+  organisation whose reporting has been paused now reads "reporting is paused
+  for this organisation — contact support". A refused report is still never
+  queued and never holds up the reports behind it.
+- **A report the service turns down is no longer forgotten.** It used to be
+  written down as though it had been delivered, so when the reason went away
+  — a pause lifted, a key fixed — the state that had been refused was never
+  sent: the board had never had it and your machine had stopped meaning to
+  send it. It is now remembered as refused, which is a different thing: it is
+  not re-sent on every tool call, and it does go out at the end of the next
+  turn. The same applies to a machine with no credential, which no longer
+  finishes signing in believing it has already reported everything it holds.
+
 ## 0.3.19
 
 - **Security: a repository you opened could take your TeamFlow credential.
