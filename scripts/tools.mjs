@@ -326,7 +326,34 @@ export const TOOL_CAPABILITIES = [
   },
 ];
 
-export const BY_ID = Object.fromEntries(TOOL_CAPABILITIES.map((tool) => [tool.id, tool]));
+/**
+ * The table by id, on a null prototype, which is not a style choice.
+ *
+ * This table is indexed by strings that arrive from OUTSIDE the
+ * process: `TEAMFLOW_TOOL` out of the environment, and the `client`
+ * field of a device request, which the service takes as forty raw
+ * characters and echoes back to the consent page without an allowlist.
+ * Every one of its seven readers asks it the same way — `BY_ID[x]`,
+ * then a truthiness test or `?.` — so with `Object.prototype` still
+ * attached, `constructor`, `toString`, `valueOf`, `hasOwnProperty`,
+ * `isPrototypeOf` and `__proto__` all answered something. That is how
+ * `TEAMFLOW_TOOL=constructor` put the word "Object" on the screen
+ * where a person grants a credential to a machine (MACLEOD-605): the
+ * lookup that exists to reject unknown ids was accepting six of them.
+ *
+ * `Object.create(null)` is the fix rather than `Object.hasOwn` at the
+ * call sites, because the property belongs to the table and not to
+ * whoever reads it: there are seven readers here and in the dashboard,
+ * which imports this same file, and a guard added at two of them
+ * leaves five. A table asked about keys it does not have must say no.
+ *
+ * Spreading, `Object.keys` and plain indexing all behave unchanged; it
+ * is only the inherited names that stop answering.
+ */
+export const BY_ID = Object.assign(
+  Object.create(null),
+  Object.fromEntries(TOOL_CAPABILITIES.map((tool) => [tool.id, tool])),
+);
 
 export const AUTOMATION_LEVELS = ['hooks', 'git-hooks', 'rules'];
 

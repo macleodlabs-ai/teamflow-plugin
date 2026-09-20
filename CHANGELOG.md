@@ -3,6 +3,42 @@
 What changed in each published version of the TeamFlow plugin, newest first.
 Only what a person using it would notice.
 
+## 0.3.18
+
+- **`teamflow tidy` no longer says it is closing issues in your tracker when
+  it is not.** It used to print "Closing in the tracker: …" with every ticket
+  it was about to publish a card for, whatever your tracker said and whether
+  or not write-back was switched on — so on an organisation with write-back
+  off it named 37 issues it could not touch, and named issues that had been
+  Done for weeks. It now reads your tracker settings and each issue's own
+  state first: issues the tracker has already closed are not listed, with
+  write-back off it says "cards only … nothing moves in linear" and where to
+  turn it on, and where write-back is on it says it is *asking* the tracker
+  to close them, because whether the request succeeds is the service's
+  answer and not something the plugin can promise. `--dry-run` prints the
+  same, which is where you decide whether to spend the credits.
+- **The CLI no longer says your work is "reported to" your organisation.**
+  It syncs to TeamFlow, and the organisation is the board it is filed under
+  — not somebody being told about you. `teamflow org` now says "Syncing to
+  TeamFlow under Acme Delivery", `org switch` says "This machine now syncs
+  to TeamFlow under …", installing hooks says "syncs to TeamFlow under org
+  …, project …", and the refusal you get when a ticket is bound under
+  another organisation reads the same way. One phrasing everywhere. Nothing
+  about what is sent has changed, and a report is still called a report.
+- **The consent page now also names Cursor, Windsurf, Zed and Gemini CLI**,
+  where before it named only Claude Code. Claude Code running in another
+  editor's terminal is still "Claude Code": the tool driving the plugin is
+  named ahead of the editor the terminal happens to belong to, so you are not
+  shown Cursor for work Claude Code is doing. The name is a convenience, not
+  a proof — it is what the asking machine said about itself. The code on the
+  page is the thing to check, and it is why the page shows it to you.
+- **Where a tool cannot be told apart from the editor around it, the page
+  still says "The TeamFlow plugin on your-laptop" rather than guessing.**
+  That covers VS Code with GitHub Copilot, JetBrains Junie, Cline and Codex
+  CLI, none of which leave anything behind that means only them. Set
+  `TEAMFLOW_TOOL=<id>` before `teamflow login` to name one of those yourself;
+  an id the plugin does not recognise is ignored rather than shown.
+
 ## 0.3.17
 
 - **`teamflow login --device` now sends you to a page that asks one

@@ -458,26 +458,243 @@ function deviceLabel() {
   return String(os.hostname() || 'unnamed machine').slice(0, 64);
 }
 
+// --- which tool is asking (MACLEOD-604, MACLEOD-605) -----------------
+//
+// The consent page's question is "did I start this?", and a hostname
+// alone does not answer it: the same laptop runs several tools and
+// `teamflow login` is the same command in every one of them. So the
+// request says which, and the page reads the display name out of
+// `tools.mjs` rather than out of a second list.
+//
+// TWO DIFFERENT QUESTIONS, AND THE ORDER BETWEEN THEM IS THE POINT.
+// The session that wrote this carried, at the same moment,
+// `CLAUDE_CODE_ENTRYPOINT=cli` and a `GIT_ASKPASS` inside
+// `/Applications/Cursor.app`. Both facts were true and they were not
+// the same fact: Claude Code was driving the plugin, and Cursor was
+// the editor whose terminal it was running in. A sweep for editor
+// markers would have put "Cursor" on the one screen where a person
+// grants a credential to a machine, for work Claude Code was doing.
+// That is not a cosmetic slip; a consent screen that names the wrong
+// asker is a phishing primitive. So the two questions are asked by two
+// functions with two names, and `detectTool` puts them in order.
+//
+// THE BAR FOR ADDING A MARKER: it must be able to mean only the tool
+// it names. A marker that names a family while the id names a member
+// of it is refused, however convenient — `TERM_PROGRAM=vscode` is set
+// by every VS Code fork and says nothing about GitHub Copilot, and
+// `TERMINAL_EMULATOR=JetBrains-JediTerm` is set by every JetBrains IDE
+// and says nothing about Junie. Answering `copilot` or `jetbrains`
+// from those would assert an agent nobody saw. They decline instead.
+//
+// A marker is safe to add, even for a tool nobody here has run, when
+// it is ANCHORED — when the thing being matched is one only that tool
+// puts there, so the check can fail by being absent but not by being
+// wrong, and absence falls through to the honest fallback. The word in
+// a path is not an anchor and the first version of this learnt it the
+// expensive way; see `forkInAskpassPath`. A bundle identifier, a
+// `TERM_PROGRAM` a vendor sets to its own name, and a path ending in a
+// specific extension's own dist directory are anchors.
+//
+// Where each marker below was confirmed is recorded beside it.
+
 /**
- * Which tool this is running in, for the page that asks (MACLEOD-604).
+ * Editors whose installation directory is named after themselves and
+ * whose record in `tools.mjs` is the editor rather than an agent
+ * inside it — so the directory name and the tool id are the same word.
  *
- * The consent page's question is "did I start this?", and a hostname
- * alone does not answer it: the same laptop runs several tools and
- * `teamflow login` is the same command in every one of them. So the
- * request says which, and the page reads the display name out of
- * `tools.mjs` rather than out of a second list.
+ * Deliberately not `copilot`: its record is "VS Code with GitHub
+ * Copilot", and a `Visual Studio Code` install path proves the editor
+ * and not the extension.
+ */
+const FORK_EDITORS = ['cursor', 'windsurf'];
+
+/**
+ * Bundle identifiers that name an editor, for macOS, where
+ * `__CFBundleIdentifier` is inherited by everything the app launches.
  *
- * Detected, never guessed. `CLAUDECODE` is set in a real Claude Code
- * session and is the one marker confirmed by running in one; anything
- * else comes from `--tool`, and an unset value is not a failure — the
- * page falls back to naming the plugin alone, which is true whatever
- * asked. Inventing markers for tools nobody has watched would put a
- * wrong tool name on a security decision, which is worse than none.
+ * Only Cursor is here because only Cursor could be read off a machine:
+ * it ships through ToDesktop, so its identifier names ToDesktop rather
+ * than Cursor and could not have been guessed. Confirmed twice on
+ * 2026-09-20 — present in a live session's environment, and read back
+ * from `/Applications/Cursor.app/Contents/Info.plist`.
+ */
+const HOST_BUNDLE_IDS = {
+  'com.todesktop.230313mzl4w4u92': 'cursor',
+};
+
+/**
+ * The path VS Code's git extension ships its askpass helpers at, which
+ * is the anchor this whole check hangs on.
+ *
+ * Confirmed by listing the directory in two editors installed on one
+ * machine on 2026-09-20 — `/Applications/Cursor.app` and
+ * `/Applications/Visual Studio Code.app` both ship `askpass.sh`,
+ * `askpass-empty.sh` and `askpass-main.js` under
+ * `Contents/Resources/app/extensions/git/dist/` — so the shape is
+ * first-hand for two editors rather than inferred from one.
+ */
+// No `.bat` arm: the extension has no platform branch. Its shipped
+// `git/dist/main.js` names `askpass.sh`, `askpass-empty.sh` and
+// `askpass-main.js` and nothing else, and neither editor installed
+// here ships a `.bat` at all — so matching one would be guarding a
+// case that does not exist, which is how a fictional test gets
+// written (MACLEOD-605 audit).
+const ASKPASS_TAIL = /[/\\]resources[/\\]app[/\\]extensions[/\\]git[/\\]dist[/\\]askpass[\w-]*\.(sh|js)$/i;
+
+/**
+ * Which VS Code fork an askpass path belongs to, or nothing.
+ *
+ * VS Code's git extension exports a path inside its own installation,
+ * and every fork inherits that extension unchanged — which is why the
+ * path names the fork when `TERM_PROGRAM` cannot, being `vscode` in
+ * all of them.
+ *
+ * ANCHORED ON THE EXTENSION'S OWN FILE, NEVER ON THE WORD. The first
+ * version of this scanned every segment for `cursor` or `windsurf`,
+ * and a review found what that costs: `GIT_ASKPASS` set to
+ * `/Users/cursor/bin/my-askpass.sh` — a person whose home directory is
+ * named `cursor`, using a custom askpass with no editor involved at
+ * all — was told "Cursor is asking" on the screen where they grant a
+ * credential. `/home/dev/windsurf/scripts/askpass.sh` and
+ * `/usr/local/bin/cursor-askpass` did the same. So the tail above has
+ * to match first, and only then is the installation directory read:
+ * the last segment before `resources/app`, stepping over macOS's
+ * `Contents`, which leaves the bundle's own name last in every layout.
+ *
+ * This is the version that can only be right or silent, and the anchor
+ * is why. An unanchored word can be anybody's directory; a path ending
+ * in this extension's own dist directory belongs to a VS Code fork or
+ * to nothing. The trade is a false negative where the fix is a false
+ * positive: a layout that puts the extension somewhere else declines.
+ * Verified here are the two macOS bundles above; assumed from VS
+ * Code's standard packaging are Linux (`/usr/share/<name>/resources/
+ * app/…`) and Windows (`…\<name>\resources\app\…`). Known to decline:
+ * a remote or WSL session, where `GIT_ASKPASS` points into
+ * `~/.vscode-server/bin/<commit>/extensions/…` with no `resources/app`
+ * in it. That decline is correct, but not for the reason it first
+ * looks: WSL and a devcontainer are the same seat as the terminal, so
+ * "the editor is elsewhere" is false for two of the three. The honest
+ * reason is narrower — a server install carries no install directory
+ * to read a name out of, so there is nothing to answer with.
+ *
+ * Windsurf is a fork of the same editor and so inherits the same
+ * extension; that it installs as `Windsurf` has not been watched here,
+ * which costs nothing, because a fork this does not recognise simply
+ * declines.
+ */
+function forkInAskpassPath(given) {
+  if (!given) return '';
+  const askpass = String(given);
+  const tail = ASKPASS_TAIL.exec(askpass);
+  if (!tail) return '';
+  const segments = askpass.slice(0, tail.index).split(/[/\\]/).filter(Boolean);
+  let last = segments.pop();
+  if (last && last.toLowerCase() === 'contents') last = segments.pop();
+  const name = String(last || '').toLowerCase().replace(/\.app$/, '');
+  return FORK_EDITORS.includes(name) ? name : '';
+}
+
+/**
+ * 1. What a person said, which outranks anything inferred.
+ *
+ * Validated against the table all the same. The consent page renders
+ * nothing for an id it does not know and the service refuses to echo
+ * an arbitrary client string, so an unrecognised value is dropped here
+ * rather than passed on — ignored, never echoed. Dropped and not
+ * fatal: detection carries on below, because a typo in a variable is
+ * no reason to stop naming the tool that is demonstrably running.
+ */
+function toolNamedByHand(env) {
+  const named = env.TEAMFLOW_TOOL;
+  return named && BY_ID[named] ? named : '';
+}
+
+/**
+ * 2. The tool actually driving the plugin.
+ *
+ * Every tool other than these is told to the plugin rather than
+ * guessed at by it: `teamflow hook --for <tool>` names it on the hook
+ * path (`hook-cli.mjs`). That is not available here — `teamflow login`
+ * is a person at a terminal, in a process no hook started — and it is
+ * deliberately not remembered from a previous hook run; see the note
+ * under `detectTool`.
+ */
+function drivingTool(env) {
+  // Claude Code. Confirmed in a live session in this repository on
+  // 2026-09-20: `CLAUDECODE=1` and `CLAUDE_CODE_ENTRYPOINT=cli` were
+  // both present. Either alone answers, so a future entrypoint that
+  // sets only one still names itself.
+  if (env.CLAUDECODE === '1' || env.CLAUDE_CODE_ENTRYPOINT) return 'claude-code';
+  // Gemini CLI. Confirmed against the vendor's own shell-tool
+  // reference, which sets it for precisely this purpose: "When
+  // run_shell_command executes a command, it sets the GEMINI_CLI=1
+  // environment variable in the subprocess's environment. This allows
+  // scripts or tools to detect if they are being run from within the
+  // Gemini CLI." Read 2026-09-20 at
+  // google-gemini.github.io/gemini-cli/docs/tools/shell.html.
+  //
+  // The documented value, not merely a set variable. Bare truthiness
+  // made `GEMINI_CLI=0` answer "Gemini CLI" while `CLAUDECODE=0` above
+  // answered nothing — two conventions in adjacent lines, and the one
+  // that reads a disabling value as an enabling one is the wrong one
+  // to keep on a page that names who is asking for a credential.
+  if (env.GEMINI_CLI === '1') return 'gemini';
+  return '';
+}
+
+/**
+ * 3. The editor whose terminal this is, which is a weaker claim than
+ * the one above and is only reached when nothing above answered.
+ */
+function hostEditor(env) {
+  const byBundle = HOST_BUNDLE_IDS[env.__CFBundleIdentifier];
+  if (byBundle) return byBundle;
+  // Zed, which names itself here rather than inheriting `vscode`.
+  // zed-industries/zed#4571 asked for it and was closed by #14213, and
+  // #21951 is a report of it going MISSING when Zed is launched from a
+  // dock or launcher — which only makes sense if it is normally set.
+  // Secondary evidence rather than a session watched here; the failure
+  // it can produce is silence.
+  if (env.TERM_PROGRAM === 'zed') return 'zed';
+  // `…_MAIN` and not `…_NODE`, which the first version read by
+  // mistake: in this session's own environment `VSCODE_GIT_ASKPASS_NODE`
+  // is `/Applications/Cursor.app/Contents/Frameworks/Cursor Helper
+  // (Plugin).app/…`, the Electron helper binary, which is nowhere near
+  // the extension and can never satisfy the anchor. `…_MAIN` is the
+  // one that points at `dist/askpass-main.js`. The extension exports
+  // all three together, so nothing is lost by dropping `…_NODE`.
+  return forkInAskpassPath(env.VSCODE_GIT_ASKPASS_MAIN)
+    || forkInAskpassPath(env.GIT_ASKPASS);
+}
+
+/**
+ * Which tool this is running in, as an id `tools.mjs` knows, or ''.
+ *
+ * The precedence, in one line, weakest last. An unset answer is not a
+ * failure: the page falls back to naming the plugin alone, which is
+ * true whatever asked.
+ *
+ * NOT REMEMBERED ACROSS SESSIONS, and that was a judgement rather than
+ * an omission (MACLEOD-605). `--for <tool>` is a fact the plugin is
+ * handed, so writing it into the data directory would let a later
+ * `login` in the same repository name Cline or Codex CLI, which no
+ * environment marker can. It is not worth it. Such a note is only ever
+ * consulted when the environment says nothing — which is exactly the
+ * bare-terminal CLI case where two of these tools are
+ * indistinguishable from each other, so a repository used from Codex
+ * CLI and then from Gemini CLI would be named wrongly by the note in
+ * the one situation the note exists for. A host-editor change
+ * (`cursor` then `windsurf`) could be caught by comparing the
+ * environment then against the environment now, but that same guard
+ * cannot see two CLIs apart, and MACLEOD-583's rule keeps what is
+ * written to the data directory readable by older versions, so a wrong
+ * note is durable. Meanwhile the person typing `teamflow login` has
+ * `TEAMFLOW_TOOL` above, which is a statement rather than a guess. A
+ * remembered guess that is wrong occasionally is worse here than the
+ * fallback, which is never wrong.
  */
 export function detectTool(env = process.env) {
-  if (env.TEAMFLOW_TOOL && BY_ID[env.TEAMFLOW_TOOL]) return env.TEAMFLOW_TOOL;
-  if (env.CLAUDECODE === '1' || env.CLAUDE_CODE_ENTRYPOINT) return 'claude-code';
-  return '';
+  return toolNamedByHand(env) || drivingTool(env) || hostEditor(env) || '';
 }
 
 const wait = (ms) => new Promise((resolve) => { setTimeout(resolve, ms); });

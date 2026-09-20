@@ -22,7 +22,7 @@ When the browser cannot be opened — no display, no browser installed, or `--no
 
 If the user says their browser is on a different machine from the one this is running on, run `npx -y github:macleodlabs-ai/teamflow-plugin login --device`. That is the only path that works when the terminal and the browser are not on the same machine, because the ordinary sign-in redirects to `127.0.0.1`.
 
-A device sign-in stores a revocable credential for this machine rather than a personal session. `/teamflow:logout` revokes it at the service, and the user can revoke it from the members page. Which organisation it reports to is chosen in the browser, so `--org` does nothing on a device sign-in.
+A device sign-in stores a revocable credential for this machine rather than a personal session. `/teamflow:logout` revokes it at the service, and the user can revoke it from the members page. Which organisation it syncs under is chosen in the browser, so `--org` does nothing on a device sign-in.
 
 This is the whole of TeamFlow onboarding. Reporting then uses a one-hour access token refreshed in the background, and only a revocable refresh token is stored on this machine.
 

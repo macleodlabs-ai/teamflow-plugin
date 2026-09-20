@@ -378,3 +378,74 @@ export function cardLine(key, card, tracker, writeBack = {}) {
     + 'holds no credential it can write with (a Jira connection and a hand-pasted GitHub '
     + 'webhook never do). Move it yourself';
 }
+
+/**
+ * `cardLine`'s honesty, for a whole pass at once (MACLEOD-603).
+ *
+ * The pass-level sentence used to read "Closing in the tracker: <37
+ * keys>" off the stage of the card and nothing else — the one fact
+ * that says nothing about any tracker. On the organisation it was
+ * found on, write-back was off and all 37 were already Done in Linear:
+ * nothing was closed, nothing could have been, and the customer who
+ * WANTS those issues closed is told they are being closed when they
+ * are not.
+ *
+ * The distinction is drawn from what this side can actually read, and
+ * from nothing else. Two documents answer: the key's `tracker.json`
+ * sidecar says whether the tracker has already decided, and
+ * `settings/trackers.json` says whether write-back is switched on.
+ * Neither says the issue WILL move — whether the connection holds a
+ * credential it can write with is the service's to know, and is
+ * exactly `cardLine`'s last answer — so the line that goes out with
+ * write-back on says what TeamFlow is ASKING FOR, never what it
+ * predicts will result.
+ *
+ * `asking` is `{ key, tracker }` for every card at a trigger stage.
+ * Pure, so every branch of it is a test rather than a live tenant.
+ */
+export function trackerAskLines(asking = [], writeBack = {}, { dryRun = false } = {}) {
+  const buckets = new Map();
+  const bucket = (kind, where, key) => {
+    const id = `${kind}\u0000${where}`;
+    if (!buckets.has(id)) buckets.set(id, { kind, where, keys: [] });
+    buckets.get(id).keys.push(key);
+  };
+  for (const { key, tracker } of asking) {
+    // Not read back: this side does not know, so it does not say.
+    if (!tracker?.known) { bucket('unread', 'the tracker', key); continue; }
+    /*
+     * Already decided there, or never mentioned there. Either way this
+     * key is not something about to be closed in a tracker, so it is
+     * not named as though it were — which is the whole of the incident:
+     * 35 of the 37 were in this branch.
+     */
+    if (!tracker.connected || FINISHED.has(tracker.event)) continue;
+    const where = tracker.provider || 'the tracker';
+    if (!writeBack.known) { bucket('unset', where, key); continue; }
+    const settings = (writeBack.settings || {})[tracker.provider] || {};
+    bucket(settings.transitions ? 'ask' : 'off', where, key);
+  }
+  const order = ['ask', 'off', 'unset', 'unread'];
+  return [...buckets.values()]
+    .sort((a, b) => order.indexOf(a.kind) - order.indexOf(b.kind))
+    .map(({ kind, where, keys }) => {
+      const many = `${keys.length} ticket${keys.length === 1 ? '' : 's'}`;
+      if (kind === 'ask') {
+        // Named, because these are real issues in somebody's Linear.
+        return `${dryRun ? 'About to ask' : 'Asking'} ${where} to close: ${keys.join(', ')}.`;
+      }
+      if (kind === 'off') {
+        // Not named: the per-repair lines below already list them, and
+        // nothing is happening to them in the tracker to list them for.
+        return `Cards only for ${many}: write-back is off for this organisation, so nothing `
+          + `moves in ${where}. Turn it on in Organisation settings, or move them yourself.`;
+      }
+      if (kind === 'unset') {
+        return `${many} at a write-back stage, and the tracker settings could not be read just `
+          + `now, so whether TeamFlow will ask ${where} to move them is unknown. Try again, or `
+          + 'check Organisation settings.';
+      }
+      return `${many} whose tracker could not be read just now, so what TeamFlow will ask of it `
+        + 'is unknown. Try again, or check them yourself.';
+    });
+}

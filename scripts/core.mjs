@@ -774,9 +774,9 @@ export function refusalLine(refusal) {
     : refusal.unreadable
       ? `${unstamped}, and nothing here can read the data directory to see whose it is`
       : `${unstamped}, and this machine holds work for ${refusal.others.map(scopeName).join(', ')} as well`;
-  return `Nothing is reported for ${refusal.key}: ${because}, and this session reports to `
-    + `${scopeName(refusal.account)}. Run \`teamflow work-on ${refusal.key}\` to bind it here, `
-    + 'or `teamflow org switch` to report as the organisation it belongs to.';
+  return `Nothing is synced for ${refusal.key}: ${because}, and this session syncs to TeamFlow `
+    + `under ${scopeName(refusal.account)}. Run \`teamflow work-on ${refusal.key}\` to bind it `
+    + 'here, or `teamflow org switch` to sync under the organisation it belongs to.';
 }
 
 // --- the workflows this machine knows about (MACLEOD-540) -----------

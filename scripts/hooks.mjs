@@ -676,7 +676,7 @@ export async function credentialNotice({ root = process.cwd(), config } = {}) {
     org ? `org ${org}` : 'the organisation this credential belongs to',
     `project ${project.line}`,
   ].join(', ');
-  const signIn = `signed in: ${repository || 'this repository'} reports to ${where}`;
+  const signIn = `signed in: ${repository || 'this repository'} syncs to TeamFlow under ${where}`;
   return { signIn, block: `\nTeamFlow: ${signIn}. \`teamflow status\` confirms it.\n` };
 }
 

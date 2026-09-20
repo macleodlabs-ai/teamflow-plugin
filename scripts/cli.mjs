@@ -53,7 +53,7 @@ const USAGE = `teamflow \u2014 delivery reporting for TeamFlow
 
   teamflow login [--org <id>] [--no-browser] [--device]  sign in once, naming an org if asked for one
   teamflow logout                  remove the session
-  teamflow org [switch <id>]       which organisation this session reports to
+  teamflow org [switch <id>]       which organisation this session syncs under
   teamflow status                  who is signed in, what is bound, what was sent
   teamflow bind <issue> [--local] | unbind
                                    name the ticket by hand, or stop; --local writes
@@ -589,7 +589,7 @@ async function login() {
   if (result.ambiguous) {
     throw new Error('TeamFlow signed you in, but that address holds a seat on more than one organisation:\n'
       + `${auth.organisationLines(result.accounts)}\n`
-      + 'Run `teamflow login --org <id>` with the one to report to.');
+      + 'Run `teamflow login --org <id>` with the one to sync under.');
   }
   if (!result.ok) {
     // The URL is not repeated when it was already printed while the
@@ -687,7 +687,7 @@ async function org() {
     const moved = await auth.switchOrg(config, token.token, target);
     if (!moved.ok) throw new Error(`TeamFlow could not switch to ${target}: ${moved.reason}`);
     auth.rememberOrg(moved.account, moved.name);
-    print(`TeamFlow now reports to ${moved.name || moved.account}. `
+    print(`This machine now syncs to TeamFlow under ${moved.name || moved.account}. `
       + 'Reports from this machine are credited to that organisation from now on.');
     return;
   }
@@ -696,7 +696,7 @@ async function org() {
   const me = await auth.listOrgs(config, token.token);
   if (!me.ok) throw new Error(`TeamFlow could not read your organisation: ${me.reason}`);
   const others = (me.accounts || []).filter((entry) => entry.id !== me.account);
-  print(`Reporting to ${me.name || me.account} [${me.account}]`
+  print(`Syncing to TeamFlow under ${me.name || me.account} [${me.account}]`
     + `${[me.role, me.plan].filter(Boolean).join(', ') ? ` \u2014 ${[me.role, me.plan].filter(Boolean).join(', ')}` : ''}\n`
     + (others.length
       ? `You also hold a seat on:\n${auth.organisationLines(others)}\n`
@@ -860,8 +860,10 @@ try {
       deep: true,
       limit: FULL,
       // Said before anything is paid, because these are real issues in
-      // somebody's Linear and not just cards on a board.
-      announce: (keys) => print(`Closing in the tracker: ${keys.join(', ')}.`),
+      // somebody's Linear and not just cards on a board. The words are
+      // built from what the tracker and the settings actually say
+      // (MACLEOD-603), so this end only prints them.
+      announce: (lines) => { for (const line of lines) print(line); },
     })));
   }
   else if (command === 'doctor') await doctor();

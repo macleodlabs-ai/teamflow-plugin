@@ -775,7 +775,7 @@ export async function main(args, {
       dryRun: rest.includes('--dry-run'),
       deep: true,
       limit: FULL,
-      announce: (keys) => print(`Closing in the tracker: ${keys.join(', ')}.`),
+      announce: (lines) => { for (const line of lines) print(line); },
     });
     print(renderPass(pass));
     return 0;

@@ -223,10 +223,16 @@ teamflow workflow reconcile             # confirm: expect "Nothing to reconcile"
 
 **Always the dry run first.** It changes nothing and it prints two things you
 need before you spend anything: how many reports the pass will send (one
-credit each — on a bad morning that has been 161) and, separately,
-`about to close in the tracker: …`, which names the real issues in somebody's
-Linear that the pass will ask the service to close. Read that line. If a key
-on it should not be closed, fix the run first.
+credit each — on a bad morning that has been 161) and, separately, one line
+per tracker saying what the pass will ask of it. `About to ask linear to
+close: …` names the real issues in somebody's Linear it will ask the service
+to close, and names only the ones that tracker has not already closed. Read
+that line. If a key on it should not be closed, fix the run first.
+
+`Cards only … write-back is off for this organisation` means the opposite:
+the cards move on the board and nothing at all moves in the tracker. Do not
+read it as "closed"; the issues still have to be moved by whoever holds them,
+or write-back turned on in Organisation settings (MACLEOD-603).
 
 The repair pass tags every line `repaired`, `owed` or `refused`, so a pass
 that repaired everything still prints a non-empty list. That is why the

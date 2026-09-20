@@ -1,6 +1,6 @@
 ---
 name: org
-description: Show which TeamFlow organisation this machine reports to, and switch to another one the user holds a seat on.
+description: Show which TeamFlow organisation this machine syncs under, and switch to another one the user holds a seat on.
 command: org
 disable-model-invocation: true
 ---

@@ -61,7 +61,9 @@
 import fs from 'node:fs';
 import path from 'node:path';
 
-import { TRIGGER_STAGES, cardFor, publishCard, readTracker } from './card.mjs';
+import {
+  TRIGGER_STAGES, cardFor, publishCard, readTracker, readWriteBack, trackerAskLines,
+} from './card.mjs';
 import {
   dataDir, isOver, organisationScope, readJson, readWorkflows, saveSession, sessionPath,
   writeJson, writeWorkflows,
@@ -475,9 +477,11 @@ export function trackerAgrees(tracker, ticket) {
  * runs: three things need the tracker's own answer or a person's
  * intent, and a hook asks for none of them.
  *
- * `announce` is called once, before anything is paid, with the keys
- * this pass is about to close in somebody's tracker. A pass that moves
- * real issues says which ones first.
+ * `announce` is called once, before anything is paid, with the lines
+ * saying what this pass is about to ask of somebody's tracker. A pass
+ * that may move real issues says so first — and says only what the
+ * sidecars and the organisation's write-back settings actually support
+ * (MACLEOD-603), never what it merely hopes will result.
  *
  * `dryRun` pays nothing and changes nothing, including the record of
  * the pass — printing a plan is not doing it.
@@ -534,15 +538,35 @@ export async function reconcile(config = {}, {
   // Each repair counted once: quarantined is a state of its own, and
   // adding it to `owed` as well reported the same repair twice.
   const owedOf = (done) => repairs.length - done - Object.keys(quarantined).length;
+
+  /*
+   * What this pass may honestly say about the tracker (MACLEOD-603),
+   * read once from the two documents `cardLine` reads. Only a card at a
+   * trigger stage can move a real issue and `planRepairs` offers none
+   * of those unless `deep`, so the hook path adds no reads at all.
+   *
+   * The sidecars are kept on the repairs because `pay` needs the same
+   * answer a moment later: reading the same document twice in one pass
+   * is only a chance for the two answers to disagree.
+   */
+  const terminal = repairs.filter((one) => one.confirm && !one.quarantined);
+  let trackerLines = [];
+  if (terminal.length) {
+    const writeBack = await readWriteBack(config).catch(() => ({ known: false }));
+    for (const repair of terminal) {
+      repair.tracker = await readTracker(repair.key, config).catch(() => ({ known: false }));
+    }
+    trackerLines = trackerAskLines(
+      terminal.map((one) => ({ key: one.key, tracker: one.tracker })), writeBack, { dryRun },
+    );
+  }
+
   if (dryRun) {
-    return { repairs, done: [], owed: owedOf(0), at, dryRun: true, quarantined };
+    return { repairs, done: [], owed: owedOf(0), at, dryRun: true, quarantined, trackerLines };
   }
 
   const payable = repairs.filter((one) => !one.quarantined);
-  if (announce) {
-    const closing = payable.filter((one) => one.confirm).map((one) => one.key);
-    if (closing.length) announce(closing);
-  }
+  if (announce && trackerLines.length) announce(trackerLines);
 
   const done = [];
   for (const repair of payable) {
@@ -648,7 +672,9 @@ async function pay(repair, state, config, { at, deep }) {
     if (!ticket) return { landed: false };
     if (repair.confirm) {
       if (!deep) return { landed: false };
-      const tracker = await readTracker(repair.key, config);
+      // Read once for the whole pass, by `reconcile`, so the sentence it
+      // printed before paying and the gate here are the same answer.
+      const tracker = repair.tracker || await readTracker(repair.key, config);
       const agrees = trackerAgrees(tracker, ticket);
       if (!agrees.ok) return { landed: false, why: agrees.why };
     }
@@ -765,10 +791,13 @@ export function renderPass(pass) {
    * as repaired.
    */
   const paid = new Set(pass.done.map((one) => one.id));
-  const closing = pass.repairs.filter((one) => one.confirm).map((one) => one.key);
-  if (pass.dryRun && closing.length) {
-    out.push(`  about to close in the tracker: ${closing.join(', ')}`);
-  }
+  /*
+   * What the tracker is actually being asked for, and nothing this side
+   * cannot know (MACLEOD-603). `reconcile` built these lines from the
+   * sidecars and the organisation's write-back settings; a real pass
+   * says the same ones through `announce`, before it pays.
+   */
+  if (pass.dryRun) for (const line of pass.trackerLines || []) out.push(`  ${line}`);
   for (const repair of pass.repairs) {
     const how = paid.has(repair.id) ? 'repaired'
       : repair.quarantined ? `refused  (${repair.quarantined})`
