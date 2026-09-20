@@ -114,6 +114,20 @@ The account behind the credential being the tenant also decides what the plugin 
 - `git`: `branch`, `head.sha` and `head.subject`, `commitsSinceMain`, `ahead`, `behind`, `pushed`, `dirty` — where the branch stands, as counts and flags. Derived state: a count of commits is not the commits, and the subject line is capped at one line's length so a hunk cannot ride in as prose.
 - `pr`: `number`, `url`, `state`, `mergeable`, `checks.{passing,failing,pending}`, `review` — what the forge already publishes about the pull request. Derived state: how many checks are in each state, never which ones and never their output.
 
+### What the SERVICE adds: `member`
+
+Everything above is what a reporter may send. `member` is the one field on a stored issue document or runtime sidecar that no reporter sends and none may: it is the email address of the organisation member whose credential posted the report, and the service stamps it from the credential (MACLEOD-588).
+
+The rule has three halves and all three are load-bearing:
+
+- **It comes from the credential, never from the body.** The kit resolves the presenting credential to a member — an account key's member, a device credential's seat, a signed-in person's seat — and hands it to the adapter as `ctx["member"]`. `member` is in `adapters/teamflow/schema.py`'s `DROPPED` list beside `tenantId` and `slot`, so a payload carrying one is thrown away by the allowlist walker and then overwritten; a report claiming another member's address changes nothing but its own `dropped_fields`. The same reason `tenantId` is dropped applies: a body that names a person is describing somebody else's work.
+- **A credential that names nobody stamps nothing.** An organisation-wide key carries the account's rights and no person's, so the field is simply absent rather than being filled with the owner. Only a member who still holds an *active* seat on that account is ever stamped; a key that outlived the person it was issued to names nobody.
+- **The plugin still never sends an email.** Nothing on the reporting side changes. This is the service adding what it already knows, at the one point where it knows it and the reporter cannot influence it.
+
+The value discloses nothing new to whoever can read it. It is only ever the address of a member of the account the document belongs to, and an organisation's own members' addresses are already listed on its members page to its own members. What it adds is the fact that this report and that member are the same human, which is what lets the dashboard draw one person instead of one per name they report under.
+
+A workflow document is not stamped: it already names its `actor`, and a second answer to who is running a run is a second thing to go stale.
+
 ### One event
 
 A ticket's events used to be stored in three shapes — the issue document's `executions[]`, the tracker sidecar's `history[]` and the pull request sidecar's `history[]` — and the dashboard folded all three into one timeline in the browser, on every read, for every ticket. They are one shape now, folded once by whoever writes it:
@@ -173,6 +187,8 @@ One identifier is deliberately not hashed: the execution id `claude-<session>` c
 
 `session` is which session a run happened in, so the board can group a person's work as person → session → agent. `id` is a digest of the tool's `session_id` and **never the id itself**: telling two of somebody's sessions apart is the whole job, and a raw session id is a machine-local identifier with no business on a report. No transcript path, no scratchpad directory, no working directory — `repository` and `branch` are the same two fields the issue document already carries, repeated here because a worktree is the usual reason a person has more than one session open.
 
+**An `agent` block may ride a run of any `kind`, not only `claude`** — a reporter that runs the audit, the suite or the deploy under a named agent says so, and the board draws that agent on its person's lane beside their coding ones. This is a decision rather than an omission (MACLEOD-596): the block has been accepted on every kind since it was introduced, and for a while the swimlanes walked only `claude` runs, so a block on an `audit` run was accepted, stored and drawn nowhere. Tightening the table instead would have turned that silent discard into a silent refusal for anything already sending one. `test_an_agent_block_is_accepted_on_a_run_of_any_kind` in `tests/test_schema.py` pins it.
+
 A `running` agent is believed for as long as it keeps saying so. `SessionEnd` has 1.5 seconds and may not spend them on the network, so a session that is killed leaves its last report standing: the plugin carries those ends on the next turn by anything on the machine, and the dashboard ages out a Claude agent whose last report is older than `freshness`'s `idle` band, drawing it as *stopped reporting* rather than as working. A build or a test suite is not aged out — it is owned by a reporter with a lifecycle of its own and is taken at its word.
 
 `AGENT` and `SESSION` in `adapters/teamflow/schema.py` are the enforcement, and `sanitizePayload` in `plugin/scripts/core.mjs` gives each block a scope of its own rather than adding `name`, `task`, `parent` and the rest to the flat allowlist — those are precisely the words a reporter talked into attaching a prompt would reach for.
@@ -211,6 +227,16 @@ Documents written before this shape are still read, and so are reports still sen
 Derived state, on the same rule as everything above: a key and a title name an issue. A title is capped at 120 characters. No issue description, no comment, no link comment, and no issue body — GitHub's relations are the keys read out of a body that is then dropped, never the body.
 
 An absent field means *this tracker did not say*, which is not the same as an empty list and is not drawn as one. `docs/TRACKERS.md` has the per-tracker table of what each webhook states and what it cannot.
+
+#### `assignee.member` — who the assignee actually is
+
+The `assignee` block on the `tracker` sidecar is `{id, name}` and, when the service could tie the assignee to a person, `member`: the email address of a member of *this* organisation.
+
+It is written at the moment the delivery is applied and never by a reporter. Linear's webhook and its import both carry the assignee's address, and Jira's payload carries one when the site does not hide it; the service compares that address, case-insensitively, against the seats `mcpkit.ledger` holds for this account, and writes the **member's own** address when it matches one. An address that matches no member of this organisation is written nowhere — not into the sidecar, not into a log line, not into a response — and the assignee stays `{id, name}`.
+
+GitHub sends no address at all, so it is matched the other way (MACLEOD-591): its payload names the assignee by GitHub's own numeric user id, and a member who signed in through GitHub has that same id recorded on their seat by the kit — from the verified token and from nowhere a person can type. The service compares the two, within this account's seats only, and writes the member's address on a match exactly as it does for an address. A **login is never matched**, because a login is a label its owner can change and anybody can claim; a display name is never matched against anything, because two people share one often enough to merge them.
+
+The address that does get written is not new information to anybody who can read it: an organisation's own members' addresses are already listed on its members page, to its own members. What the field adds is the fact that this assignee and that member are the same human, which is what stops one person being drawn as three (MACLEOD-588).
 - normalized stage/status
 - `reworkFrom` and loop count
 - concise derived summary
@@ -265,6 +291,14 @@ They do not learn the sentence that asked for it.
 saying why one ticket waits on another, capped exactly as `summary` is, and
 it never quotes code, a diff, a log line or a prompt. `adapters/teamflow/schema.py`'s
 `WORKFLOW` tables are the enforcement and drop anything else.
+
+**A republish that leaves `actor` out keeps the stored one.** The document is
+replaced whole on every write and a live run republishes it once per ticket
+that moves, so absence has to mean *I did not say* rather than *nobody*, or
+the second write of a run would blank the owner the first one named. The
+adapter's `WORKFLOW_CARRIED` is the list of fields that survive a republish
+this way, and nothing about it lets a report *clear* a field it did not set —
+a value is only ever replaced by another value (MACLEOD-588).
 
 ### The project document
 
@@ -417,7 +451,7 @@ team. It is off for every connection until somebody turns it on
 
 ```
 Verified on dev by TeamFlow at <updatedAt>: <summary>
-Ready for production by TeamFlow at <updatedAt>: <summary>
+Delivered by TeamFlow at <updatedAt>: <summary>
 ```
 
 with the trailing `: <summary>` replaced by a full stop when the report
@@ -437,7 +471,7 @@ page, per TeamFlow stage. What travels is the state's name, which the admin
 typed, resolved to the tracker's own id by the provider.
 
 **When.** Only when a report puts a ticket at `DEV_VERIFIED` or
-`READY_PROD` with a status that is not `failed`. Never for an earlier
+`DONE` with a status that is not `failed`. Never for an earlier
 stage, a rework or a failure, never twice for the same `(key, stage)`, and
 never for a ticket the tracker has already marked done, cancelled or
 deleted — the tracker wins on closure, and two-way only ever moves forward

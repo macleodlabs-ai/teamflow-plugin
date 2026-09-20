@@ -7,6 +7,8 @@ import { NO_PROJECT, resolveProject } from './project.mjs';
 import {
   actor,
   clearDiscards,
+  bindingRefusal,
+  bindingRefusalFor,
   credential,
   credentialKind,
   dataDir,
@@ -17,11 +19,13 @@ import {
   latestSessionForCwd,
   loadConfig,
   localBindingPath,
+  organisationScope,
   outboxLine,
   outboxSummary,
   parseBindArgument,
-  projectBindingPath,
   publishState,
+  refusalLine,
+  retireSharedBinding,
   resolveGithubRepo,
   resolveIssueTitle,
   serviceUrl,
@@ -30,6 +34,8 @@ import {
   trackerOf,
   safeExec,
   saveSession,
+  userBindingPath,
+  userBindingPaths,
   writeJson,
   writeLocalBinding,
   pluginVersion,
@@ -72,6 +78,7 @@ const USAGE = `teamflow \u2014 delivery reporting for TeamFlow
   teamflow report --issue ... --stage ...   report one stage transition
   teamflow skills install --for <tool>      install these skills into another tool
   teamflow hooks status | install           report automatically from that tool
+  teamflow hooks uninstall --all            take all of it back out again
   teamflow hook --for <tool>                the hook entry itself; tools call this
 
 \`teamflow report --help\`, \`teamflow skills --help\`, \`teamflow hooks --help\`
@@ -176,7 +183,7 @@ function identity(email, account) {
 }
 
 async function status() {
-  const state = latestSessionForCwd(cwd);
+  const state = latestSessionForCwd(cwd, config);
   const session = auth.readSession();
   const probe = credentialKind(config) ? await fetchAccount(config) : undefined;
   // The other half of the picture: the skill reports what happens to the
@@ -194,6 +201,10 @@ async function status() {
   // this is where a person finds out, and saying it clears it.
   const outbox = await outboxSummary(config);
   if (outbox.discarded.ownerless || outbox.discarded.expired) clearDiscards();
+  // A binding that belongs to another organisation (MACLEOD-586). The
+  // hook that refused it exits 0 and prints nothing, so this is where a
+  // person finds out why their ticket stopped moving.
+  const refused = refusalLine(bindingRefusalFor(cwd, config));
   print({
     tenantId: tenantId(config),
     pluginVersion: pluginVersion() || 'unknown',
@@ -219,6 +230,9 @@ async function status() {
       : undefined,
     jiraKey: state?.binding?.key,
     bindingSource: state?.binding?.source,
+    // Only when there is one, so a single-organisation machine prints
+    // exactly what it printed before.
+    ...(refused ? { binding: refused } : {}),
     stage: state?.stage,
     status: state?.status,
     summary: state?.summary,
@@ -266,13 +280,23 @@ async function bind(argument = args.filter((a) => a !== '--local').join(' '), { 
     // free to try once more rather than blanking the card for good.
     titleLookedUp: Boolean(found?.title),
     tenantId: tenantId(config),
+    // Whose work this is (MACLEOD-586). Additive: an older plugin
+    // ignores the field, and an install with no credential has no
+    // organisation to record and records none.
+    ...(organisationScope(config) ? { account: organisationScope(config) } : {}),
     boundAt: new Date().toISOString(),
   };
   if (inRepo) writeLocalBinding(cwd, record);
-  else writeJson(projectBindingPath(cwd, config), record);
-  const state = latestSessionForCwd(cwd);
+  else {
+    writeJson(userBindingPath(cwd, config), record);
+    // An older copy of the plugin on this machine reads the shared file
+    // and would go on naming the ticket this bind just replaced
+    // (MACLEOD-586).
+    retireSharedBinding(cwd, config, ref.key);
+  }
+  const state = latestSessionForCwd(cwd, config);
   if (state) {
-    state.binding = { key: ref.key, tracker: ref.tracker, repo: ref.repo, workspace: ref.workspace, confidence: 1000, source: 'manual', sticky: true, boundAt: new Date().toISOString() };
+    state.binding = { key: ref.key, tracker: ref.tracker, repo: ref.repo, workspace: ref.workspace, confidence: 1000, source: 'manual', sticky: true, boundAt: new Date().toISOString(), ...(record.account ? { account: record.account } : {}) };
     if (found?.title || found?.status) {
       state.jira = { ...(state.jira || {}), key: ref.key, title: found.title, status: found.status };
     }
@@ -299,9 +323,13 @@ async function workOn() {
 }
 
 function unbind() {
-  try { fs.unlinkSync(projectBindingPath(cwd, config)); } catch {}
-  try { fs.unlinkSync(localBindingPath(cwd)); } catch {}
-  const state = latestSessionForCwd(cwd);
+  // Every file that could speak for this repository, including the
+  // shared one an older plugin wrote: unbinding that leaves one behind
+  // is a binding that comes back (MACLEOD-586).
+  for (const file of [...userBindingPaths(cwd, config), localBindingPath(cwd)]) {
+    try { fs.unlinkSync(file); } catch {}
+  }
+  const state = latestSessionForCwd(cwd, config);
   if (state) {
     delete state.binding;
     state.updatedAt = new Date().toISOString();
@@ -311,8 +339,25 @@ function unbind() {
 }
 
 async function sync() {
-  const state = latestSessionForCwd(cwd);
-  if (!state?.binding?.key) throw new Error(`No issue is currently bound. ${BIND_USAGE}`);
+  const state = latestSessionForCwd(cwd, config);
+  if (!state?.binding?.key) {
+    throw new Error(refusalLine(bindingRefusalFor(cwd, config))
+      || `No issue is currently bound. ${BIND_USAGE}`);
+  }
+  /*
+   * The binding the session holds, and not only the session that holds
+   * it (MACLEOD-586 audit, finding 1).
+   *
+   * `latestSessionForCwd` already refuses a session that records
+   * another organisation, but a session written by an older copy of the
+   * plugin records none — and two copies on one machine is ordinary.
+   * The binding it is holding still says whose ticket it is, and this
+   * is the command `bind` itself tells people to run, so it is the last
+   * place that may take a key from one organisation and post it with
+   * another's credential. Loud, because a CLI has somebody reading it.
+   */
+  const refused = bindingRefusal(state.binding, config);
+  if (refused) throw new Error(refusalLine(refused));
   const result = await publishState(state, config, info, { force: true });
   saveSession(state);
   print(result);
@@ -344,6 +389,7 @@ async function doctor() {
   const stale = staleBuild();
   const outbox = await outboxSummary(config);
   if (outbox.discarded.ownerless || outbox.discarded.expired) clearDiscards();
+  const refusedBinding = refusalLine(bindingRefusalFor(cwd, config));
   const report = {
     claudeProbe: claudeBin ? 'ran' : `skipped: ${claudeSkipped}`,
     pluginVersion: pluginVersion() || 'unknown',
@@ -363,6 +409,9 @@ async function doctor() {
     apiKeyFallback: config.apiKey ? 'configured' : 'not configured',
     tracker,
     issueSource,
+    // A finding rather than trivia: nothing is being reported for that
+    // ticket at all, and no other line here would say so (MACLEOD-586).
+    ...(refusedBinding ? { binding: refusedBinding } : {}),
     trackerMcp: mcpVisible
       ? `${server} visible`
       : `${server} not visible yet; TeamFlow bundles it, restart/reload plugin then use /mcp to authenticate`,
@@ -434,7 +483,7 @@ async function doctor() {
       }
       // What the last report actually carried, which is the thing a person
       // can check against what they see on the board.
-      const seen = latestSessionForCwd(cwd)?.binding;
+      const seen = latestSessionForCwd(cwd, config)?.binding;
       if (seen?.tracker && seen.tracker !== tracker && !connected.has(seen.tracker)) {
         warnings.push(`the last report was for ${seen.key || 'an issue'} from ${seen.tracker}, `
           + `which the org has not connected either.`);

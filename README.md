@@ -95,9 +95,9 @@ A project may override config in `.teamflow.json`.
 TeamFlow treats audit as a first-class delivery gate:
 
 ```text
-Local Test → Local Audit → Merge → CI → Deploy Dev → Dev Test → Dev Audit → Verified
-                 │                                        │
-                 └─ fail → rework/retest/re-audit         └─ fail → rework/redeploy/retest/re-audit
+Local Test → Local Audit → Merge → CI/CD → Dev Test → Dev Audit → Verified → Done
+                 │                              │
+                 └─ fail → rework/retest/…      └─ fail → rework/redeploy/retest/re-audit
 ```
 
 Common `audit`, `lint`, `typecheck`, Semgrep and CodeQL commands are recognized locally. Dev audit detection supports `audit-dev` / `dev-audit` style commands. Repositories can set custom `localAuditPattern`, `devTestPattern` and `devAuditPattern` regexes.

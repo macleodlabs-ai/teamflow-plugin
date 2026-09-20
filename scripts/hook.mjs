@@ -9,7 +9,7 @@ import { claudeContext, failOpen, handleEvent, readStdin } from './hook-core.mjs
 
 await failOpen(async () => {
   const input = await readStdin();
-  const { state, justBound, event, project, signedIn } = await handleEvent(input);
-  const output = claudeContext(event, state, justBound, undefined, project, signedIn);
+  const { state, justBound, event, project, signedIn, refused } = await handleEvent(input);
+  const output = claudeContext(event, state, justBound, undefined, project, signedIn, refused);
   if (output) process.stdout.write(output);
 });

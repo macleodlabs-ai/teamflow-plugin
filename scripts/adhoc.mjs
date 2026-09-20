@@ -29,6 +29,7 @@
 import fs from 'node:fs';
 
 import {
+  bindingRefusalFor,
   credential,
   credentialKind,
   dataDirWritable,
@@ -36,13 +37,18 @@ import {
   issuePayload,
   latestSessionForCwd,
   localBindingPath,
-  projectBindingPath,
+  organisationScope,
   publishState,
   readJson,
+  readUserBinding,
+  refusalLine,
   saveSession,
   sendReport,
   serviceUrl,
   tenantId,
+  usableBinding,
+  userBindingPath,
+  userBindingPaths,
   writeJson,
   writeLocalBinding,
 } from './core.mjs';
@@ -138,12 +144,17 @@ export async function mint(config = {}) {
 
 /** Which binding file this project writes: the worktree's, or the user data directory's. */
 function bindingFile(cwd, config) {
-  return dataDirWritable() ? projectBindingPath(cwd, config) : localBindingPath(cwd);
+  return dataDirWritable() ? userBindingPath(cwd, config) : localBindingPath(cwd);
 }
 
-/** The binding on disk, local first, because a worktree's own is the one in force. */
+/**
+ * The binding on disk, local first, because a worktree's own is the one
+ * in force — and never one made under another organisation, which this
+ * credential must not report under (MACLEOD-586).
+ */
 export function currentBinding(cwd, config = {}) {
-  return readJson(localBindingPath(cwd)) || readJson(projectBindingPath(cwd, config));
+  return usableBinding(readJson(localBindingPath(cwd)), config)
+    || usableBinding(readUserBinding(cwd, config), config);
 }
 
 /** The bound ad hoc item, or undefined when the binding is a real ticket. */
@@ -162,6 +173,8 @@ function bindingRecord(key, title, config, extra = {}) {
     titleLookedUp: true,
     adhoc: true,
     tenantId: tenantId(config),
+    // Whose item it is (MACLEOD-586), on the same terms as `teamflow bind`.
+    ...(organisationScope(config) ? { account: organisationScope(config) } : {}),
     boundAt: new Date().toISOString(),
     ...extra,
   };
@@ -190,7 +203,7 @@ function writeBinding(cwd, config, record) {
  */
 export async function republish(key, title, cwd, config = {}, info = {}, { status, summary } = {}) {
   const binding = { key, tracker: TRACKER, confidence: 1000, source: 'manual', sticky: true, boundAt: new Date().toISOString() };
-  const session = latestSessionForCwd(cwd);
+  const session = latestSessionForCwd(cwd, config);
   if (session) {
     session.binding = binding;
     session.jira = { ...(session.jira || {}), key, title };
@@ -242,7 +255,13 @@ export async function start(title, cwd, config = {}, info = {}) {
 export async function retitle(title, cwd, config = {}, info = {}) {
   const clean = checkTitle(title);
   const bound = boundAdHoc(cwd, config);
-  if (!bound) throw new Error('No ad hoc item is bound. `teamflow adhoc start "<what the work is>"` starts one.');
+  // A refused binding is not "nothing bound": say which organisation it
+  // belongs to rather than inviting a second item under this one
+  // (MACLEOD-586). Loud here, because a CLI has somebody reading it.
+  if (!bound) {
+    throw new Error(refusalLine(bindingRefusalFor(cwd, config))
+      || 'No ad hoc item is bound. `teamflow adhoc start "<what the work is>"` starts one.');
+  }
   writeBinding(cwd, config, { ...bound, title: clean });
   const sent = await republish(bound.jiraKey, clean, cwd, config, info);
   return { key: bound.jiraKey, title: clean, sent };
@@ -258,7 +277,10 @@ export async function retitle(title, cwd, config = {}, info = {}) {
  */
 export async function done(cwd, config = {}, info = {}, { summary, status = 'success' } = {}) {
   const bound = boundAdHoc(cwd, config);
-  if (!bound) throw new Error('No ad hoc item is bound, so there is nothing to finish.');
+  if (!bound) {
+    throw new Error(refusalLine(bindingRefusalFor(cwd, config))
+      || 'No ad hoc item is bound, so there is nothing to finish.');
+  }
   const line = summary === undefined ? 'Ad hoc work done' : checkTitle(summary);
   const sent = await republish(bound.jiraKey, bound.title, cwd, config, info, { status, summary: line });
   clearBinding(cwd, config);
@@ -273,7 +295,7 @@ export async function done(cwd, config = {}, info = {}, { summary, status = 'suc
  * the network.
  */
 export function clearBinding(cwd, config = {}) {
-  for (const file of [localBindingPath(cwd), projectBindingPath(cwd, config)]) {
+  for (const file of [localBindingPath(cwd), ...userBindingPaths(cwd, config)]) {
     const held = readJson(file);
     if (held && isAdHocKey(held.jiraKey)) {
       try { fs.unlinkSync(file); } catch { /* already gone */ }

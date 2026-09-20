@@ -69,20 +69,32 @@ const GIT_MERGE_RE = /\bgit\s+merge\b/i;
 // neither of the others is the moment the gate is passed.
 const GIT_MERGE_HOUSEKEEPING_RE = /\bgit\s+merge\b[^;&|]*?--(?:abort|quit|continue)\b/i;
 const PR_RE = /\bgh\s+pr\s+(?:create|ready)\b/i;
-const DEPLOY_RE = /\b(?:cdk|terraform)\s+(?:deploy|apply)\b|\baws\s+(?:cloudformation\s+deploy|ecs\s+update-service)\b|\b(?:npm|pnpm|yarn|bun)\s+(?:run\s+)?deploy(?::|-)?dev\b/i;
+// Every command that actually puts a change somewhere. `mcpkit deploy` and the
+// `sam deploy` it wraps were missing, which is why an mcp-service-kit service —
+// TeamFlow among them — reported no deploy at all (MACLEOD-594).
+const DEPLOY_RE = /\b(?:cdk|terraform)\s+(?:deploy|apply)\b|\b(?:mcpkit|sam)\s+deploy\b|\baws\s+(?:cloudformation\s+deploy|ecs\s+update-service)\b|\b(?:npm|pnpm|yarn|bun)\s+(?:run\s+)?deploy(?::|-)?dev\b/i;
+// A build a developer runs on their own machine is a local gate, not a
+// pipeline, so this feeds LOCAL_TEST. CI/CD is reported by a background
+// reporter or by one of the deploy commands above, and by nothing a developer
+// runs to compile.
 const BUILD_RE = /\b(?:npm|pnpm|yarn|bun)\s+(?:run\s+)?build\b|\btsc\s+-b\b/i;
 const LOCAL_AUDIT_RE = /\b(?:npm|pnpm|yarn|bun)\s+(?:run\s+)?audit(?:[-_:]local)?\b|\b(?:make|just)\s+audit\b/i;
 const DEV_AUDIT_RE = /\baudit[-_: ]?(?:dev|staging)\b|\b(?:dev|staging)[-_: ]?audit\b/i;
 
 /*
- * The columns, in delivery order. This is the emitting side's copy of STAGES in
- * src/lib/stageMachine.ts: the plugin needs the order to answer one question a
- * transition cannot answer on its own — has the gate that sent this ticket back
- * been passed again? Rework stages are not in it, because they are not columns.
+ * The stages, in delivery order. This is the emitting side of the contract
+ * STAGES in src/lib/stageMachine.ts draws: the plugin needs the order to answer
+ * one question a transition cannot answer on its own — has the gate that sent
+ * this ticket back been passed again? Rework stages are not in it, because a
+ * ticket never ranks at one.
+ *
+ * It is longer than the dashboard's column list by one, and deliberately:
+ * CI_BUILD and DEPLOY_DEV are two gates a ticket passes in order but one CI/CD
+ * column to a reader (MACLEOD-594). Rank is about order, so both are here.
  */
-const STAGE_ORDER = [
+export const STAGE_ORDER = [
   'JIRA', 'LOCAL_DEV', 'LOCAL_TEST', 'LOCAL_AUDIT', 'MERGE', 'CI_BUILD',
-  'DEPLOY_DEV', 'DEV_TEST', 'DEV_AUDIT', 'DEV_VERIFIED', 'READY_PROD',
+  'DEPLOY_DEV', 'DEV_TEST', 'DEV_AUDIT', 'DEV_VERIFIED', 'DONE',
 ];
 
 /** What the dashboard calls the step at a gate, so the rework arrow can name it. */
@@ -376,6 +388,12 @@ export function projectId(cwd) {
 // to be standing in. `teamflow bind` run in a package and a hook event
 // fired from that package's directory have to name the same file as the
 // root does, or the binding is written where nothing will look for it.
+//
+// The tenant is `default` on every service install, so this is one file
+// for every organisation a person holds a seat on: it is where every
+// plugin before this one wrote, it is still read and still written by an
+// install that has no organisation, and `accountBindingPath` is where a
+// signed-in one writes instead (MACLEOD-586).
 export function projectBindingPath(cwd, config = {}) {
   return path.join(dataDir(), 'bindings', tenantId(config), `${projectId(repositoryRoot(cwd))}.json`);
 }
@@ -441,6 +459,303 @@ export function writeLocalBinding(cwd, value) {
     fs.writeFileSync(ignore, `${current.endsWith('\n') || !current ? current : `${current}\n`}binding.json\n`);
   }
   return file;
+}
+
+// --- a binding belongs to one organisation (MACLEOD-586) ------------
+//
+// The binding is the most load-bearing store in the plugin: it decides
+// which ticket every hook event in this repository is about. It said
+// nothing about who bound it, and `bindings/<tenant>/` is `default` on
+// every service install, so a repository bound while signed in to
+// organisation A went on naming A's ticket after a switch to B. The
+// tenant a report lands in comes from the credential, so A's key,
+// title, stage, summary, branch and counts were written onto B's board.
+// Per-session switching (MACLEOD-524) makes that an ordinary Tuesday for
+// a contractor and, unlike the outbox (MACLEOD-583), it needs no outage
+// and no queue: it is every report.
+//
+// The answer is to refuse rather than to re-key. A binding records the
+// organisation it was made under; one made under another does not speak
+// here, and `teamflow work-on <KEY>` under this one is what makes it
+// speak. Nothing is migrated and nothing is moved, so the worst this
+// code can do wrong is a ticket that stops advancing -- which `status`,
+// `doctor` and the session-start notice say out loud.
+
+/**
+ * The organisation to stamp a binding with, or undefined when this
+ * install has none to stamp.
+ *
+ * `accountScope` falls back to the tenant where there is no credential,
+ * and the tenant tells no two organisations apart. Stamping that would
+ * be a lie that refuses the person's own binding the moment they sign
+ * in, so an install with no credential stamps nothing and refuses
+ * nothing: it behaves exactly as it always has.
+ */
+export function organisationScope(config = {}) {
+  const scope = accountScope(config);
+  return scope && !isLegacyScope(scope) ? scope : undefined;
+}
+
+/**
+ * The user binding for THIS organisation.
+ *
+ * A second directory beside the tenant one, never a re-keying of it: an
+ * older plugin goes on reading `bindings/<tenant>/`, which is neither
+ * moved nor deleted, and two organisations on one machine stop
+ * overwriting each other's ticket — bind under B and A's binding is
+ * still there when the next session switches back.
+ *
+ * Undefined where there is no organisation, and the tenant file is then
+ * the only one there has ever been.
+ */
+export function accountBindingPath(cwd, config = {}) {
+  const scope = organisationScope(config);
+  if (!scope) return undefined;
+  return path.join(dataDir(), 'bindings', scope, `${projectId(repositoryRoot(cwd))}.json`);
+}
+
+/** Where a user binding written now goes. */
+export function userBindingPath(cwd, config = {}) {
+  return accountBindingPath(cwd, config) || projectBindingPath(cwd, config);
+}
+
+/** The user binding files, this organisation's before the shared one. */
+export function userBindingPaths(cwd, config = {}) {
+  const own = accountBindingPath(cwd, config);
+  const legacy = projectBindingPath(cwd, config);
+  return own ? [own, legacy] : [legacy];
+}
+
+/** The user binding in force: this organisation's file, else the shared one. */
+export function readUserBinding(cwd, config = {}) {
+  for (const file of userBindingPaths(cwd, config)) {
+    const found = readJson(file);
+    if (found?.jiraKey) return found;
+  }
+  return undefined;
+}
+
+/**
+ * The shared binding, once this organisation's own file has taken over
+ * and names a different ticket.
+ *
+ * Two copies of the plugin run on one machine as a matter of course —
+ * Claude Code's cached release fires the hooks while a checkout's CLI
+ * binds — and the older copy reads only `bindings/<tenant>/`. Leaving a
+ * superseded file there would have that copy attribute today's work to
+ * yesterday's ticket, silently, which is worse than attributing it to
+ * nothing.
+ *
+ * So the superseded file goes, and it is the one place this change
+ * removes anything an older plugin reads. The rule it bends
+ * (MACLEOD-583: never delete what an older version reads) was written
+ * about a workflow nothing re-creates; a binding is re-created by the
+ * command that was just run. What is NOT done is the other repair —
+ * mirroring this binding into the shared file so the older copy stays
+ * right — because that file is shared by every organisation, and
+ * writing this organisation's ticket into it would hand the key to an
+ * older copy signed in as another. A stale ticket is a bug; that would
+ * be this ticket.
+ */
+export function retireSharedBinding(cwd, config = {}, key = undefined) {
+  const shared = projectBindingPath(cwd, config);
+  // No organisation: the shared file is the one just written.
+  if (shared === userBindingPath(cwd, config)) return false;
+  const held = readJson(shared);
+  if (!held?.jiraKey || held.jiraKey === key) return false;
+  try {
+    fs.unlinkSync(shared);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * The organisations this data directory holds state for.
+ *
+ * Used for one question only: whether an UNSTAMPED binding — written
+ * before this version, or by a plugin that had no organisation — may be
+ * adopted by whoever is signed in. On a machine that has only ever held
+ * one organisation's state there is nobody else it could belong to; on
+ * one that has held two there is no safe guess, so it is refused until
+ * somebody re-binds it.
+ *
+ * The evidence is state other subsystems wrote for their own reasons,
+ * and never a record this rule keeps for itself. A record of its own
+ * would begin the day this version is installed, and the first
+ * organisation to ask would answer in its own favour by having written
+ * it; that is the mistake MACLEOD-583 made and undid.
+ *
+ * Every store on this machine that names an organisation is read, and
+ * the reason is that the cheap subset is not a safe subset (MACLEOD-586
+ * audit, finding 2). The projects cache was the load-bearing one and it
+ * is written only by a `resolveProject` that answered: the hook asks
+ * with a 1.5 second budget and caches nothing on a timeout. So an
+ * organisation that worked here through an outage — queueing reports,
+ * writing session state, never reaching the projects route — left no
+ * trace in it at all, and its binding would have been adopted by the
+ * next organisation to sign in. The queue and the session files record
+ * that organisation for their own purposes, so they answer it.
+ *
+ * What is left is narrow and stated rather than hidden: an organisation
+ * that has signed in on this machine and then done nothing whatever —
+ * no report queued or sent, no session, no project, no workflow, no
+ * binding — leaves nothing behind, and an unstamped binding would be
+ * adopted with it present. `outbox-discards.json` is deliberately not
+ * read: it is two counters and names nobody.
+ *
+ * `readable` is the other half of the answer, and it is why this
+ * returns a pair. All of this evidence lives in the user data
+ * directory, which is exactly the directory a sandboxed worktree agent
+ * cannot read — the case `.teamflow/binding.json` exists for. There
+ * every listing throws, "nobody else has been here" would be a
+ * statement about a directory nobody looked in, and a pre-upgrade local
+ * binding left by another organisation's agent is a realistic
+ * dogfooding artefact. So unreadable is not empty: it is unknown, and
+ * an unstamped binding is refused rather than adopted on it. A data
+ * directory that does not exist yet IS empty, and says so — nothing can
+ * have been left in a directory that was never created.
+ */
+function organisationsSeen(config = {}) {
+  const seen = new Set();
+  const add = (name) => { if (name && !isLegacyScope(String(name))) seen.add(String(name)); };
+  add(organisationScope(config));
+  let readable;
+  try {
+    fs.readdirSync(dataDir());
+    readable = true;
+  } catch (error) {
+    readable = error?.code === 'ENOENT';
+  }
+  try {
+    for (const key of Object.keys(readJson(workflowsPath(), {}) || {})) add(key);
+  } catch { /* an unreadable store is no evidence either way */ }
+  // One file or directory per organisation: the name is the answer.
+  for (const dir of ['projects', 'bindings']) {
+    try {
+      for (const name of fs.readdirSync(path.join(dataDir(), dir))) {
+        add(name.endsWith('.json') ? name.slice(0, -'.json'.length) : name);
+      }
+    } catch { /* never written on this machine */ }
+  }
+  // The actors of every session this machine has run, which this
+  // version stamps on every hook event.
+  try {
+    for (const name of fs.readdirSync(path.join(dataDir(), 'sessions'))) {
+      if (name.endsWith('.json')) add(readJson(path.join(dataDir(), 'sessions', name))?.account);
+    }
+  } catch { /* no session has ever been written here */ }
+  // And what is waiting to be delivered, which carries the owner that
+  // queued it (MACLEOD-583) — the one record an outage cannot suppress,
+  // because an outage is what creates it.
+  try {
+    for (const name of fs.readdirSync(outboxDir())) {
+      if (name.endsWith('.json')) add(scopeOf(ownerId(readJson(path.join(outboxDir(), name))?.owner)));
+    }
+  } catch { /* nothing queued */ }
+  return { seen, readable };
+}
+
+/**
+ * Whether a binding may speak for the organisation signed in now, and
+ * why not when it may not.
+ *
+ * Undefined means it speaks. That is the answer for every binding on a
+ * single-organisation machine and for every install with no credential,
+ * which is what keeps this change invisible to nearly everybody.
+ */
+export function bindingRefusal(record, config = {}) {
+  const key = record?.jiraKey || record?.key;
+  if (!key) return undefined;
+  const account = organisationScope(config);
+  if (!account) return undefined;
+  const boundTo = typeof record.account === 'string' && record.account ? record.account : undefined;
+  if (boundTo) return boundTo === account ? undefined : { key, account, boundTo };
+  const { seen, readable } = organisationsSeen(config);
+  const others = [...seen].filter((one) => one !== account).sort();
+  if (others.length) return { key, account, others };
+  // Nothing found, and no way to know whether that means nothing is
+  // there: a sandboxed agent cannot read the directory the evidence
+  // lives in (MACLEOD-586 audit).
+  return readable ? undefined : { key, account, unreadable: true };
+}
+
+/** The record, or nothing at all when it belongs to another organisation. */
+export function usableBinding(record, config = {}) {
+  return bindingRefusal(record, config) ? undefined : record;
+}
+
+/**
+ * A binding another organisation made for this repository.
+ *
+ * For the explanation and never for a candidate. One file per
+ * organisation means the files this session can read are silent about
+ * the one it must not use, so without this a person who switched
+ * organisation would see no ticket, no error and no reason — which is
+ * the failure mode the whole plugin is built to avoid. The key is read
+ * only to be said back to the person who bound it, on this machine.
+ */
+function otherOrganisationBinding(cwd, config = {}) {
+  const account = organisationScope(config);
+  if (!account) return undefined;
+  const file = `${projectId(repositoryRoot(cwd))}.json`;
+  let dirs;
+  try { dirs = fs.readdirSync(path.join(dataDir(), 'bindings')).sort(); } catch { return undefined; }
+  for (const dir of dirs) {
+    if (dir === account || isLegacyScope(dir)) continue;
+    const held = readJson(path.join(dataDir(), 'bindings', dir, file));
+    if (held?.jiraKey) return { ...held, account: held.account || dir };
+  }
+  return undefined;
+}
+
+/**
+ * Why this repository is reporting nothing, from the binding files
+ * already in hand.
+ *
+ * A file that speaks ends the question: this organisation has a binding
+ * here and there is nothing to explain. Only when none of them speaks
+ * is another organisation's file looked for, which is also the only
+ * case where the extra read costs anything.
+ */
+function refusalFrom(records, cwd, config) {
+  for (const record of records) {
+    const refusal = bindingRefusal(record, config);
+    if (refusal) return refusal;
+  }
+  if (records.some((one) => one?.jiraKey)) return undefined;
+  return bindingRefusal(otherOrganisationBinding(cwd, config), config);
+}
+
+/** The refusal in force for this repository, for `status` and `doctor`. */
+export function bindingRefusalFor(cwd, config = {}) {
+  return refusalFrom([readJson(localBindingPath(cwd)), readUserBinding(cwd, config)], cwd, config);
+}
+
+/** An organisation scope as a person would name it. */
+function scopeName(scope) {
+  if (!scope) return 'an unknown organisation';
+  return scope.startsWith('account-') ? scope.slice('account-'.length) : 'a credential that names no organisation';
+}
+
+/**
+ * Why nothing is being reported under this ticket, in one line.
+ *
+ * It names the remedy, because a refusal a person cannot act on is a
+ * ticket that has stopped moving for a reason nobody can find.
+ */
+export function refusalLine(refusal) {
+  if (!refusal) return undefined;
+  const unstamped = 'it was bound before TeamFlow recorded which organisation a binding belongs to';
+  const because = refusal.boundTo
+    ? `it was bound under ${scopeName(refusal.boundTo)}`
+    : refusal.unreadable
+      ? `${unstamped}, and nothing here can read the data directory to see whose it is`
+      : `${unstamped}, and this machine holds work for ${refusal.others.map(scopeName).join(', ')} as well`;
+  return `Nothing is reported for ${refusal.key}: ${because}, and this session reports to `
+    + `${scopeName(refusal.account)}. Run \`teamflow work-on ${refusal.key}\` to bind it here, `
+    + 'or `teamflow org switch` to report as the organisation it belongs to.';
 }
 
 // --- the workflows this machine knows about (MACLEOD-540) -----------
@@ -1571,6 +1886,10 @@ export function candidate(key, confidence, source, ref = {}) {
   if (!normalized) return undefined;
   const out = { key: normalized, confidence, source, tracker: ref.tracker || 'jira' };
   if (ref.boundAt) out.boundAt = ref.boundAt;
+  // Which organisation bound it travels with the candidate and onto the
+  // session, so a session that switches organisation mid-flight stops
+  // naming the ticket it was bound to (MACLEOD-586).
+  if (ref.account) out.account = ref.account;
   if (ref.repo) out.repo = ref.repo;
   if (ref.workspace) out.workspace = ref.workspace;
   return out;
@@ -1594,12 +1913,18 @@ export function issueCandidates(input = {}, info = {}, manual = undefined, confi
   // becoming a candidate: two manual candidates would make confidence
   // decide between them, and confidence knows nothing about which was
   // written last.
-  const bound = Array.isArray(manual) ? preferBinding(manual[0], manual[1]) : manual;
+  //
+  // Each file is judged on its own before they are compared, so a stale
+  // binding belonging to another organisation cannot suppress this
+  // organisation's older one by being the newer of the two
+  // (MACLEOD-586).
+  const usable = (Array.isArray(manual) ? manual : [manual]).map((one) => usableBinding(one, config));
+  const bound = usable.length > 1 ? preferBinding(usable[0], usable[1]) : usable[0];
   if (bound?.jiraKey) {
     // boundAt travels with the candidate: it is how a `teamflow bind` run
     // after this session started outranks the sticky binding the session
     // already holds (see chooseBinding).
-    add({ key: bound.jiraKey, tracker: bound.tracker || tracker, repo: bound.repo, workspace: bound.workspace, boundAt: bound.boundAt }, 1000, 'manual');
+    add({ key: bound.jiraKey, tracker: bound.tracker || tracker, repo: bound.repo, workspace: bound.workspace, boundAt: bound.boundAt, account: bound.account }, 1000, 'manual');
   }
   add(detectIssueRef(input.prompt, config, info), 100, 'prompt');
   add(detectIssueRef(input.task_subject, config, info), 98, 'task');
@@ -1631,7 +1956,11 @@ export function issueCandidates(input = {}, info = {}, manual = undefined, confi
 
 export function detectCandidates(input, cwd, state = {}, config = {}) {
   const info = gitInfo(cwd);
-  const manual = [readJson(localBindingPath(cwd)), readJson(projectBindingPath(cwd, config))];
+  const manual = [readJson(localBindingPath(cwd)), readUserBinding(cwd, config)];
+  // Read here rather than asked for again later: the caller has to be
+  // able to say why a bound ticket went quiet, and this is the one place
+  // that has both files in hand (MACLEOD-586).
+  const refused = refusalFrom(manual, cwd, config);
   // The disk half of the prefix rule: what has been bound, here and in this
   // session, and the tickets of the runs this machine holds. One file read each,
   // beside the two binding reads above.
@@ -1646,7 +1975,7 @@ export function detectCandidates(input, cwd, state = {}, config = {}) {
     const session = candidate(state.binding.key, state.binding.confidence || 1, state.binding.source || 'session', state.binding);
     if (session) candidates.push(session);
   }
-  return { candidates, info };
+  return { candidates, info, refused };
 }
 
 export function chooseBinding(state, candidates) {
@@ -1949,8 +2278,9 @@ export async function cachedIssueTitle(ref, cwd, config = {}, info = {}) {
   // Two files can hold a binding; the cache is whichever one names this
   // key, local first, because a worktree's own binding is the one the
   // report is being written for.
-  const files = [localBindingPath(cwd), projectBindingPath(cwd, config)];
-  const file = files.find((candidateFile) => readJson(candidateFile)?.jiraKey === ref.key) || files[1];
+  const files = [localBindingPath(cwd), ...userBindingPaths(cwd, config)];
+  const file = files.find((candidateFile) => readJson(candidateFile)?.jiraKey === ref.key)
+    || userBindingPath(cwd, config);
   const cached = readJson(file);
   const isCache = cached?.jiraKey === ref.key;
   if (isCache && (cached.title || cached.titleLookedUp)) {
@@ -2832,8 +3162,19 @@ export function mayPut(item, config = {}) {
  * answer is a file name.
  */
 export function accountScope(config = {}) {
-  const id = ownerId(credentialOwner(config));
-  if (!id) return tenantId(config);
+  return scopeOf(ownerId(credentialOwner(config))) || tenantId(config);
+}
+
+/**
+ * One owner id as the name its state is filed under.
+ *
+ * Its own function because a second caller needs the identical mapping:
+ * reading a queued item's owner back to the bucket that organisation's
+ * files would be in (MACLEOD-586). Two spellings of this would mean an
+ * organisation the machine has plainly seen reading as one it has not.
+ */
+function scopeOf(id) {
+  if (!id) return undefined;
   return id.replace(':', '-').toLowerCase().replace(/[^a-z0-9._-]+/g, '-').slice(0, 80);
 }
 
@@ -2988,7 +3329,42 @@ export function resetPaymentNotice() {
   paymentNoticeShown = false;
 }
 
-async function postEnvelope(endpoint, envelope, idempotencyKey, config) {
+/**
+ * The last word on whether this report may go out, taken where the
+ * credential is actually chosen (MACLEOD-586 audit, finding 3).
+ *
+ * Every other check in this ticket asks `organisationScope`, which asks
+ * `credentialOwner`, which is deliberately the STABLE answer and not the
+ * true one — it has to be, because it names local files and may not
+ * change mid-process. Its one guess is the one that matters here: a
+ * session that will not refresh falls back to an API key, and the
+ * tenant a report lands in is the key's. So a binding stamped
+ * `account-acme` passed every synchronous check and the report went out
+ * with somebody else's key, which is this ticket's own defect surviving
+ * its own fix.
+ *
+ * Refused rather than queued. The report is not wrong, but it is not
+ * this credential's to send, and a queue entry would only ask the same
+ * question again later.
+ *
+ * A credential that names nobody — a bearer token handed in with no
+ * account, which fingerprints to nothing — is refused too, and that is
+ * the deliberate direction: "I cannot tell whose this is" and "it is
+ * theirs" must have the same answer, or the bypass is a missing
+ * environment variable away.
+ */
+function carrierRefusal(account, owner) {
+  if (!account) return undefined;
+  const carrier = scopeOf(ownerId(owner));
+  if (carrier === account) return undefined;
+  const whose = carrier
+    ? `the credential in hand is ${scopeName(carrier)}'s`
+    : 'the credential in hand names no organisation';
+  return `not sent: this report is ${scopeName(account)}'s and ${whose}. `
+    + 'Sign in again with `teamflow login`, or re-bind under the organisation reporting now.';
+}
+
+async function postEnvelope(endpoint, envelope, idempotencyKey, config, account = undefined) {
   const cred = await credential(config);
   if (!cred) return { ok: false, retry: false, reason: 'no service credential available' };
   // Whose report this was, taken from the credential that is about to
@@ -2997,6 +3373,10 @@ async function postEnvelope(endpoint, envelope, idempotencyKey, config) {
   // organisation that receives the report is the key's.
   const secret = cred.kind === 'api_key' ? cred.value : String(cred.value).replace(/^Bearer\s+/i, '');
   const owner = ownerFrom(cred.kind, secret, config);
+  // Before the fetch, and with no owner on the answer: nothing is sent,
+  // so nothing is queued and there is no owner to record.
+  const refused = carrierRefusal(account, owner);
+  if (refused) return { ok: false, retry: false, refused: true, reason: refused };
   const answer = (result) => ({ ...result, owner });
   let response;
   try {
@@ -3296,13 +3676,16 @@ export function outboxLine(summary) {
 // POST one report to the service. kind is the envelope kind
 // ("issue" or "runtime"); slot is required for runtime and absent for
 // an issue, because it is a path segment the service checks.
-export async function sendReport(kind, slot, payload, config) {
+export async function sendReport(kind, slot, payload, config, { account } = {}) {
   if (!credentialKind(config)) return { ok: false, skipped: true, reason: 'no service credential configured' };
   const document = serviceDocument(payload, kind);
   const envelope = slot ? { kind, slot, payload: document } : { kind, payload: document };
   const endpoint = `${serviceUrl(config)}/v1/report`;
   const idempotencyKey = reportIdempotencyKey(kind, slot, document);
-  const result = await postEnvelope(endpoint, envelope, idempotencyKey, config);
+  // `account` is the organisation this report belongs to, when the
+  // caller knows one (MACLEOD-586). Checked against the credential that
+  // will carry it, inside postEnvelope.
+  const result = await postEnvelope(endpoint, envelope, idempotencyKey, config, account);
   if (result.retry) {
     // `owner` is the whole fix: where to send it, what to send, and
     // whose it is. Never the credential — that is resolved again when
@@ -3366,7 +3749,9 @@ export function aggregateActor(config, info) {
       if (sessionTenant !== tenant) continue;
       const key = session?.binding?.key;
       if (!key) continue;
-      const terminal = ['DEV_VERIFIED', 'READY_PROD'].includes(session.stage) || session.ended;
+      // READY_PROD is retired (MACLEOD-594) but a session written by an
+      // older plugin still says it, and it meant what DONE means here.
+      const terminal = ['DEV_VERIFIED', 'DONE', 'READY_PROD'].includes(session.stage) || session.ended;
       if (terminal) recent.add(key);
       else active.add(key);
     }
@@ -3424,7 +3809,19 @@ export async function publishState(state, config, info, { force = false, keepTen
   let issueResult;
   let actorResult;
   if (transport === 'service') {
-    issueResult = await sendReport('issue', undefined, payload, config);
+    /*
+     * Whose report this is, carried to the send point (MACLEOD-586).
+     *
+     * The binding's stamp first, because it is a statement somebody
+     * made about this ticket; the actor's otherwise, which this version
+     * writes on every hook event. Either way it is compared against the
+     * credential the request will actually carry, which is the only
+     * comparison that cannot be fooled by a session quietly falling
+     * back to an API key.
+     */
+    issueResult = await sendReport('issue', undefined, payload, config, {
+      account: state.binding?.account || state.account,
+    });
     // No actor document is posted. The service allowlist knows two
     // kinds, issue and runtime, and the account already scopes the
     // tenant, so a locally aggregated actor rollup has nowhere to
@@ -3446,31 +3843,53 @@ export async function publishState(state, config, info, { force = false, keepTen
       ? 'queued'
       : issueResult.paymentRequired
         ? 'payment_required'
-        // Nothing was attempted, so nothing failed (MACLEOD-572, plugin
-        // audit row 17). A machine with no credential and no data URI
-        // used to record `failed` here, and `status` printed it three
-        // lines above `identity: not signed in` — so the first thing a
-        // lost customer read was that their report had been rejected,
-        // which it had not: it was never sent. `skipped` is the flag
-        // both transports set for exactly that, and only that; a
-        // configured transport that could not deliver is `queued`.
-        : issueResult.skipped
-          ? 'not sent: this machine has nothing to send it with; run /teamflow:login'
-          : 'failed';
+        // Refused where the credential is chosen, because the report
+        // belongs to another organisation (MACLEOD-586). Its own line
+        // carrying the reason in full: `status` is where a person finds
+        // out that a ticket has stopped moving on purpose.
+        : issueResult.refused
+          ? issueResult.reason
+          // Nothing was attempted, so nothing failed (MACLEOD-572,
+          // plugin audit row 17). A machine with no credential and no
+          // data URI used to record `failed` here, and `status` printed
+          // it three lines above `identity: not signed in` — so the
+          // first thing a lost customer read was that their report had
+          // been rejected, which it had not: it was never sent.
+          // `skipped` is the flag both transports set for exactly that,
+          // and only that; a configured transport that could not
+          // deliver is `queued`.
+          : issueResult.skipped
+            ? 'not sent: this machine has nothing to send it with; run /teamflow:login'
+            : 'failed';
   return { ok: Boolean(issueResult.ok && actorResult.ok), transport, issueResult, actorResult };
 }
 
 // Sessions record the repository root they were opened against, so the
 // question is asked in those terms too: `teamflow status` run three
 // directories down is still asking about the same session.
-export function latestSessionForCwd(cwd) {
+//
+// And the organisation they were opened under (MACLEOD-586 audit,
+// finding 1). Every CLI path that publishes, prints or edits "the
+// session" starts here, and each one remembering the check for itself is
+// one of them forgetting: `teamflow sync` did, and would post the ticket
+// a session bound under A to whichever board the credential in hand
+// names. A session that records another organisation is not this
+// session, so it is not returned at all.
+//
+// Compared only when both sides name one: a session written before this
+// version records none and is still answered, or an upgrade would blank
+// `teamflow status` until the next hook event, and an install with no
+// credential has nothing to compare and never did.
+export function latestSessionForCwd(cwd, config = {}) {
   cwd = repositoryRoot(cwd);
   const dir = path.join(dataDir(), 'sessions');
   if (!fs.existsSync(dir)) return undefined;
+  const mine = organisationScope(config);
   const candidates = fs.readdirSync(dir)
     .filter((name) => name.endsWith('.json'))
     .map((name) => readJson(path.join(dir, name)))
     .filter((state) => state?.cwd === cwd)
+    .filter((state) => !mine || !state.account || state.account === mine)
     .sort((a, b) => new Date(b.updatedAt || 0).getTime() - new Date(a.updatedAt || 0).getTime());
   return candidates[0];
 }

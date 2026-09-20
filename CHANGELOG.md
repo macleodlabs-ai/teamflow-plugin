@@ -3,6 +3,64 @@
 What changed in each published version of the TeamFlow plugin, newest first.
 Only what a person using it would notice.
 
+## 0.3.15
+
+- **Security: a ticket binding now names the organisation it was made under,
+  and work bound under one organisation is not reported into another.** A
+  binding recorded which ticket a repository was working on and nothing about
+  whose it was, so switching organisation and carrying on reported the first
+  organisation's ticket key, title, stage, summary, branch and counts onto the
+  second's board. Unlike the queued-report defect in 0.3.14 this needed no
+  outage and no queue: it was every report. A binding made under another
+  organisation now stays silent and says so, in `teamflow status`, in
+  `teamflow doctor` and once at the start of a session, and `teamflow work-on
+  <KEY>` re-binds it.
+- **And the check happens where the credential is actually chosen.** Comparing
+  the credential the configuration *names* was not enough: an expired session
+  falls back to an API key while still reporting itself as a session, so a
+  binding could pass the check and the report still go out under a different
+  organisation's key. Every report now carries its organisation to the point
+  of sending and is refused there if the credential disagrees. Nothing is sent
+  and nothing is queued.
+- **Because of that, an expired session sitting beside an API key stops
+  reporting until you run `teamflow login` again** — even when the key belongs
+  to the same organisation. Nothing on the machine can tell that it does: a
+  credential fingerprint names a credential, not an organisation. It says so
+  rather than failing quietly, and the alternative is reporting to whoever the
+  key happens to belong to.
+- **`teamflow hooks uninstall` and `teamflow skills uninstall`**, for Cursor,
+  Copilot, Windsurf, Cline, Codex CLI, Gemini CLI, JetBrains Junie and the git
+  hook fallback — `--for <tool>`, `--git`, `--all`, and `--dry-run` to see it
+  first. Install merges entries into files you own, so uninstall removes
+  exactly what install added and nothing else: a third-party hook in the same
+  file survives, a file you already had survives, and a file that was wholly
+  the installer's is deleted. It prints what it removed. Claude Code never
+  needed this — `claude plugin uninstall` already removes the lot — but no
+  other tool had a way back out.
+- **A gate's verdict is worked out from the ticket rather than remembered.**
+  A chip could be left lit for ever: the verdict was cleared using a marker
+  held in a local file, and anything that lost the marker — a restored backup,
+  a second machine, a copied run — left the board claiming work was still
+  going on a ticket that had finished hours earlier. Each gate's status is now
+  derived from where the ticket actually is, and every ticket in a run is
+  reconciled on each command, so a board that has drifted repairs itself. The
+  first command after updating publishes a burst of corrections.
+- **The delivery columns are ten rather than eleven.** CI / Build and Deploy
+  Dev were always one thing to everybody reading the board — a pipeline builds
+  and deploys in one run — and are now one column, **CI/CD**. **Prod Review**
+  becomes **Done**, which is where a ticket its tracker calls done belongs;
+  the old stage was a manual gate nothing ever emitted, and on a real board it
+  had silently become the parking space for every finished ticket. Reports
+  from older plugins that still name the old stage are accepted and stored
+  under the new one, so nothing needs migrating and no card is lost.
+- **`mcpkit deploy` is recognised as a deploy.** It matched no pattern, so a
+  service deployed with it reached no column at all.
+- **A GitHub repository with a capital letter in its name no longer produces
+  two cards for one issue.** The plugin lower-cased the repository half of the
+  key and the tracker connector kept GitHub's own casing, so the reports and
+  the issue's title, assignee and status landed on two different cards. Lower
+  case is now the one spelling on both sides.
+
 ## 0.3.14
 
 - **Security: a report queued for one organisation can no longer be delivered

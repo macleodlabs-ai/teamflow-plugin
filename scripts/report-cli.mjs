@@ -42,7 +42,7 @@ import {
 const STAGES = [
   'BACKLOG', 'LOCAL_DEV', 'LOCAL_TEST', 'LOCAL_AUDIT', 'LOCAL_REWORK',
   'MERGE', 'CI_BUILD', 'DEPLOY_DEV', 'DEV_TEST', 'DEV_AUDIT',
-  'DEV_REWORK', 'DEV_VERIFIED', 'READY_PROD',
+  'DEV_REWORK', 'DEV_VERIFIED', 'DONE',
 ];
 const STATUSES = ['running', 'success', 'waiting', 'blocked', 'failed', 'idle'];
 const KINDS = ['human', 'claude', 'ci', 'deploy', 'test', 'audit', 'environment', 'security'];

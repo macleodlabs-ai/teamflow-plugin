@@ -21,8 +21,17 @@ import os from 'node:os';
 import path from 'node:path';
 
 import { fetchAccount, gitInfo, loadConfig, safeExec, transportOf } from './core.mjs';
+// Namespace import, for one function that is not on this branch yet.
+// MACLEOD-586 files the user binding under the organisation as well as
+// under the legacy tenant and adds `userBindingPaths` as the one list of
+// both — the list `unbind` and `adhoc clearBinding` already use. A named
+// import of a function that is not there is a load-time error in every
+// hook on the machine, and this module is imported by all of them.
+import * as core from './core.mjs';
 import { BY_ID } from './tools.mjs';
-import { mergeJson, writeBlock, writeFile } from './write.mjs';
+import {
+  mergeJson, removeBlock, removeEmptyDir, removeFile, unmergeJson, writeBlock, writeFile,
+} from './write.mjs';
 
 const PACKAGE = 'github:macleodlabs-ai/teamflow-plugin';
 
@@ -122,6 +131,27 @@ export function installGitHooks({ root = process.cwd(), dryRun = false } = {}) {
     });
   }
   return { scope: 'git', dir, written, covers: Object.values(GIT_HOOKS).map((h) => h.covers) };
+}
+
+// The way back out, and it is the markers that make it exact: what is
+// between `# BEGIN teamflow` and `# END teamflow` is ours and everything
+// else in the file is not. A repository that had its own post-commit
+// hook keeps it, without the block; a file that is nothing but the block
+// and the `#!/bin/sh` the installer wrote above it is the installer's
+// and goes.
+export function uninstallGitHooks({ root = process.cwd(), dryRun = false } = {}) {
+  const dir = hooksDirOrThrow(root);
+  const written = [];
+  for (const event of Object.keys(GIT_HOOKS)) {
+    const file = path.join(dir, event);
+    if (dryRun) {
+      const installed = fs.existsSync(file) && fs.readFileSync(file, 'utf8').includes(GIT_BEGIN);
+      written.push({ file, action: installed ? 'would remove' : 'absent' });
+      continue;
+    }
+    removeBlock(file, written, { begin: GIT_BEGIN, end: GIT_END, header: '#!/bin/sh' });
+  }
+  return { scope: 'git', dir, written };
 }
 
 export function gitHooksInstalled(root = process.cwd()) {
@@ -465,6 +495,60 @@ export function installHooks(tool, { root = process.cwd(), dryRun = false } = {}
   return { tool, label: spec.name, hooks: true, files: targets.map((t) => t.file), covers, written };
 }
 
+// Every shim this module writes says this, in a comment, in both
+// dialects. It is what tells a file TeamFlow wrote from a file of the
+// same name that somebody else wrote: Cline's hook IS a file called
+// `.clinerules/hooks/PostToolUse`, and a customer who had one there
+// before TeamFlow arrived keeps it.
+export const SHIM_MARKER = 'TeamFlow delivery reporting';
+
+// The inverse of installHooks. It is knowable for the same reason a
+// reinstall is a no-op: HOOK_SPECS says exactly what install adds, so
+// exactly that is what comes out, entry by entry. Anything else in the
+// same file — another vendor's hook, the customer's own — is untouched,
+// and a tool that was never installed for succeeds quietly, because
+// `uninstall` is what somebody runs when they are not sure.
+export function uninstallHooks(tool, { root = process.cwd(), dryRun = false } = {}) {
+  const spec = BY_ID[tool];
+  if (!spec) throw new Error(`Unknown tool "${tool}". Known: ${Object.keys(BY_ID).sort().join(', ')}`);
+  const written = [];
+  if (!HOOK_SPECS[tool]) return { tool, label: spec.name, hooks: false, written };
+  const { targets } = HOOK_SPECS[tool](root);
+  for (const target of targets) {
+    if (dryRun) {
+      written.push({ file: target.file, action: fs.existsSync(target.file) ? 'would remove' : 'absent' });
+      continue;
+    }
+    if (target.json) unmergeJson(target.file, target.json, written, { arrayUnion: true });
+    else if (target.script) removeFile(target.file, written, { marker: SHIM_MARKER });
+  }
+  // `.teamflow/hooks` with its last shim gone, and nothing above it:
+  // `.teamflow` holds the binding and `.github` is the customer's.
+  if (!dryRun) {
+    for (const dir of new Set(targets.map((t) => path.dirname(t.file)))) removeEmptyDir(dir, written);
+  }
+  return { tool, label: spec.name, hooks: true, files: targets.map((t) => t.file), written };
+}
+
+// The binding is the one piece of TeamFlow state in a repository that no
+// installer wrote, and leaving it behind is how a reinstall six months
+// later reports against a ticket nobody is working on. Removed by
+// `uninstall --all` only: removing TeamFlow from Cursor while Claude Code
+// still reports is not a reason to forget which ticket this is.
+//
+// `userBindingPaths` is the list of every file the user binding may live
+// in — MACLEOD-586 added the organisation-scoped location beside the
+// legacy tenant one, and an install with no credential still writes the
+// legacy one. A second list here is how the two drift apart, so this
+// calls that one; see the namespace import at the top for why it is
+// reached this way.
+export function bindingFiles(root, config = {}) {
+  const user = typeof core.userBindingPaths === 'function'
+    ? core.userBindingPaths(root, config)
+    : [core.projectBindingPath(root, config)];
+  return [core.localBindingPath(root), ...user];
+}
+
 // --- status -----------------------------------------------------------
 
 // Does this repository look like it is used with this tool? Only files
@@ -612,8 +696,71 @@ does this for you.
 system: post-commit, post-merge and pre-push. Reporting is then on
 commit rather than per tool call.
 
+  teamflow hooks uninstall --for <tool> [--dry-run]
+  teamflow hooks uninstall --git [--dry-run]
+  teamflow hooks uninstall --all [--dry-run]
+
+uninstall removes exactly what install added and nothing else: another
+vendor's entry in the same file stays, a hook TeamFlow did not write
+stays, and a tool that was never installed for succeeds quietly. --all
+is every tool, the git hooks and this repository's ticket binding.
+--dry-run lists what would go without touching anything.
+
 Tools with hooks: ${Object.keys(HOOK_SPECS).sort().join(', ')}.
 `;
+
+// What the uninstall says out loud. A silent uninstall is as bad as no
+// uninstall: the whole point of the command is that a customer can see
+// TeamFlow leave, and can see what it decided not to touch.
+export function removalReport(written, root = process.cwd()) {
+  const short = (file) => {
+    const inside = path.relative(root, file);
+    if (inside && !inside.startsWith('..')) return inside;
+    return file.startsWith(home()) ? `~${file.slice(home().length)}` : file;
+  };
+  const lines = [];
+  for (const item of written) {
+    if (item.action === 'absent' || item.action === 'unchanged') continue;
+    const why = item.reason ? ` — ${item.reason}` : '';
+    const verb = item.action === 'updated' ? "TeamFlow's entries removed from" : item.action;
+    lines.push(`  ${verb} ${short(item.file)}${why}`);
+  }
+  if (!lines.length) return 'TeamFlow was not installed here. Nothing to remove.\n';
+  return `TeamFlow removed:\n${lines.join('\n')}\nNothing else was touched.\n`;
+}
+
+// One tool, the git hooks, or everything. `--all` is the command a
+// customer who is leaving actually wants, and it is the only one that
+// takes the binding with it: removing TeamFlow from Cursor while Claude
+// Code still reports is not a reason to forget which ticket this is.
+//
+// The git hooks are best-effort under `--all`. A checkout with no `.git`
+// — a tarball, a Docker context — has no hooks to remove, and refusing
+// to finish removing the rest over that would be absurd.
+export function uninstallEverywhere(options, { root = process.cwd(), config = {}, dryRun = false } = {}) {
+  if (options.for) return uninstallHooks(options.for, { root, dryRun });
+  if (!options.all) return uninstallGitHooks({ root, dryRun });
+
+  const written = [];
+  const tools = Object.keys(HOOK_SPECS).sort();
+  for (const tool of tools) written.push(...uninstallHooks(tool, { root, dryRun }).written);
+  let git;
+  try {
+    git = uninstallGitHooks({ root, dryRun });
+    written.push(...git.written);
+  } catch (error) {
+    written.push({ file: root, action: 'skipped', reason: error instanceof Error ? error.message : String(error) });
+  }
+  // Same reason as the git hooks: no repository, no local binding path,
+  // and that is not a reason to stop.
+  let bindings = [];
+  try { bindings = bindingFiles(root, config); } catch { bindings = []; }
+  for (const file of bindings) {
+    if (dryRun) written.push({ file, action: fs.existsSync(file) ? 'would remove' : 'absent' });
+    else removeFile(file, written);
+  }
+  return { scope: 'all', tools, git: git?.dir, written };
+}
 
 export async function main(argv = [], io = {}) {
   const out = io.stdout || ((text) => process.stdout.write(text));
@@ -629,7 +776,7 @@ export async function main(argv = [], io = {}) {
     const body = token.slice(2);
     const eq = body.indexOf('=');
     const name = eq >= 0 ? body.slice(0, eq) : body;
-    if (name === 'dry-run' || name === 'git' || name === 'help') { options[name] = true; continue; }
+    if (name === 'dry-run' || name === 'git' || name === 'all' || name === 'help') { options[name] = true; continue; }
     const value = eq >= 0 ? body.slice(eq + 1) : rest[++i];
     if (value === undefined) { err(`--${name} needs a value\n`); return 2; }
     options[name] = value;
@@ -641,6 +788,25 @@ export async function main(argv = [], io = {}) {
   if (action === 'status') {
     out(`${JSON.stringify(hooksStatus(root, config), null, 2)}\n`);
     return 0;
+  }
+  if (action === 'uninstall') {
+    if (!options.git && !options.for && !options.all) {
+      err(`hooks uninstall needs --for <tool>, --git or --all.\n\n${USAGE}`);
+      return 2;
+    }
+    try {
+      const dryRun = Boolean(options['dry-run']);
+      const result = uninstallEverywhere(options, { root, config, dryRun });
+      out(`${JSON.stringify(result, null, 2)}\n`);
+      // The list goes to stderr for the same reason the install's notice
+      // does: stdout stays parseable JSON, and this is the half a person
+      // reads.
+      err(removalReport(result.written, root));
+      return 0;
+    } catch (error) {
+      err(`${error instanceof Error ? error.message : String(error)}\n`);
+      return 2;
+    }
   }
   if (action !== 'install') { err(`Unknown hooks action "${action}".\n\n${USAGE}`); return 2; }
   if (!options.git && !options.for) { err(`hooks install needs --for <tool> or --git.\n\n${USAGE}`); return 2; }

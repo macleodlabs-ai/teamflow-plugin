@@ -13,6 +13,7 @@ import {
   absorbRootActor,
   resolveActorKey,
   applyTransition,
+  bindingRefusal,
   chooseBinding,
   claimLaunch,
   classifyTool,
@@ -23,10 +24,12 @@ import {
   isAgentTool,
   loadConfig,
   matchLaunch,
+  organisationScope,
   parseAgentId,
   publishState,
   readJson,
   recordLaunch,
+  refusalLine,
   reporterInfo,
   repositoryRoot,
   saveSession,
@@ -116,7 +119,7 @@ function projectSentence(project) {
 // flipped between whichever worktree had bound last. An agent reads its
 // own binding and the session reads its own; neither can see the other's.
 export function claudeContext(event, state, justBound, stale = staleBuildNotice(), project = undefined,
-  signedIn = true) {
+  signedIn = true, refused = undefined) {
   if (!FAST.includes(event)) return undefined;
   // Said on SessionStart only. A session loads plugin code once, so
   // the answer cannot change until it restarts, and repeating it on
@@ -128,6 +131,12 @@ export function claudeContext(event, state, justBound, stale = staleBuildNotice(
   // will happen: an unbound ticket is a ticket that will not move, and
   // an unsigned-in machine is every ticket.
   const credential = event === 'SessionStart' && !signedIn ? [NOT_SIGNED_IN] : [];
+  // Beside it, and for the same reason: a binding refused because it
+  // belongs to another organisation is a ticket that will not move, and
+  // a hook cannot say so anywhere else — it exits 0 and prints nothing
+  // (MACLEOD-586). Once a session, like the rest of this.
+  const refusal = event === 'SessionStart' ? refusalLine(refused) : undefined;
+  if (refusal) credential.push(`TeamFlow: ${refusal}`);
   if (!state.binding?.key) {
     return JSON.stringify({
       hookSpecificOutput: {
@@ -283,6 +292,19 @@ export async function flushPendingEnds(config, limit = 3, sessionId = undefined)
     try { ownTenant = tenantId(own); } catch { continue; }
     if (actor.tenantId && ownTenant !== actor.tenantId) continue;
     if (actor.serviceUrl && serviceUrl(own) !== actor.serviceUrl) continue;
+    /*
+     * And not under another organisation's credential (MACLEOD-586).
+     *
+     * The tenant check above cannot see this: the tenant is `default` on
+     * every service install, so a pending end written while signed in to
+     * A passes it, and posting it now would put A's ticket, stage and
+     * summary on whichever board the credential in hand names. Compared
+     * only when the state records one — a state written before this
+     * version behaves as it did — and left pending rather than cleared,
+     * because the organisation it belongs to can still deliver it the
+     * next time it does any work on this machine.
+     */
+    if (actor.account && actor.account !== organisationScope(own)) continue;
     try {
       /*
        * No git, and the actor's own tenant. `skipGit` because a `Stop`
@@ -403,6 +425,12 @@ export async function handleEvent(input = {}) {
     cwd,
     ended: false,
     tenantId: tenantId(config),
+    // Which organisation this actor is working for (MACLEOD-586). Local
+    // only — no report carries it — and it is what stops a pending end
+    // written under one organisation being delivered under another.
+    // Always this event's answer, never the saved one: a session that
+    // switched organisation must not go on claiming the one it left.
+    account: organisationScope(config),
     reporter: reporterInfo(input.reporter_tool),
   };
 
@@ -434,7 +462,7 @@ export async function handleEvent(input = {}) {
     if (state.status === 'running') state.status = 'idle';
     state.updatedAt = at;
     saveSession(state);
-    return { state, justBound: false, event, signedIn: true };
+    return { state, justBound: false, event, signedIn: true, refused: undefined };
   }
 
   // Whether this machine has anything to report with. Local and cheap —
@@ -443,7 +471,25 @@ export async function handleEvent(input = {}) {
   const signedIn = Boolean(credentialKind(config));
 
   const beforeKey = state.binding?.key;
-  const { candidates, info } = detectCandidates(resolved, cwd, state, config);
+  /*
+   * A binding made under another organisation does not speak here
+   * (MACLEOD-586).
+   *
+   * The session's own binding is dropped before anything is detected,
+   * rather than after: a sticky manual binding outranks every candidate
+   * in `chooseBinding`, so leaving it in place would mean this session
+   * went on reporting the ticket it was bound to under whichever
+   * credential it now holds. With it gone the session falls back to
+   * what the repository says about itself — a branch, a prompt — which
+   * belongs to whoever is signed in now.
+   *
+   * Only a manual binding: an inferred one is not somebody's statement
+   * about which organisation's work this is, and refusing it would stop
+   * ordinary detection on any machine that has seen two organisations.
+   */
+  const staleOrg = state.binding?.source === 'manual' ? bindingRefusal(state.binding, config) : undefined;
+  if (staleOrg) delete state.binding;
+  const { candidates, info, refused } = detectCandidates(resolved, cwd, state, config);
   state.binding = chooseBinding(state, candidates);
   const justBound = Boolean(state.binding?.key && state.binding.key !== beforeKey);
   state = enrichBinding(state, resolved);
@@ -519,7 +565,7 @@ export async function handleEvent(input = {}) {
     ? await resolveProject(info?.repository, config, { timeoutMs: 1500 })
     : undefined;
 
-  return { state, justBound, event, project, signedIn };
+  return { state, justBound, event, project, signedIn, refused: staleOrg || refused };
 }
 
 // Every hook entry runs inside this. Reporting must never break the

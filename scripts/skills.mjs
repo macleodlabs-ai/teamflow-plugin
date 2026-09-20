@@ -16,9 +16,12 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { credentialNotice, installHooks } from './hooks.mjs';
+import { credentialNotice, installHooks, removalReport, uninstallHooks } from './hooks.mjs';
 import { capability } from './tools.mjs';
-import { mergeJson, writeBlock, writeFile, writeTomlTable } from './write.mjs';
+import {
+  mergeJson, removeBlock, removeEmptyDir, removeFile, unmergeJson, writeBlock, writeFile,
+  writeTomlTable,
+} from './write.mjs';
 
 const SERVICE_URL = 'https://codercat.io';
 const MCP_URL = `${SERVICE_URL}/mcp`;
@@ -140,7 +143,7 @@ Report at these moments, and only these:
 - tests pass against dev -> \`DEV_TEST\`; an audit passes against dev ->
   \`DEV_AUDIT\`; both passed -> \`DEV_VERIFIED\`
 
-The other stages are \`BACKLOG\`, \`CI_BUILD\`, \`DEV_REWORK\` and \`READY_PROD\`.
+The other stages are \`BACKLOG\`, \`CI_BUILD\`, \`DEV_REWORK\` and \`DONE\`.
 Statuses are \`running\`, \`success\`, \`waiting\`, \`blocked\`, \`failed\` and
 \`idle\`. \`--issue\` takes \`DAEMON-142\`, \`ENG-42\`, \`#123\`, \`owner/repo#123\`
 or an issue URL.
@@ -414,6 +417,68 @@ export function install(tool, { root = process.cwd(), scope = 'project', dryRun 
   };
 }
 
+// --- uninstall -------------------------------------------------------
+
+// The inverse of install(), target for target and in the same order
+// (MACLEOD-582). Everything it removes is something install wrote: the
+// skill directories it copied, its own rules file or its marked block
+// inside the customer's, its entry in a shared MCP config, and the hooks
+// it installed in the same breath. A skill somebody else put in the same
+// directory, another server in the same config, the customer's own
+// instructions around the block: all untouched.
+export function uninstall(tool, { root = process.cwd(), scope = 'project', dryRun = false, dir = skillsDir() } = {}) {
+  const spec = TOOLS[tool];
+  if (!spec) {
+    throw new Error(`Unknown tool "${tool}". Known: ${Object.keys(TOOLS).sort().join(', ')}`);
+  }
+  const skills = readSkills(dir);
+  const written = [];
+  const plan = (file) => written.push({ file, action: fs.existsSync(file) ? 'would remove' : 'absent' });
+
+  if (spec.skills) {
+    const target = spec.skills(root, scope === 'user');
+    for (const skill of skills) {
+      const file = path.join(target, externalName(skill.name), 'SKILL.md');
+      if (dryRun) { plan(file); continue; }
+      // `.agents/skills` is shared with every other tool's skills, so
+      // only the directories TeamFlow named go, and only when the file
+      // in them is the one it wrote.
+      removeFile(file, written, { marker: 'teamflow' });
+      removeEmptyDir(path.dirname(file), written);
+    }
+    if (!dryRun) removeEmptyDir(target, written);
+  }
+
+  if (spec.rules) {
+    const file = spec.rules(root);
+    if (dryRun) plan(file);
+    else if (ownedByTeamflow(file)) removeFile(file, written, { marker: 'TeamFlow' });
+    else removeBlock(file, written);
+  }
+
+  if (spec.mcp) {
+    const target = spec.mcp(root);
+    if (dryRun) plan(target.file);
+    else if (target.json) unmergeJson(target.file, target.json, written);
+    else if (target.toml) removeBlock(target.file, written, { begin: '# BEGIN teamflow', end: '# END teamflow' });
+  }
+
+  const hooks = uninstallHooks(tool, { root, dryRun });
+  written.push(...hooks.written);
+
+  return {
+    tool,
+    label: spec.label,
+    scope,
+    written,
+    // The half no command can undo, when there is one: a connector added
+    // through a vendor's UI was never a file here.
+    manual: spec.manual?.length
+      ? ['Remove the TeamFlow entry from the same screen the install used; nothing on disk holds it.']
+      : [],
+  };
+}
+
 // A path whose name is TeamFlow's own; anything else belongs to the
 // user and only gets a marked block.
 function ownedByTeamflow(file) {
@@ -426,6 +491,7 @@ export const USAGE = `teamflow skills — put the TeamFlow skills in front of yo
 
   teamflow skills list
   teamflow skills install --for <tool> [--scope project|user] [--dir <path>] [--dry-run]
+  teamflow skills uninstall --for <tool> [--scope project|user] [--dry-run]
 
 Tools: ${Object.keys(TOOLS).sort().join(', ')}
 
@@ -433,6 +499,11 @@ Tools: ${Object.keys(TOOLS).sort().join(', ')}
 whole team gets it from a checkout. --scope user writes into your home
 directory where the tool supports it. --dry-run lists the files without
 touching any of them.
+
+uninstall takes back exactly what install of the same --scope put there,
+including that tool's hooks, and leaves everything else in those files
+alone. \`teamflow hooks uninstall --all\` is the one that removes every
+tool at once, the git hooks and this repository's ticket binding.
 `;
 
 export async function main(argv = [], io = {}) {
@@ -465,11 +536,32 @@ export async function main(argv = [], io = {}) {
     return 0;
   }
 
-  if (action !== 'install') { err(`Unknown skills action "${action}".\n\n${USAGE}`); return 2; }
-  if (!options.for) { err(`skills install needs --for <tool>.\n\n${USAGE}`); return 2; }
+  if (action !== 'install' && action !== 'uninstall') {
+    err(`Unknown skills action "${action}".\n\n${USAGE}`);
+    return 2;
+  }
+  if (!options.for) { err(`skills ${action} needs --for <tool>.\n\n${USAGE}`); return 2; }
   if (options.scope && !['project', 'user'].includes(options.scope)) {
     err('--scope must be project or user\n');
     return 2;
+  }
+
+  if (action === 'uninstall') {
+    try {
+      const root = options.root ? path.resolve(cwd, options.root) : cwd;
+      const result = uninstall(options.for, {
+        root,
+        scope: options.scope || 'project',
+        dryRun: Boolean(options['dry-run']),
+        dir: options.dir ? path.resolve(cwd, options.dir) : skillsDir(),
+      });
+      out(`${JSON.stringify(result, null, 2)}\n`);
+      err(removalReport(result.written, root));
+      return 0;
+    } catch (error) {
+      err(`${error instanceof Error ? error.message : String(error)}\n`);
+      return 2;
+    }
   }
 
   try {

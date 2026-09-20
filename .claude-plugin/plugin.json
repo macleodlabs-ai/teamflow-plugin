@@ -1,11 +1,11 @@
 {
   "name": "teamflow",
   "description": "Automatically reports Jira, Linear or GitHub issue-led Claude Code delivery progress to TeamFlow",
-  "version": "0.3.14",
+  "version": "0.3.15",
   "author": {
     "name": "MacleodLabs"
   },
   "homepage": "https://codercat.io",
   "repository": "https://github.com/macleodlabs-ai/teamflow-plugin",
-  "license": "Proprietary"
+  "license": "SEE LICENSE IN LICENSE"
 }

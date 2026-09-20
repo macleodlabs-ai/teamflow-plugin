@@ -22,6 +22,13 @@
 //   rules      neither is possible; the skills and the rules file are
 //              installed and the agent decides whether to report
 //
+// There is deliberately no `uninstall` field, and adding one would be a
+// mistake (MACLEOD-582). Uninstall is not a per-tool capability: it is
+// the inverse of whatever install wrote for that tool, derived from the
+// same HOOK_SPECS and skills tables, so every tool with an install has
+// one. A field here could only repeat that, and would be the thing that
+// went stale.
+//
 // `events` lists what is covered in that tool's own vocabulary, so a
 // reader can check it against their vendor's documentation.
 //

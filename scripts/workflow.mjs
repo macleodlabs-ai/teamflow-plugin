@@ -397,54 +397,103 @@ const GATES = {
 const CYCLE_ORDER = ['build', 'test', 'audit', 'status', 'deploy', 'verified'];
 
 /**
- * The sidecar a verdict writes, or undefined when the move is not one.
+ * What each gate's verdict IS, read off the ticket as it stands now.
  *
- * `before` is the ticket as it was; `ticket` as it is now. A move TO
- * rework at a gate is a refusal. A move to a cycle past the gate that
- * last refused it (or to done) is that gate passing, and only then: a
- * ticket that was never sent back has nothing to clear, and writing a
- * pass for every ticket at every step would be a sidecar per keystroke.
+ * The whole of MACLEOD-593 is here. The first version of this decided a
+ * gate's status from a TRANSITION and from `refusedAt`, a marker kept in
+ * the local workflow file: lose the marker -- a store keyed two ways
+ * (MACLEOD-583), a restored backup, a second machine, a run adopted into
+ * another scope -- and the write that would have cleared the chip never
+ * happened, so a gate stayed lit `running` or `failed` on a ticket that
+ * had been done for hours. Nothing ever revisited it, and the owner read
+ * the board and asked why CI was stalled.
+ *
+ * A verdict nothing revisits is a verdict that can only be wrong, so the
+ * status is derived rather than remembered: a ticket past a gate has
+ * passed it, one sent back at it has failed it, one standing at it is
+ * running it, and one that has not reached it has no verdict at all. No
+ * local state is consulted, so no local state can be lost.
  */
-export function gateReport(workflow, before, ticket, reason, at = now()) {
-  const verdict = (gate, status, summary) => ({
-    slot: gate.slot,
-    payload: {
-      jiraKey: ticket.key,
-      slot: gate.slot,
-      // One id per gate per workflow, so a pass replaces the refusal it
-      // answers instead of sitting beside it.
-      id: `${workflow.id}-${gate.slot}`.slice(0, 120),
-      kind: gate.kind,
-      label: gate.label,
-      stage: gate.stage,
-      status,
-      summary: String(summary).slice(0, 180),
-      updatedAt: at,
-    },
-  });
+function gateStatuses(ticket) {
+  const at = CYCLE_ORDER.indexOf(ticket.cycle);
+  const out = {};
+  for (const cycle of Object.keys(GATES)) {
+    const index = CYCLE_ORDER.indexOf(cycle);
+    // `done` is past every gate, whatever cycle it stopped at: a ticket
+    // cannot be finished with a gate still to pass.
+    if (ticket.state === 'done' || (at >= 0 && at > index)) out[cycle] = 'success';
+    else if (at === index && ticket.state === 'rework') out[cycle] = 'failed';
+    else if (at === index && ticket.state === 'running') out[cycle] = 'running';
+  }
+  return out;
+}
 
-  if (ticket.state === 'rework' && GATES[ticket.cycle]) {
-    const gate = GATES[ticket.cycle];
-    ticket.refusedAt = ticket.cycle;
-    return verdict(gate, 'failed', reason || `${gate.label} sent this back`);
+/**
+ * The sidecars a ticket's gates want written, and none it does not.
+ *
+ * `ticket.gates` is what was last SAID, and it is a hint and nothing
+ * more: it keeps a command that changed nothing from writing three
+ * reports, and losing it costs one extra write rather than a chip lit
+ * for ever. That is the difference this ticket is about -- the old
+ * marker was the only source of truth, and this one is an optimisation
+ * over a truth that is recomputed every time.
+ *
+ * A gate the ticket has not reached is left alone rather than cleared:
+ * `wanted` says nothing about it, and a verdict already on the board
+ * (a ticket sent back from audit all the way to build) is still true.
+ */
+export function gateReports(workflow, ticket, { reason, at = now() } = {}) {
+  const told = (ticket.gates && typeof ticket.gates === 'object') ? ticket.gates : {};
+  const wanted = gateStatuses(ticket);
+  const out = [];
+
+  for (const [cycle, status] of Object.entries(wanted)) {
+    if (told[cycle] === status) continue;
+    const gate = GATES[cycle];
+    const was = told[cycle];
+    const summary = status === 'failed'
+      ? (reason || `${gate.label} sent this back`)
+      : status === 'running'
+        ? (was === 'failed'
+          ? `Back at the ${gate.label.toLowerCase()} after rework`
+          : `${gate.label} running`)
+        : `${gate.label} passed${was === 'failed' ? ' on the way back' : ''}`;
+    out.push({
+      slot: gate.slot,
+      cycle,
+      payload: {
+        jiraKey: ticket.key,
+        slot: gate.slot,
+        // One id per gate per workflow, so a pass replaces the refusal it
+        // answers instead of sitting beside it. A sidecar lives at
+        // `runtime/<key>/<slot>.json`, so two tickets sharing an id are
+        // two separate files and neither stands on the other.
+        id: `${workflow.id}-${gate.slot}`.slice(0, 120),
+        kind: gate.kind,
+        label: gate.label,
+        stage: gate.stage,
+        status,
+        summary: String(summary).slice(0, 180),
+        updatedAt: at,
+      },
+    });
   }
-  const refused = before.refusedAt;
-  if (!refused || !GATES[refused] || ticket.state === 'rework') return undefined;
-  // Back AT the gate that refused it: the rework is done and the ticket
-  // is standing where it was turned away. The arrow said "sent back";
-  // it is not sent back any more, so the loop clears here and not only
-  // once the gate has passed. If the gate refuses it again the failed
-  // run replaces this one and the loop is drawn again. `refusedAt`
-  // stays, because the gate has not passed yet and its pass is still to
-  // be written.
-  if (ticket.state === 'running' && ticket.cycle === refused && before.state === 'rework') {
-    return verdict(GATES[refused], 'running', `Back at the ${GATES[refused].label.toLowerCase()} after rework`);
-  }
-  const past = ticket.state === 'done'
-    || CYCLE_ORDER.indexOf(ticket.cycle) > CYCLE_ORDER.indexOf(refused);
-  if (!past) return undefined;
-  delete ticket.refusedAt;
-  return verdict(GATES[refused], 'success', `${GATES[refused].label} passed on the way back`);
+
+  return out;
+}
+
+/**
+ * Remember that the board has been told, so the next command is quiet.
+ *
+ * Recorded by whoever SENT it and only once the report will land, which
+ * is the half of this that is easy to get wrong: a hint written for a
+ * report that failed is the original bug again with a new name -- the
+ * board would be wrong and every later command would believe it had
+ * already put it right. A report the outbox has queued counts as sent,
+ * because it will go.
+ */
+export function gateSaid(ticket, verdict) {
+  ticket.gates = { ...(ticket.gates || {}), [verdict.cycle]: verdict.payload.status };
 }
 
 // --- printing --------------------------------------------------------
@@ -725,21 +774,57 @@ export async function main(args, {
 
   if (sub === 'ticket') {
     const key = rest.filter((a) => !a.startsWith('--'))[0];
-    const before = { ...((target.tickets || []).find((t) => t.key === key) || {}) };
     const ticket = move(target, key, {
       state: flag(rest, 'state'), cycle: flag(rest, 'cycle'),
     });
-    const said = gateReport(target, before, ticket, flag(rest, 'reason'));
+    const said = gateReports(target, ticket, { reason: flag(rest, 'reason') });
+    /*
+     * And every OTHER ticket in the pool (MACLEOD-593). This is the
+     * revisiting: a gate chip is only ever as true as the last write,
+     * and the ticket it is on may never move again, so any command
+     * puts the whole pool's gates right rather than only the one just
+     * touched. It is cheap because `gateReports` writes nothing where
+     * the board already says what the ticket says -- in the ordinary
+     * case this loop sends nothing at all -- and it is what repairs a
+     * board after a marker was lost, without anybody noticing it was.
+     */
+    const repaired = (target.tickets || [])
+      .filter((t) => t !== ticket)
+      .flatMap((t) => gateReports(target, t).map((verdict) => ({ on: t, verdict })));
     save(state, config);
     await publish(target, config);
     // After the workflow, so a board that draws the loop already knows
     // the ticket is in rework. Never fatal: the plan is saved either way.
-    if (said) {
-      const sent = await sendReport('runtime', said.slot, said.payload, config).catch(() => ({ ok: false }));
+    const send = async (on, verdict) => {
+      const sent = await sendReport('runtime', verdict.slot, verdict.payload, config)
+        .catch(() => ({ ok: false }));
+      // Queued counts: the outbox will deliver it. Anything else and the
+      // hint is not written, so the next command says it again.
+      if (sent.ok || sent.queued) gateSaid(on, verdict);
+      return sent;
+    };
+    for (const verdict of said) {
+      const sent = await send(ticket, verdict);
       print(sent.ok
-        ? `${ticket.key}: the ${said.payload.label.toLowerCase()} is on the board as ${said.payload.status}.`
-        : `${ticket.key}: the ${said.payload.label.toLowerCase()} could not be sent to the board${sent.queued ? '; it is queued' : ''}.`);
+        ? `${ticket.key}: the ${verdict.payload.label.toLowerCase()} is on the board as ${verdict.payload.status}.`
+        : `${ticket.key}: the ${verdict.payload.label.toLowerCase()} could not be sent to the board${sent.queued ? '; it is queued' : ''}.`);
     }
+    /*
+     * A dozen at a time, and not one more after the first that does not
+     * land. A repair is never urgent -- the next command does the rest --
+     * and a command that sits through forty timeouts because the service
+     * is unreachable has turned a quiet correction into the slowest thing
+     * on the machine.
+     */
+    let put = 0;
+    for (const { on, verdict } of repaired.slice(0, 12)) {
+      const sent = await send(on, verdict);
+      if (!sent.ok && !sent.queued) break;
+      put += 1;
+    }
+    if (put) print(`Put ${put} gate ${put === 1 ? 'verdict' : 'verdicts'} on other tickets right.`);
+    // Again, because what the board has been told is part of the plan now.
+    save(state, config);
     const open = ready(target);
     print(`${ticket.key} is ${ticket.state}${ticket.cycle ? ` at ${ticket.cycle}` : ''}.`);
     print(open.phase
