@@ -96,6 +96,7 @@ export async function adminCall(config, method, route, payload) {
         ...(payload ? { 'Content-Type': 'application/json' } : {}),
       },
       body: payload ? JSON.stringify(payload) : undefined,
+      redirect: 'error',
       signal: AbortSignal.timeout(Number(config.serviceTimeoutMs || 10000)),
     });
   } catch (error) {

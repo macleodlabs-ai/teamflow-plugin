@@ -88,7 +88,27 @@ Environment equivalents include `TEAMFLOW_SERVICE_URL`, `TEAMFLOW_ACTOR_ID`, `TE
 
 `TEAMFLOW_API_KEY` is the last credential tried, for an environment that can neither open a browser nor mint an OIDC token. Legacy S3 reporting (`dataUri`, `tenantId`, `awsProfile`) still works when no service credential is available. See `docs/PLUGIN.md`.
 
-A project may override config in `.teamflow.json`.
+A project may override config in `.teamflow.json` — but only the keys that
+describe the project. A file inside a repository may not decide where a
+credential goes or which one is used, so `serviceUrl`, `authIssuer`,
+`authClientId`, `authScopes`, `authApiScope`, `apiKey`, `accessToken`,
+`dataUri`, `awsProfile` and `oidcAudience` are ignored there and only the
+environment or `~/.config/teamflow/config.json` set them. `teamflow status`
+and `teamflow doctor` name any key they ignored and the variable that still
+works.
+
+A credential is also sent only to the service that issued it, only over
+`https` unless the service is on `localhost`, and never across a redirect. An
+API key and a handed-in access token record no origin of their own, so they go
+only to TeamFlow, to `localhost`, or to an origin listed as `trustedOrigins` in
+`~/.config/teamflow/config.json` — the environment cannot add one, because
+inside an editor the environment is not reliably yours.
+
+To use your own TeamFlow, say so deliberately: `teamflow login --service <url>`
+once, or `serviceUrl` in that same file. Either records the origin for you.
+`teamflow login` refuses to start against a non-`localhost` address that only
+an environment variable names, because a sign-in hands that address an
+authorization code and your identity token.
 
 ## Audit detection
 

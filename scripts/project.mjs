@@ -112,6 +112,7 @@ export async function fetchProjects(config = {}, { ttlMs = TTL_MS, timeoutMs, no
   try {
     const response = await fetch(`${serviceUrl(config)}/v1/members/projects`, {
       headers: { [cred.header]: cred.value },
+      redirect: 'error',
       signal: AbortSignal.timeout(Number(timeoutMs || config.serviceTimeoutMs || 5000)),
     });
     let body;

@@ -3,6 +3,103 @@
 What changed in each published version of the TeamFlow plugin, newest first.
 Only what a person using it would notice.
 
+## 0.3.19
+
+- **Security: a repository you opened could take your TeamFlow credential.
+  Update to this version.** Every version up to and including 0.3.18 let a
+  `.teamflow.json` inside a repository set `serviceUrl` — the address the
+  plugin talks to — and the plugin then attached your machine's credential to
+  whatever address that file named. Opening a repository you did not write, in
+  any editor the plugin hooks into, was enough: the first hook sent your
+  credential to the address the file chose, with no prompt, nothing to click
+  and nothing visibly wrong, because the hooks exit quietly by design. Anyone
+  who did that could read your organisation's board — ticket keys and titles,
+  assignees, branches, summaries, tracker connections — and write to it, and
+  every later report from that checkout went to them as well. The same file
+  could hand over an API key, or point the legacy S3 path at their bucket
+  through one of your AWS profiles.
+
+  **Who was exposed:** anyone who opened a repository they did not write while
+  the plugin was installed and signed in. Nothing else was needed. There is no
+  evidence anybody did it, and this was found by us rather than reported.
+
+  **What is fixed:** a file in a repository may describe the project and
+  nothing else. `serviceUrl`, `authIssuer`, `authClientId`, `authScopes`,
+  `authApiScope`, `apiKey`, `accessToken`, `dataUri`, `awsProfile` and
+  `oidcAudience` are now ignored when they come from a repository's own
+  `.teamflow.json`; the environment and your own
+  `~/.config/teamflow/config.json` keep full power over all of them, because
+  those are you speaking. On top of that, a credential is now bound to the
+  service that issued it and is refused — not quietly swapped for another one
+  — anywhere else, and a credential never travels over plain `http` to
+  anything but `localhost`.
+
+  **If you point TeamFlow at your own service** from a repository file,
+  reporting will stop until you move that setting. `teamflow status` and
+  `teamflow doctor` name the exact key they ignored and the environment
+  variable that replaces it, and the plugin now says so once at the start of a
+  session too, rather than going quiet. You are not signed out by this update.
+
+  **Updating is the fix.** If you are worried about a specific repository, you
+  can also revoke this machine from the members page and sign in again.
+
+- **An API key is no longer sent to a service you have not named.** A
+  repository cannot only ship a config file — it can ship a
+  `.claude/settings.json` with an `env` block, an `.envrc`, or an editor
+  workspace setting, and any of those sets `TEAMFLOW_SERVICE_URL` for every
+  process your editor starts. A signed-in session is safe from that, because
+  it now records where it was issued; an API key or a handed-in access token
+  records nothing, so one of those environment variables was enough to send it
+  anywhere. An API key now goes only to TeamFlow itself, to `localhost`, or to
+  an origin you listed as `"trustedOrigins"` in your own
+  `~/.config/teamflow/config.json` — a file a repository cannot write.
+  `teamflow login` against your own service adds it for you, so most
+  self-hosted setups need nothing typed; if you use only an API key against
+  one, `status` and `doctor` print the exact line to add the first time you
+  are refused.
+
+- **Signing in to your own TeamFlow is now something you say, not something a
+  variable says for you.** `teamflow login --service <url>`, or `serviceUrl` in
+  your own `~/.config/teamflow/config.json`. If the only thing naming a
+  non-TeamFlow address is an environment variable, `teamflow login` stops
+  before it fetches anything and tells you where the address came from — a
+  sign-in hands that address an authorization code and your identity token,
+  and a repository can set an environment variable through a
+  `.claude/settings.json` "env" block, an `.envrc` or an editor workspace
+  setting. `localhost` is unaffected, so local development and previews work
+  as before. The messages you see when a credential is held back no longer
+  suggest signing in at the address that was just refused; they say where that
+  address came from first, and what to do about it second.
+
+- **A credential no longer follows a redirect.** Every request the plugin makes
+  now refuses one outright. `fetch` drops an `Authorization` header when a
+  response redirects it to another host, but it does *not* drop a custom
+  header, and TeamFlow's API key travels as `X-Api-Key` — so a service
+  answering `301` could have had the request replayed, key included, at
+  whatever address it named. If your configuration points at an alias of the
+  TeamFlow host rather than the host itself (`www.`, or the old
+  `teamflow.macleodlabs.com`), reporting will now tell you the address
+  redirected and ask you to name the primary host, instead of failing as
+  though the network were down.
+
+- **A session signed in inside a hostile repository is retired rather than
+  reused.** If you ran `teamflow login` while one of those repositories was
+  open, your session file recorded the attacker's sign-in service, and
+  refreshing it would have handed them a fresh token every hour — including
+  after this update, since nothing else about the session looks wrong. The
+  plugin now checks that the sign-in service belongs to the service that
+  issued the session, and refuses to use one that does not: you are asked to
+  run `teamflow login` again, and to revoke the old session on the members
+  page. Ordinary sessions are untouched.
+
+- **Update every copy of the plugin on the machine.** Two versions share one
+  data directory. 0.3.18's `login` and `deviceLogin` write a session object
+  that has no place for the new "where was this issued" field, so signing in
+  again from a stale 0.3.18 copy strips it — and a self-hosted user would then
+  find the up-to-date copy refusing to report until they sign in with it. It
+  fails closed, nothing leaks, and `teamflow doctor` says so when it sees it;
+  the remedy is the same one 0.3.14 taught, which is to update all of them.
+
 ## 0.3.18
 
 - **`teamflow tidy` no longer says it is closing issues in your tracker when

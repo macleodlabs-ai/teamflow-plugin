@@ -17,7 +17,11 @@ import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
 
-import { defaultServiceUrl, readJson, safeExec, serviceUrl, writeJson } from './core.mjs';
+import {
+  credentialDestination, credentialRefusal, defaultServiceUrl, globalConfigPath,
+  isLoopbackOrigin, originOf, readJson, safeExec, serviceUrl, serviceUrlSource,
+  trustedOrigins, unreachableReason, writeJson,
+} from './core.mjs';
 import { BY_ID } from './tools.mjs';
 
 // Fixed and small on purpose: every one of these has to be registered
@@ -58,6 +62,141 @@ export function readSession() {
 
 export function isDeviceSession(session = readSession()) {
   return session?.kind === DEVICE_KIND && Boolean(session.deviceToken);
+}
+
+/**
+ * The origin that issued this session, and so the only one it may be
+ * sent to (MACLEOD-616).
+ *
+ * Written at sign-in from `serviceUrl(config)`. Sessions signed in
+ * before this release recorded nothing, and they are not signed out for
+ * it: an unrecorded origin is read as the hosted service, which is where
+ * every real one was issued. The field is additive — an older plugin
+ * sharing this data directory reads the file, ignores the key it has
+ * never heard of and keeps working.
+ *
+ * Absent means hosted. It must NOT mean "unbound, adopt whatever origin
+ * this session first reaches", however tempting that is as a way to
+ * spare the handful of people who signed in against a preview: that is
+ * trust on first use where the attacker picks the first use. A hostile
+ * `.claude/settings.json` setting `TEAMFLOW_SERVICE_URL` in the first
+ * session after the upgrade would bind the victim's session to the
+ * attacker's origin permanently, which is a worse bug than the one this
+ * whole change exists to fix. Somebody genuinely elsewhere runs
+ * `teamflow login` again, which records where they are.
+ */
+export function sessionOrigin(session = readSession()) {
+  return session?.serviceOrigin || originOf(defaultServiceUrl());
+}
+
+/** What to stamp on a session being written now. */
+function originToRecord(config) {
+  return originOf(serviceUrl(config)) || originOf(defaultServiceUrl());
+}
+
+/**
+ * Signing in somewhere is saying that somewhere is yours (MACLEOD-616
+ * follow-up, F2).
+ *
+ * The session itself records its origin and needs nothing more. This is
+ * for the credential that cannot: an API key used against the same
+ * self-hosted service, which has no record of where it came from and is
+ * otherwise refused anywhere but the hosted host. Deliberately a write
+ * to the user's own file — the one place a repository cannot reach —
+ * and never a write from the environment's say-so alone.
+ */
+function rememberTrustedOrigin(config, typed = undefined) {
+  const origin = originToRecord(config);
+  if (!origin || origin === originOf(defaultServiceUrl())) return false;
+  // Provenance, not the fact of a sign-in. Signing in against an address
+  // an environment variable chose is not the user naming that address;
+  // it is the user doing what the error message told them to, and the
+  // first version of this function turned that into a permanent entry in
+  // their own global file (MACLEOD-616 follow-up, B1). Only `--service`
+  // typed this run, or `serviceUrl` already in the file, counts.
+  const source = serviceUrlSource(config, typed);
+  if (source !== 'typed' && source !== 'global') return false;
+  if (trustedOrigins().includes(origin)) return false;
+  const file = globalConfigPath();
+  const existing = readJson(file, {}) || {};
+  const listed = Array.isArray(existing.trustedOrigins) ? existing.trustedOrigins : [];
+  writeJson(file, { ...existing, trustedOrigins: [...listed, origin] });
+  return true;
+}
+
+/**
+ * A sign-in at an address nobody deliberately chose does not happen
+ * (MACLEOD-616 follow-up, B1).
+ *
+ * Checked before `/v1/capabilities` is fetched, before a browser is
+ * opened, before anything at all goes to the origin — because the
+ * sign-in *is* the leak, not merely its consequence. What a hostile
+ * origin gets out of one is the authorize URL it can dress up as
+ * anything, the authorization code with its PKCE exchange, and the
+ * `id_token` that `seatCall` posts to it. Refusing afterwards would be
+ * refusing after the interesting part.
+ *
+ * Loopback is exempt, so `npm run dev`, the preview and the e2e suite
+ * sign in against a local stack exactly as before. The one flow this
+ * costs is a self-hoster who configures purely by environment variable,
+ * and their ask is `--service <url>` once, or one line in their own
+ * config file.
+ */
+function deliberateService(config, typed) {
+  const origin = originToRecord(config);
+  if (isLoopbackOrigin(origin)) return { ok: true };
+  const source = serviceUrlSource(config, typed);
+  if (source !== 'environment') return { ok: true };
+  return {
+    ok: false,
+    refused: true,
+    reason: `TEAMFLOW_SERVICE_URL in this environment names ${origin}, so TeamFlow did not sign in `
+      + 'there — a sign-in hands that address an authorization code and your identity token, and an '
+      + 'environment variable is not a deliberate choice of who to sign in to. A repository can set '
+      + 'one: a `.claude/settings.json` "env" block, an `.envrc` or an editor workspace setting all '
+      // The command is printed with a placeholder, never with the
+      // declined origin filled in (MACLEOD-616 final audit): this message
+      // is read by somebody whose sign-in has just failed, and a line
+      // they can paste is a line they will paste.
+      + `reach this process. If ${origin} is genuinely your service, say so deliberately by typing `
+      + "its address yourself — `teamflow login --service <your service's address>` — or put "
+      + `\`serviceUrl\` in ${globalConfigPath()}.`,
+  };
+}
+
+/**
+ * The origins this machine's *own* identity provider may live on
+ * (MACLEOD-616 follow-up, F1).
+ *
+ * `session.tokenUrl` is where the refresh token goes, and it was learned
+ * at sign-in from the service's `/v1/capabilities`. Before this change a
+ * repository could choose that service, so somebody who ran
+ * `teamflow login` inside a hostile checkout has an attacker's token
+ * endpoint written into their session file — and the guards elsewhere
+ * all pass, because the session reads as hosted and the attacker's URL
+ * is https. The upgrade would keep handing them a refresh token for as
+ * long as the session lived.
+ *
+ * So the token endpoint is checked against where the session says it was
+ * issued. The hosted service's provider is NOT on the hosted origin —
+ * Cognito's custom domain is `auth.codercat.io` by design — so it is
+ * named here rather than derived, and a session that recorded its own
+ * origin may also use a provider on that origin or on a trusted one.
+ */
+const HOSTED_TOKEN_ORIGIN = 'https://auth.codercat.io';
+
+export function tokenOriginAllowed(session = readSession()) {
+  const token = originOf(session?.tokenUrl);
+  if (!token) return false;
+  if (token === HOSTED_TOKEN_ORIGIN) return true;
+  if (isLoopbackOrigin(token)) return true;
+  // Only a session that recorded where it was issued may name a provider
+  // of its own: an unrecorded one reads as hosted, and the hosted
+  // provider is the line above.
+  if (!session?.serviceOrigin) return false;
+  return token === session.serviceOrigin
+    || token === originOf(session.issuer)
+    || trustedOrigins().includes(token);
 }
 
 export function hasSession() {
@@ -138,7 +277,7 @@ async function capabilities(config) {
   let detail;
   for (let attempt = 0; attempt < CAPABILITIES_ATTEMPTS; attempt += 1) {
     try {
-      const response = await fetch(url, { signal: AbortSignal.timeout(timeoutMs) });
+      const response = await fetch(url, { redirect: 'error', signal: AbortSignal.timeout(timeoutMs) });
       if (response.status >= 500) {
         detail = `the service answered ${response.status}`;
         continue;
@@ -221,16 +360,26 @@ export async function discoverAuth(config = {}) {
 // --- the token endpoint --------------------------------------------
 
 async function tokenRequest(tokenUrl, params, config) {
+  // The authorization code and the refresh token both go out here, and
+  // the address came from the service's own `/v1/capabilities` answer —
+  // a URL from a response, which is exactly the shape part 4 of
+  // MACLEOD-616 is about. It gets the transport rule the rest do: https,
+  // or this machine.
+  const origin = originOf(tokenUrl);
+  if (!origin || (!origin.startsWith('https:') && !isLoopbackOrigin(origin))) {
+    return { ok: false, reason: `refusing to send a credential to the token endpoint at ${tokenUrl || 'no address'}: https is required for anything but localhost` };
+  }
   let response;
   try {
     response = await fetch(tokenUrl, {
       method: 'POST',
       headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
       body: new URLSearchParams(params).toString(),
+      redirect: 'error',
       signal: AbortSignal.timeout(Number(config.serviceTimeoutMs || 10000)),
     });
   } catch (error) {
-    return { ok: false, reason: `token endpoint unreachable: ${error instanceof Error ? error.message : String(error)}` };
+    return { ok: false, reason: unreachableReason(error, { serviceUrl: tokenUrl }) };
   }
   let body;
   try { body = await response.json(); } catch { body = undefined; }
@@ -328,7 +477,14 @@ export async function login(config = {}, {
   // decide whether the URL is opened here or handed to the person.
   noBrowser = false, canOpenBrowser = browserPossible(), tty = Boolean(process.stdout.isTTY),
   notify = printLine,
+  // `--service <url>`, as typed this run. The one thing that makes a
+  // non-hosted address a deliberate choice rather than a variable.
+  service = undefined,
 } = {}) {
+  // Before discovery: nothing, not even a capabilities probe, goes to an
+  // address only the environment named (MACLEOD-616 follow-up, B1).
+  const deliberate = deliberateService(config, service);
+  if (!deliberate.ok) return deliberate;
   const auth = await discoverAuth(config);
   if (!auth.ok) return auth;
 
@@ -420,6 +576,9 @@ export async function login(config = {}, {
       issuer: auth.issuer,
       clientId: auth.clientId,
       tokenUrl: auth.tokenUrl,
+      // The service that issued this session, and the only one it will
+      // be sent to afterwards (MACLEOD-616).
+      serviceOrigin: originToRecord(config),
       refreshToken: exchanged.body.refresh_token,
       email,
       // Which organisation this session is bound to, so `teamflow org` and
@@ -429,6 +588,10 @@ export async function login(config = {}, {
       createdAt: new Date().toISOString(),
     });
     rememberToken(exchanged.body, exchanged.body.refresh_token, email);
+    // Signing in *deliberately* here is saying this service is yours,
+    // which is what lets an API key against it be used later. Signing in
+    // because a variable pointed here is not (MACLEOD-616, B1).
+    rememberTrustedOrigin(config, service);
     return {
       ok: true, email, issuer: auth.issuer, account: bound.account, accountName: bound.name,
       bound: bound.bound, opened, printedUrl,
@@ -706,10 +869,11 @@ async function deviceCall(config, route, payload) {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(payload),
+      redirect: 'error',
       signal: AbortSignal.timeout(Number(config.serviceTimeoutMs || 10000)),
     });
   } catch (error) {
-    return { ok: false, unreachable: true, reason: `service unreachable: ${error instanceof Error ? error.message : String(error)}` };
+    return { ok: false, unreachable: true, reason: unreachableReason(error, config) };
   }
   let body;
   try { body = await response.json(); } catch { body = undefined; }
@@ -766,7 +930,13 @@ const DEVICE_REFUSALS = {
 export async function deviceLogin(config = {}, {
   notify = printLine, label = deviceLabel(), tool = detectTool(),
   timeoutMs = LOGIN_TIMEOUT_MS, sleep = wait, now = () => Date.now(),
+  service = undefined,
 } = {}) {
+  // As in `login`, and before the first request: a device grant is a
+  // credential this machine will hold, and an address the environment
+  // chose is not a choice (MACLEOD-616 follow-up, B1).
+  const deliberate = deliberateService(config, service);
+  if (!deliberate.ok) return deliberate;
   const started = await deviceCall(config, '/v1/auth/device', { label, client: tool });
   if (!started.ok) {
     return { ok: false, reason: `the service would not start a device sign-in: ${started.reason}` };
@@ -804,12 +974,16 @@ export async function deviceLogin(config = {}, {
         // It is the credential, and revoking it is instant.
         deviceToken: body.access_token,
         deviceId: body.device_id,
+        // As for a browser session: the origin that granted it
+        // (MACLEOD-616).
+        serviceOrigin: originToRecord(config),
         label,
         email: body.member,
         account: body.account,
         createdAt: new Date().toISOString(),
       });
       forgetCachedToken();
+      rememberTrustedOrigin(config, service);
       return {
         ok: true, device: true, email: body.member, account: body.account,
         accountName: body.account_name, deviceId: body.device_id, label,
@@ -857,15 +1031,21 @@ export async function signOut(config = {}) {
 
 export async function revokeDevice(config, deviceId, token) {
   if (!deviceId || !token) return { ok: false, reason: 'no device credential to revoke' };
+  // The device credential in the clear, in a header, to whatever this
+  // config names. Same rule as everywhere else (MACLEOD-616): the local
+  // file still goes, because `signOut` clears it whatever this answers.
+  const target = credentialDestination(config, sessionOrigin());
+  if (!target.ok) return { ok: false, refused: true, reason: target.reason };
   let response;
   try {
     response = await fetch(`${serviceUrl(config)}/v1/members/devices/${encodeURIComponent(deviceId)}`, {
       method: 'DELETE',
       headers: { Authorization: `Bearer ${token}` },
+      redirect: 'error',
       signal: AbortSignal.timeout(Number(config.serviceTimeoutMs || 10000)),
     });
   } catch (error) {
-    return { ok: false, reason: `service unreachable: ${error instanceof Error ? error.message : String(error)}` };
+    return { ok: false, reason: unreachableReason(error, config) };
   }
   if (!response.ok) {
     let body;
@@ -903,6 +1083,11 @@ export async function switchOrg(config, idToken, account) {
 
 async function seatCall(config, route, idToken, account) {
   if (!idToken) return { ok: false, reason: 'the identity provider returned no ID token' };
+  // An ID token in a body is still a credential. No origin is bound yet
+  // — this runs during sign-in, before a session exists — so it gets the
+  // transport half of the rule (MACLEOD-616).
+  const target = credentialDestination(config);
+  if (!target.ok) return { ok: false, refused: true, reason: target.reason };
   let response;
   try {
     response = await fetch(`${serviceUrl(config)}${route}`, {
@@ -911,10 +1096,11 @@ async function seatCall(config, route, idToken, account) {
       // `account` only when one has been chosen: a service that predates the
       // chooser sees exactly the request it saw before.
       body: JSON.stringify({ id_token: idToken, ...(account ? { account } : {}) }),
+      redirect: 'error',
       signal: AbortSignal.timeout(Number(config.serviceTimeoutMs || 10000)),
     });
   } catch (error) {
-    return { ok: false, reason: `service unreachable: ${error instanceof Error ? error.message : String(error)}` };
+    return { ok: false, reason: unreachableReason(error, config) };
   }
   let body;
   try { body = await response.json(); } catch { body = undefined; }
@@ -965,10 +1151,11 @@ export async function listOrgs(config, idToken) {
   try {
     response = await fetch(`${serviceUrl(config)}/v1/members/me`, {
       headers: { Authorization: `Bearer ${idToken}` },
+      redirect: 'error',
       signal: AbortSignal.timeout(Number(config.serviceTimeoutMs || 10000)),
     });
   } catch (error) {
-    return { ok: false, reason: `service unreachable: ${error instanceof Error ? error.message : String(error)}` };
+    return { ok: false, reason: unreachableReason(error, config) };
   }
   let body;
   try { body = await response.json(); } catch { body = undefined; }
@@ -1044,6 +1231,12 @@ function rememberToken(body, refreshToken, email) {
 export async function accessToken(config = {}) {
   const session = readSession();
   if (!session) return { ok: false, reason: 'not signed in; run /teamflow:login' };
+  // The same rule `credential()` applies, applied again here because
+  // this is the other door into a stored credential: `adminIdToken` and
+  // anything else that wants a token comes through it and not through
+  // `credential()` (MACLEOD-616).
+  const target = credentialDestination(config, sessionOrigin(session));
+  if (!target.ok) return { ok: false, refused: true, reason: target.reason };
   // A device credential is the credential. Nothing to exchange, no
   // expiry to race, and no round trip on the way to a report.
   if (isDeviceSession(session)) {
@@ -1053,6 +1246,19 @@ export async function accessToken(config = {}) {
       device: true,
       email: session.email,
       refreshed: false,
+    };
+  }
+  // The refresh token is about to be sent to `session.tokenUrl`, which a
+  // pre-fix sign-in inside a hostile repository could have chosen
+  // (MACLEOD-616 follow-up, F1). Checked before the cache, so a session
+  // already holding a valid access token cannot keep using one either.
+  if (!tokenOriginAllowed(session)) {
+    return {
+      ok: false,
+      refused: true,
+      reason: 'this session names a sign-in service that is not the one it was issued by, which is '
+        + 'what a repository could do before this version. It has not been used. Run `teamflow login` '
+        + 'again to replace it, and revoke the old session on the members page.',
     };
   }
   const refresh = fingerprint(session.refreshToken);
@@ -1131,6 +1337,7 @@ async function githubIdToken(config) {
   const url = `${process.env.ACTIONS_ID_TOKEN_REQUEST_URL}&audience=${encodeURIComponent(audience)}`;
   const response = await fetch(url, {
     headers: { Authorization: `Bearer ${process.env.ACTIONS_ID_TOKEN_REQUEST_TOKEN}` },
+    redirect: 'error',
     signal: AbortSignal.timeout(Number(config.serviceTimeoutMs || 10000)),
   });
   const body = await response.json().catch(() => undefined);
@@ -1149,6 +1356,7 @@ export async function githubOidcAccessToken(config = {}) {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ token: id.token }),
+      redirect: 'error',
       signal: AbortSignal.timeout(Number(config.serviceTimeoutMs || 10000)),
     });
     let body;
@@ -1162,6 +1370,19 @@ export async function githubOidcAccessToken(config = {}) {
       ok: true, attempted: true, token: body.access_token,
       expiresIn: Number(body.expires_in) || undefined,
       account: body.account, repository: body.repository,
+      /*
+       * The origin that just minted this token, carried in process and
+       * never through config (MACLEOD-616 follow-up).
+       *
+       * A token is bound to its issuer by construction: sending it back
+       * to the service that issued it leaks nothing, whoever named that
+       * service. Without this the CI path fell to `ambientDestination`
+       * and a self-hosted GitHub Actions run was refused outright —
+       * fail-closed, but a regression. It cannot arrive from the
+       * environment (`loadConfig` reads no variable for it) or from a
+       * repository (`accessTokenOrigin` is in `UNTRUSTED_PROJECT_KEYS`).
+       */
+      origin: originOf(serviceUrl(config)),
     };
   } catch (error) {
     return { ok: false, attempted: true, reason: `OIDC exchange failed: ${error instanceof Error ? error.message : String(error)}` };
@@ -1184,6 +1405,14 @@ export async function listRepos(config, credentialHeader) {
 
 async function repoCall(config, method, route, credentialHeader, payload) {
   if (!credentialHeader) return { ok: false, reason: 'not signed in; run /teamflow:login' };
+  // The header was resolved by `credential()` against this same config,
+  // so this cannot currently fire — it is here because the header is a
+  // parameter, and a future caller that mints one some other way would
+  // otherwise route around the rule (MACLEOD-616). `credentialRefusal`
+  // rather than `credentialDestination` so it asks the same question of
+  // the same credential, ambient ones included.
+  const refused = credentialRefusal(config);
+  if (refused) return { ok: false, refused: true, reason: refused };
   let response;
   try {
     response = await fetch(`${serviceUrl(config)}${route}`, {
@@ -1193,10 +1422,11 @@ async function repoCall(config, method, route, credentialHeader, payload) {
         ...(payload ? { 'Content-Type': 'application/json' } : {}),
       },
       body: payload ? JSON.stringify(payload) : undefined,
+      redirect: 'error',
       signal: AbortSignal.timeout(Number(config.serviceTimeoutMs || 10000)),
     });
   } catch (error) {
-    return { ok: false, reason: `service unreachable: ${error instanceof Error ? error.message : String(error)}` };
+    return { ok: false, reason: unreachableReason(error, config) };
   }
   let body;
   try { body = await response.json(); } catch { body = undefined; }

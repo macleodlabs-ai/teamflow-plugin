@@ -127,6 +127,7 @@ export async function mint(config = {}) {
       method: 'POST',
       headers: { [cred.header]: cred.value, 'content-type': 'application/json' },
       body: '{}',
+      redirect: 'error',
       signal: AbortSignal.timeout(Number(config.serviceTimeoutMs || 5000)),
     });
     let body;

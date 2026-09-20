@@ -18,6 +18,7 @@ import {
   claimLaunch,
   classifyTool,
   credentialKind,
+  credentialRefusal,
   detectCandidates,
   enrichBinding,
   isAdHocKey,
@@ -119,7 +120,7 @@ function projectSentence(project) {
 // flipped between whichever worktree had bound last. An agent reads its
 // own binding and the session reads its own; neither can see the other's.
 export function claudeContext(event, state, justBound, stale = staleBuildNotice(), project = undefined,
-  signedIn = true, refused = undefined) {
+  signedIn = true, refused = undefined, credentialRefused = undefined) {
   if (!FAST.includes(event)) return undefined;
   // Said on SessionStart only. A session loads plugin code once, so
   // the answer cannot change until it restarts, and repeating it on
@@ -137,6 +138,20 @@ export function claudeContext(event, state, justBound, stale = staleBuildNotice(
   // (MACLEOD-586). Once a session, like the rest of this.
   const refusal = event === 'SessionStart' ? refusalLine(refused) : undefined;
   if (refusal) credential.push(`TeamFlow: ${refusal}`);
+  /*
+   * And beside those: the credential exists but may not go where this
+   * machine is pointed (MACLEOD-616).
+   *
+   * Somebody genuinely self-hosted, who signed in before the upgrade and
+   * so recorded no origin, is now refused against their own service.
+   * That is the right outcome — nothing leaks — but they would learn it
+   * only by running `status` or `doctor`, and a hook that quietly stops
+   * reporting is the same silence that hid the original bug for as long
+   * as it hid. Once a session, like the rest of this, and still exit 0.
+   */
+  if (event === 'SessionStart' && credentialRefused) {
+    credential.push(`TeamFlow: nothing is reaching the board — ${credentialRefused}`);
+  }
   if (!state.binding?.key) {
     return JSON.stringify({
       hookSpecificOutput: {
@@ -263,7 +278,8 @@ export async function flushPendingEnds(config, limit = 3, sessionId = undefined)
     if (flushed >= limit) break;
     flushed += 1;
     /*
-     * Its OWN repository's configuration, never the caller's.
+     * Its OWN repository's configuration, never the caller's — and what
+     * that is worth changed under this line (MACLEOD-616).
      *
      * `sessions/` is one directory per machine, shared by every
      * repository and every client on it, and `publishState` takes the
@@ -271,8 +287,21 @@ export async function flushPendingEnds(config, limit = 3, sessionId = undefined)
      * with the current event's config therefore posted one client's
      * ticket, stage, summary, repository and branch to another client's
      * service under another client's key — which is the one thing this
-     * codebase exists not to do. A report goes out under the
-     * credential of the repository it describes, or it does not go out.
+     * codebase exists not to do.
+     *
+     * A repository's own file can no longer carry a `serviceUrl` or an
+     * `apiKey`, so `loadConfig(actor.cwd)` now differs from the caller's
+     * config only in the project facts — `tenantId` above all. The
+     * service and the credential come from the environment, which is the
+     * same one for every actor in this process. So the tenant check
+     * below still bites, and the serviceUrl check below it only bites
+     * across processes; what actually keeps one organisation's end off
+     * another's board within a process is the `actor.account` line after
+     * them, and that one line is now the whole guard. It is worth
+     * knowing that exactly one test stands behind it — "an agent working
+     * under another account's credential is not flushed under the
+     * caller's" in integration/agents.test.mjs — and that deleting the
+     * line reproduces the 0.3.14/0.3.15 leak.
      */
     const own = loadConfig(actor.cwd);
     if (!credentialKind(own)) {
@@ -596,7 +625,17 @@ export async function handleEvent(input = {}) {
     ? await resolveProject(info?.repository, config, { timeoutMs: 1500 })
     : undefined;
 
-  return { state, justBound, event, project, signedIn, refused: staleOrg || refused };
+  return {
+    state,
+    justBound,
+    event,
+    project,
+    signedIn,
+    refused: staleOrg || refused,
+    // Local and cheap, like `signedIn` beside it: a session file and the
+    // configuration, no network (MACLEOD-616).
+    credentialRefused: credentialRefusal(config),
+  };
 }
 
 // Every hook entry runs inside this. Reporting must never break the

@@ -55,6 +55,12 @@ const payload = {
 const ci = await auth.githubOidcAccessToken(config);
 if (ci.ok) {
   config.accessToken = ci.token;
+  // And which service minted it, so it may be sent back there whatever
+  // named that address: a token returning to its own issuer leaks
+  // nothing, and without this a self-hosted Actions run is refused
+  // (MACLEOD-616). In process only — never a config key anything else
+  // can set.
+  config.accessTokenOrigin = ci.origin;
   // The exchange already said which organisation the repository is
   // registered to. Carried so a report queued offline knows whose it is
   // without a second call, and so a token replaced an hour later still

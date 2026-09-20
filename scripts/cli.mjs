@@ -17,6 +17,9 @@ import {
   gitInfo,
   isWorktree,
   latestSessionForCwd,
+  credentialRefusal,
+  ignoredProjectKeys,
+  ignoredProjectLine,
   loadConfig,
   localBindingPath,
   organisationScope,
@@ -51,7 +54,12 @@ import {
 const TRACKER_MCP = { jira: 'atlassian', linear: 'linear', github: 'github' };
 const USAGE = `teamflow \u2014 delivery reporting for TeamFlow
 
-  teamflow login [--org <id>] [--no-browser] [--device]  sign in once, naming an org if asked for one
+  teamflow login [--org <id>] [--no-browser] [--device] [--service <url>]
+                                   sign in once, naming an org if asked for one;
+                                   --service to sign in to your own TeamFlow
+                                   rather than the hosted one (an environment
+                                   variable is not enough — a repository can
+                                   set one)
   teamflow logout                  remove the session
   teamflow org [switch <id>]       which organisation this session syncs under
   teamflow status                  who is signed in, what is bound, what was sent
@@ -117,6 +125,7 @@ async function trackerConnections(config) {
   try {
     const response = await fetch(`${serviceUrl(config)}/v1/members/trackers`, {
       headers: { [cred.header]: cred.value },
+      redirect: 'error',
       signal: AbortSignal.timeout(Number(config.serviceTimeoutMs || 5000)),
     });
     let body;
@@ -213,6 +222,8 @@ async function status() {
   // or the boundedness is indistinguishable from not working.
   const { reconcileLine } = await import('./reconcile.mjs');
   const tidied = reconcileLine();
+  const ignoredConfig = ignoredProjectLine(ignoredProjectKeys(cwd));
+  const refusedCredential = credentialRefusal(config);
   print({
     tenantId: tenantId(config),
     pluginVersion: pluginVersion() || 'unknown',
@@ -252,6 +263,13 @@ async function status() {
     ...(tidied ? { reconcile: tidied } : {}),
     transport: transportOf(config),
     serviceUrl: serviceUrl(config),
+    // The repository asked for something it is not allowed to decide,
+    // and was ignored. Said here rather than nowhere: a developer with a
+    // legitimate self-hosted or preview service finds out why reporting
+    // stopped, and gets the one line that fixes it (MACLEOD-616).
+    ...(ignoredConfig ? { configIgnored: ignoredConfig } : {}),
+    // And the other half: a credential this service may not be sent.
+    ...(refusedCredential ? { credentialRefused: refusedCredential } : {}),
     credential: credentialKind(config) || 'none',
     identity: identity(probe?.email || session?.email, probe?.account?.account)
       || (credentialKind(config) ? 'not verified; run /teamflow:doctor' : 'not signed in; run /teamflow:login'),
@@ -407,6 +425,8 @@ async function doctor() {
    */
   const { reconcileLine } = await import('./reconcile.mjs');
   const tidied = reconcileLine();
+  const ignoredConfig = ignoredProjectLine(ignoredProjectKeys(cwd));
+  const refusedCredential = credentialRefusal(config);
   const report = {
     claudeProbe: claudeBin ? 'ran' : `skipped: ${claudeSkipped}`,
     pluginVersion: pluginVersion() || 'unknown',
@@ -422,6 +442,11 @@ async function doctor() {
     reconcile: tidied || 'no pass recorded yet; run `teamflow tidy`',
     transport,
     serviceUrl: serviceUrl(config),
+    // Findings, not trivia (MACLEOD-616). Either one means reports are
+    // not arriving, and neither has any other symptom: the hooks exit 0
+    // and print nothing.
+    ...(ignoredConfig ? { configIgnored: ignoredConfig } : {}),
+    ...(refusedCredential ? { credentialRefused: refusedCredential } : {}),
     credential: credentialKind(config) || 'none',
     signedIn: auth.readSession() ? `yes, ${auth.readSession().email || 'session present'}` : 'no; run /teamflow:login',
     apiKeyFallback: config.apiKey ? 'configured' : 'not configured',
@@ -540,6 +565,22 @@ function orgFlag(list) {
   return at === -1 ? undefined : list[at + 1];
 }
 
+/**
+ * `--service <url>`: signing in somewhere other than TeamFlow, said out
+ * loud (MACLEOD-616).
+ *
+ * The only way, other than `serviceUrl` in the user's own config file,
+ * to sign in against a non-hosted address — and the only thing that
+ * makes the plugin remember that address as one an API key may go to
+ * afterwards. An environment variable does not count, because a
+ * repository can set one and the whole of MACLEOD-616 is that a
+ * repository does not get to choose where credentials go.
+ */
+function serviceFlag(list) {
+  const at = list.indexOf('--service');
+  return at === -1 ? undefined : list[at + 1];
+}
+
 // Three ways in, and the command picks between them rather than
 // asking: a browser here, a URL to open here, or a code to type into
 // a browser anywhere. The third is the only one that works when the
@@ -571,12 +612,17 @@ async function login() {
   const noBrowser = args.includes('--no-browser') || Boolean(config.noBrowser);
   const wantsDevice = args.includes('--device');
   const canOpen = auth.browserPossible();
+  // `--service` is the address as well as the provenance: it is what the
+  // sign-in talks to, and the reason the plugin may trust it afterwards.
+  const service = serviceFlag(args);
+  if (service) config.serviceUrl = service;
   if (wantsDevice || ((noBrowser || !canOpen) && await serviceOffersDevice())) {
     return deviceLogin(wantsDevice ? undefined
       : `No browser can be opened here${canOpen ? '' : ' (no display)'}, so TeamFlow is asking for a code instead.`,
     before);
   }
   const result = await auth.login(config, {
+    service,
     account: orgFlag(args),
     // `--no-browser` is for the person who knows their box has none, or
     // whose browser is somewhere else entirely. The URL is printed and
@@ -645,7 +691,9 @@ async function deviceLogin(because, before) {
     // service asks it there when the address holds several seats.
     print('`--org` is not used by a device sign-in; the browser asks which organisation.');
   }
-  const result = await auth.deviceLogin(config);
+  const service = serviceFlag(args);
+  if (service) config.serviceUrl = service;
+  const result = await auth.deviceLogin(config, { service });
   if (!result.ok) {
     // A code is one-shot: expired, spent or never approved, the way out
     // is always a fresh one, and a failure that does not say so leaves
@@ -740,6 +788,7 @@ async function trackers() {
       method: 'POST',
       headers: { [cred.header]: cred.value, 'content-type': 'application/json' },
       body: JSON.stringify({ ...(filter ? { filter } : {}), ...(scope ? { scope } : {}) }),
+      redirect: 'error',
       signal: AbortSignal.timeout(Number(config.serviceTimeoutMs || 5000)),
     },
   );
