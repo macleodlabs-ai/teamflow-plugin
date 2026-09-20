@@ -1,6 +1,8 @@
 #!/usr/bin/env node
 import * as auth from './auth.mjs';
-import { loadConfig, putReport, sendReport, tenantId, tenantPath, transportOf } from './core.mjs';
+import {
+  loadConfig, putReport, reportScope, sendReport, tenantId, tenantPath, transportOf,
+} from './core.mjs';
 
 function arg(name, fallback) {
   const index = process.argv.indexOf(`--${name}`);
@@ -65,7 +67,11 @@ if (ci.ok) {
 // The service derives the object path from the envelope's slot and the
 // account's tenant, so only the legacy S3 path spells the key out.
 const result = transportOf(config) === 'service'
-  ? await sendReport('runtime', slot, payload, config)
+  // Through the organisation check (MACLEOD-586, MACLEOD-601 audit
+  // finding 3). A background reporter carries an issue key just as a
+  // hook does, and a CI job that fell back to the wrong credential
+  // would put one customer's build on another's board.
+  ? await sendReport('runtime', slot, payload, config, { account: reportScope(config) })
   : await putReport(tenantPath(config, `runtime/${jiraKey}/${slot}.json`), payload, config);
 process.stdout.write(JSON.stringify(result, null, 2) + '\n');
 // Background reporting is observability only and must not break CI.

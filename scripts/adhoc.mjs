@@ -39,6 +39,7 @@ import {
   localBindingPath,
   organisationScope,
   publishState,
+  reportScope,
   readJson,
   readUserBinding,
   refusalLine,
@@ -224,7 +225,14 @@ export async function republish(key, title, cwd, config = {}, info = {}, { statu
     summary: summary || 'Ad hoc work started',
     updatedAt: new Date().toISOString(),
   };
-  return sendReport('issue', undefined, issuePayload(state, config, info), config);
+  // Through the organisation check, like every other publisher
+  // (MACLEOD-586, MACLEOD-601 audit finding 3). An ad hoc key is
+  // minted on this machine and is nobody else's, but the report that
+  // carries it is still somebody's, and it must not go out on
+  // another organisation's credential.
+  return sendReport('issue', undefined, issuePayload(state, config, info), config, {
+    account: reportScope(config),
+  });
 }
 
 /** How a send went, in one line, because a refusal and a retry read differently. */

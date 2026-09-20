@@ -497,6 +497,27 @@ export function organisationScope(config = {}) {
 }
 
 /**
+ * "This machine cannot name an organisation", said out loud.
+ *
+ * Every service report names the organisation it belongs to, and
+ * `postEnvelope` refuses one that does not (MACLEOD-601 audit, finding
+ * 3). A CI token exchanged against a service that named no account is
+ * the one credential that legitimately has no answer, and it still has
+ * to be able to report — so it says this, which is an argument
+ * somebody typed rather than an argument somebody forgot.
+ *
+ * Never a real scope: `scopeOf` only ever mints `account-` and `fp-`
+ * names, and a tenant literally called `unscoped` is a legacy scope,
+ * which `organisationScope` already answers `undefined` for.
+ */
+export const UNSCOPED = 'unscoped';
+
+/** The organisation a report from this configuration belongs to. */
+export function reportScope(config = {}) {
+  return organisationScope(config) || UNSCOPED;
+}
+
+/**
  * The user binding for THIS organisation.
  *
  * A second directory beside the tenant one, never a re-keying of it: an
@@ -937,13 +958,40 @@ export function writeWorkflows(state, config = {}) {
  * for the same reason the dashboard prefers it: showing the run that is
  * actually working on it beats showing whichever came first.
  */
+/**
+ * The run statuses that mean nothing more will happen (MACLEOD-601).
+ *
+ * The single answer to "is this run still live", because three places
+ * needed it and two of them had written their own: `workflowRef` here,
+ * `ticketWorkflow` in the dashboard, and `backfillCards`, which asked
+ * `status === 'running'` and thereby called a BLOCKED run finished. A
+ * blocked run is live — `openTickets` counts a blocked ticket as open
+ * and `finishRun` refuses to finish over one — so backfilling its hints
+ * silenced its stale cards permanently, with no command able to recover
+ * them.
+ *
+ * Here in core.mjs rather than in workflow.mjs because core is what a
+ * hook already imports and what workflow.mjs imports from, so this is
+ * the one direction the dependency can point.
+ */
+export const RUN_OVER = ['done', 'cancelled', 'archived'];
+
+/** True when a run is over. Anything else — including `blocked` — is live. */
+export function isOver(workflow) {
+  return RUN_OVER.includes(workflow?.status);
+}
+
 export function workflowRef(key, config = {}) {
   if (!key) return undefined;
   const { workflows } = readWorkflows(config);
   const holding = Object.values(workflows)
     .filter((w) => (w.tickets || []).some((t) => t.key === key));
   if (!holding.length) return undefined;
-  const live = (w) => (w.status === 'done' || w.status === 'cancelled' ? 1 : 0);
+  // How over a run is (MACLEOD-601). Not a boolean: `archived` is more
+  // over than `done`, because tidy archives a run precisely to get it
+  // out of the way -- and it is archived NOW, so a recency tie-break
+  // would otherwise let it win over the run that actually delivered.
+  const live = (w) => (w.status === 'archived' ? 2 : isOver(w) ? 1 : 0);
   const chosen = [...holding].sort((a, b) => live(a) - live(b)
     || String(b.updatedAt || '').localeCompare(String(a.updatedAt || '')))[0];
   const ticket = chosen.tickets.find((t) => t.key === key);
@@ -1230,6 +1278,37 @@ export function pendingEndActors(sessionId = undefined, scope = undefined) {
     && actor.tenantId === scope.tenantId
     && (actor.serviceUrl ?? scope.serviceUrl) === scope.serviceUrl;
   return [...all.filter(mine), ...all.filter((actor) => !mine(actor) && sameAccount(actor))];
+}
+
+/**
+ * Every actor on this machine that is still working on one ticket.
+ *
+ * MACLEOD-601. When the run says a ticket is verified, an actor still
+ * standing at `running` on it is an agent that finished hours ago and
+ * never sent a `SubagentStop` -- its worktree was removed, its process
+ * was killed, or the session it belonged to was cleared. `SessionEnd`
+ * flags what it can see; this is for the ones nothing flagged, found by
+ * the fact the run knows and they do not: the ticket is over.
+ *
+ * Scoped to this organisation, unconditionally. `sessions/` is one
+ * directory per machine, shared by every repository and every client on
+ * it, so an unscoped sweep over a key reaches another customer's actor
+ * on a ticket that happens to be spelled the same -- and the caller
+ * would then publish it. An actor written before organisations were
+ * recorded names none and is left to whoever can say whose it is.
+ */
+export function actorsForKey(key, config = {}) {
+  const wanted = String(key || '').trim();
+  if (!wanted) return [];
+  const dir = path.join(dataDir(), 'sessions');
+  if (!fs.existsSync(dir)) return [];
+  const mine = organisationScope(config);
+  return fs.readdirSync(dir)
+    .filter((name) => name.endsWith('.json'))
+    .map((name) => readJson(path.join(dir, name)))
+    .filter((state) => state?.binding?.key === wanted)
+    .filter((state) => Boolean(mine) && state.account === mine)
+    .sort((a, b) => String(a.updatedAt || '').localeCompare(String(b.updatedAt || '')));
 }
 
 /**
@@ -2839,7 +2918,11 @@ export function sanitizePayload(value) {
    * exists to drop, and `plugin/tests/integration/report.test.mjs` asserts
    * the payload has none.
    */
-  const eventOnly = new Set(['at', 'source', 'agent', 'session']);
+  // `endedAt` says when a run stopped (MACLEOD-601), and it is allowed
+  // inside `executions` and nowhere else for the same reason `at` is: an
+  // issue document has `updatedAt` already, and a second clock on the
+  // payload would be a second answer to when the ticket last moved.
+  const eventOnly = new Set(['at', 'source', 'endedAt', 'agent', 'session']);
   /*
    * MACLEOD-574. `agent` is its own scope rather than seven more names
    * on the flat set above, because six of those names — `name`, `task`,
@@ -3354,8 +3437,35 @@ export function resetPaymentNotice() {
  * environment variable away.
  */
 function carrierRefusal(account, owner) {
-  if (!account) return undefined;
+  /*
+   * An absent `account` used to mean "skip the check" (MACLEOD-601
+   * audit, finding 3). That made the guard opt-in: four publishers
+   * never passed one, so four publishers went round it, and two of them
+   * are now driven unprompted by reconciliation. A check a caller
+   * bypasses by forgetting an argument is not a check.
+   *
+   * So absence is a refusal, and an install that genuinely names no
+   * organisation says so with `UNSCOPED` — an argument somebody had to
+   * type, not an omission somebody made.
+   */
+  if (account === undefined) {
+    return 'not sent: this report did not say which organisation it belongs to. '
+      + 'Every publisher names one; pass `reportScope(config)`.';
+  }
   const carrier = scopeOf(ownerId(owner));
+  /*
+   * A machine that cannot name an organisation — a CI token exchanged
+   * against a service that named none — may still report, and its
+   * credential must be as anonymous as it is. A credential that DOES
+   * name one is a report scoped to nobody going out on somebody's key,
+   * which is the same leak in the other direction.
+   */
+  if (account === UNSCOPED) {
+    return carrier
+      ? `not sent: this machine names no organisation and the credential in hand is ${scopeName(carrier)}'s. `
+        + 'Sign in with `teamflow login`, or report with that organisation\'s own credential.'
+      : undefined;
+  }
   if (carrier === account) return undefined;
   const whose = carrier
     ? `the credential in hand is ${scopeName(carrier)}'s`
@@ -3584,7 +3694,20 @@ export async function flushOutbox(config, limit = 5) {
         continue;
       }
       attempted += 1;
-      const result = await postEnvelope(item.endpoint, item.envelope, item.idempotencyKey, config);
+      /*
+       * The organisation this item was queued FOR, not the one this
+       * config names (MACLEOD-601 audit, finding 3). `mayDeliver` above
+       * has already established that they are the same — that is the
+       * whole of MACLEOD-583 — so this re-states the answer rather than
+       * asking a second question, and it is what keeps `postEnvelope`
+       * able to refuse an unnamed send without the flush becoming the
+       * one caller that is exempt. An item whose owner names nobody is
+       * `UNSCOPED`: it was queued by a credential that could not say,
+       * which is a fact about it and not an omission here.
+       */
+      const forWhom = scopeOf(ownerId(item.owner)) || UNSCOPED;
+      const result = await postEnvelope(
+        item.endpoint, item.envelope, item.idempotencyKey, config, forWhom);
       if (result.retry) {
         // Rewritten in place, not re-queued: a new file name would sort
         // to the back and let a stale full-state document overwrite a
@@ -3676,7 +3799,7 @@ export function outboxLine(summary) {
 // POST one report to the service. kind is the envelope kind
 // ("issue" or "runtime"); slot is required for runtime and absent for
 // an issue, because it is a path segment the service checks.
-export async function sendReport(kind, slot, payload, config, { account } = {}) {
+export async function sendReport(kind, slot, payload, config, { account, flush = true } = {}) {
   if (!credentialKind(config)) return { ok: false, skipped: true, reason: 'no service credential configured' };
   const document = serviceDocument(payload, kind);
   const envelope = slot ? { kind, slot, payload: document } : { kind, payload: document };
@@ -3693,7 +3816,15 @@ export async function sendReport(kind, slot, payload, config, { account } = {}) 
     queueOutbox(scheduleRetry({ endpoint, envelope, idempotencyKey, owner: result.owner }, result));
     return { ok: false, queued: true, status: result.status, reason: result.reason };
   }
-  if (result.ok) await flushOutbox(config);
+  /*
+   * `flush: false` is for a sender that is itself already a bounded
+   * background pass (MACLEOD-601 audit, finding 9). A flush is up to
+   * five more requests of up to five seconds each, so "reconcile posts
+   * at most two reports on `Stop`" was really "at most two, each of
+   * which may drag five more behind it" — on the path the person is
+   * waiting on. The hook flushes on its own beat either way.
+   */
+  if (result.ok && flush) await flushOutbox(config);
   return result;
 }
 
@@ -3711,6 +3842,77 @@ export async function fetchAccount(config) {
       return { ok: false, status: response.status, reason: body?.message || `service returned ${response.status}` };
     }
     return { ok: true, status: response.status, account: body, credential: cred.kind, email: cred.email, degraded: cred.degraded };
+  } catch (error) {
+    return { ok: false, reason: `service unreachable: ${error instanceof Error ? error.message : String(error)}` };
+  }
+}
+
+/**
+ * The organisation's own name, as the state route spells it in a path.
+ *
+ * NOT `organisationScope`, which is the local file-name form
+ * (`account-acme`, or a fingerprint when the credential names nobody).
+ * `GET /v1/state/tenants/<account>/...` compares its path segment
+ * against what the credential resolved to at the far end, so a
+ * fingerprint there is a 404 every time.
+ *
+ * Asked of the service only when the credential does not say: an API
+ * key that fingerprints to nothing is the case the extra round trip
+ * exists for. Memoised for the life of the process because a CLI
+ * command reads a handful of documents and asking once per read is a
+ * handful of round trips for an answer that cannot change.
+ */
+let accountNameCache;
+
+export function resetAccountName() {
+  accountNameCache = undefined;
+}
+
+export async function accountName(config = {}) {
+  const known = credentialOwner(config)?.account;
+  if (known) return known;
+  if (accountNameCache !== undefined) return accountNameCache || undefined;
+  const probe = await fetchAccount(config);
+  accountNameCache = probe.ok ? String(probe.account?.account || '') : '';
+  return accountNameCache || undefined;
+}
+
+/**
+ * Read one document back out of this organisation's own tenant prefix.
+ *
+ * The read half of `sendReport`, and the reason `teamflow workflow
+ * ticket` can say what the TRACKER now thinks rather than only what it
+ * just told the board (MACLEOD-601). The route is the dashboard's own
+ * (`GET /v1/state/tenants/<account>/<path>`), the credential is the
+ * same one a report goes out under, and the service refuses any tenant
+ * but the credential's — so this cannot read another organisation's
+ * anything, whatever is passed.
+ *
+ * Never on the hook path. It is a network round trip with nothing
+ * queued behind it, and a hook that waits on one is a hook standing
+ * between a ticket and its own report.
+ *
+ * `missing: true` for a document that is simply not there, which is the
+ * ordinary answer for a ticket no tracker has ever mentioned and must
+ * read differently from a failure.
+ */
+export async function fetchState(relativePath, config = {}) {
+  const cred = await credential(config);
+  if (!cred) return { ok: false, reason: 'no service credential available' };
+  const account = await accountName(config);
+  if (!account) return { ok: false, reason: 'this credential names no organisation' };
+  const clean = String(relativePath || '').replace(/^\/+/, '');
+  try {
+    const response = await fetch(
+      `${serviceUrl(config)}/v1/state/tenants/${encodeURIComponent(account)}/${clean}`,
+      {
+        headers: { [cred.header]: cred.value },
+        signal: AbortSignal.timeout(Number(config.serviceTimeoutMs || 5000)),
+      },
+    );
+    if (response.status === 404) return { ok: true, missing: true, document: undefined };
+    if (!response.ok) return { ok: false, status: response.status, reason: `service returned ${response.status}` };
+    return { ok: true, document: await response.json() };
   } catch (error) {
     return { ok: false, reason: `service unreachable: ${error instanceof Error ? error.message : String(error)}` };
   }
@@ -3820,7 +4022,15 @@ export async function publishState(state, config, info, { force = false, keepTen
      * back to an API key.
      */
     issueResult = await sendReport('issue', undefined, payload, config, {
-      account: state.binding?.account || state.account,
+      /*
+       * `reportScope` last, never `undefined` (MACLEOD-601 audit,
+       * finding 3): a session file written before MACLEOD-586 records
+       * no account at all, and with absence now a refusal that session
+       * would stop reporting entirely on the day the plugin upgrades.
+       * What it falls back to is this machine's own answer, which is
+       * exactly the comparison the check wants made.
+       */
+      account: state.binding?.account || state.account || reportScope(config),
     });
     // No actor document is posted. The service allowlist knows two
     // kinds, issue and runtime, and the account already scopes the

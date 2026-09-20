@@ -77,6 +77,28 @@ attributed to whatever it is actually about. If the session simply stops
 first, the `Stop` hook ends the item on its own — an ad hoc item is one
 request's worth of work, and the request has been answered.
 
+**When the item is in a run, close it in the run too**, and read the line:
+
+```bash
+node "${CLAUDE_PLUGIN_ROOT}/scripts/cli.mjs" \
+  workflow ticket ADHOC-7 --state done --cycle verified
+```
+
+That publishes its card at `DEV_VERIFIED` and closes any run still claiming
+to be working on it. The line it prints says what the card and the tracker
+now say; for an ad hoc item there is no tracker issue, so it says so —
+nothing there will move, and nothing should. That is the item closed
+everywhere, and the item is not finished until you have read the line.
+
+Then, as for any ticket, reconcile — `--dry-run` first, then the pass,
+then again — and the phase is not finished until it prints
+`Nothing to reconcile`:
+
+```bash
+node "${CLAUDE_PLUGIN_ROOT}/scripts/cli.mjs" workflow reconcile --dry-run
+node "${CLAUDE_PLUGIN_ROOT}/scripts/cli.mjs" workflow reconcile
+```
+
 **An ad hoc item never reopens.** A follow-up request is a new item with
 a new key, even when it is about the same code. Reopening would make one
 key mean two pieces of work and the board could no longer say when

@@ -155,28 +155,101 @@ reaches the board under no key or a stale one. Mark the ticket as you go:
 teamflow workflow ticket MACLEOD-538 --state running --cycle build
 ```
 
-Move the tracker's own ticket to its started state at the same moment, so
-the tracker and the board agree that it is under way and not merely queued.
+That publishes the ticket's card at `LOCAL_DEV` as well as recording it in the
+run, so the board follows immediately. Move the tracker's own ticket to its
+started state at the same moment, with its MCP: TeamFlow's write-back only
+fires at `DEV_VERIFIED`, so this earlier one is genuinely yours and no command
+will do it for you.
 
 **Test.** The suite for what changed.
 
 **Audit.** A separate reviewer, with the ticket and the diff. Not the team
 that wrote it.
 
-**Update the ticket status.** Move the tracker's own ticket with its MCP.
-If the organisation has two-way writeback on, TeamFlow also writes back at
-`DEV_VERIFIED`; doing both is harmless and doing neither leaves the tracker
-lying about what shipped.
-
 **Deploy** only if the workflow's scope says so, and only yourself — see
 "What you never delegate" below.
 
-Then `teamflow workflow ticket <KEY> --state done --cycle verified`. When the
-phase's tickets are all done, `ready` moves to the next phase on its own.
+**Close the ticket.** One command does all of it:
+
+```bash
+teamflow workflow ticket MACLEOD-538 --state done --cycle verified
+```
+
+That publishes the ticket's own card at `DEV_VERIFIED`, closes any run still
+claiming to be working on it, and — if the organisation has write-back on —
+is what moves the tracker's own issue. You do not move the tracker by hand as
+a matter of course; that was a step an agent had to remember per ticket at 4am
+and it was forgotten three times out of nineteen.
+
+**Read the line it prints.** It says what the card AND the tracker now say:
+
+```
+MACLEOD-538: card DEV_VERIFIED · linear done
+```
+
+That is closed everywhere and you move on. Anything else names the reason and
+what to do — write-back off, no state mapped, a connection with no credential
+(every Jira connection and every hand-pasted GitHub webhook), a tracker that
+could not be read. **Only then** move the tracker's issue with its MCP, and
+run `teamflow workflow reconcile` afterwards to confirm it took.
+
+Do not treat a ticket as closed on the strength of having run the command. The
+line is the evidence; if you did not read it, you do not know.
+
+When the phase's tickets are all done, `ready` moves to the next phase on its
+own, and when the last ticket of the run is verified the run finishes itself.
 
 For an ad hoc item, finish it as well: `teamflow adhoc done` publishes its
 last state and unbinds. It never reopens — a later request about the same
 code is a new item with a new key.
+
+### Closing a phase
+
+A phase is finished when its tickets are done **and** reconciling prints
+exactly this:
+
+```
+Nothing to reconcile: the runs, the cards, the executions and the bindings agree.
+```
+
+That sentence is the completion criterion. Anything else means the phase is
+not finished. Three commands, in this order:
+
+```bash
+teamflow workflow reconcile --dry-run   # what is wrong, and what repairing it costs
+teamflow workflow reconcile             # repair it
+teamflow workflow reconcile             # confirm: expect "Nothing to reconcile"
+```
+
+**Always the dry run first.** It changes nothing and it prints two things you
+need before you spend anything: how many reports the pass will send (one
+credit each — on a bad morning that has been 161) and, separately,
+`about to close in the tracker: …`, which names the real issues in somebody's
+Linear that the pass will ask the service to close. Read that line. If a key
+on it should not be closed, fix the run first.
+
+The repair pass tags every line `repaired`, `owed` or `refused`, so a pass
+that repaired everything still prints a non-empty list. That is why the
+completion criterion is the next pass printing nothing, not this one printing
+nothing.
+
+Then act on whatever is left:
+
+- **`owed`** — the pass could not do it yet. For a card, that almost always
+  means the tracker disagrees: the issue was reopened, or somebody moved it
+  after the run's verdict. TeamFlow will not close an issue a person has
+  reopened. Decide which is right — if the run is wrong, put the ticket back
+  (`--state running --cycle build`); if the tracker is wrong, move it with its
+  MCP — and reconcile again.
+- **`refused (…)`** — the service said no and re-sending the same thing cannot
+  change the answer; the reason is in the brackets. It is quarantined, so it
+  will not be retried on its own. Fix the cause and run
+  `teamflow workflow reconcile` again, which retries everything quarantined.
+- **a tracker that is behind** — the case above: move the issue with its MCP,
+  then reconcile again.
+
+**A phase is not finished, and the run cannot be declared done, while
+reconciling still reports anything.**
 
 ### Keep the metadata current as the run goes
 
@@ -233,6 +306,20 @@ because one is the plan and the other is news.
 
 ## 5. Finish
 
+Reconcile, exactly as at the end of a phase: `--dry-run` first, then the
+pass, then again until it prints `Nothing to reconcile`.
+
+**The run cannot be declared done until it does.** Work it to that line: let
+it repair what it can, and for anything left `owed` or `refused` do the thing
+it names and run it again. This is the last chance to notice that three of the
+tickets you are about to report as shipped still read "In Progress" in Linear,
+which is exactly what happened on 2026-09-20.
+
+When it is empty, the run has usually already finished itself: verifying the
+last open ticket sets the run to `done`. `teamflow workflow show` says so. If
+it has not — the run was stopped early, or tickets are blocked — say so
+explicitly:
+
 ```bash
 teamflow workflow status done
 ```
@@ -264,7 +351,12 @@ phases. A team that edits the workflow is a plan with two authors.
 ## When something is wrong
 
 - A ticket stops moving on the board: `teamflow status` then `teamflow doctor`,
-  before reading the dashboard and before debugging the UI.
+  before reading the dashboard and before debugging the UI. Both print what the
+  last reconcile pass repaired and what it left owed.
+- The board is behind on several tickets at once: `teamflow tidy --dry-run`
+  names every one of them, then `teamflow tidy` repairs what it can. The pass
+  is bounded on the hook path on purpose, so a backlog of repairs drains over
+  several commands rather than making one of them slow; `tidy` does the lot.
 - The workflow is not on the board at all: `teamflow workflow show` says
   whether the service took it. A refusal and a queued retry read differently,
   and a refusal will not fix itself.

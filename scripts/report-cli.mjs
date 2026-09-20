@@ -29,6 +29,7 @@ import {
   parseBindArgument,
   prSnapshot,
   putReport,
+  reportScope,
   sendReport,
   tenantId,
   tenantPath,
@@ -293,8 +294,21 @@ export async function main(argv = process.argv.slice(2), io = {}) {
     return 2;
   }
 
+  /*
+   * Through the organisation check, not around it (MACLEOD-586,
+   * MACLEOD-601). Every other publisher names the organisation the
+   * report belongs to so `postEnvelope` can compare it against the
+   * credential that will actually carry it; this one did not, so a
+   * `teamflow report` typed while signed in to B posted A's ticket to
+   * B's board and nothing anywhere said so. There is no binding to read
+   * here -- the key came off the command line -- so the organisation is
+   * the one this machine is reporting for, which is the only honest
+   * answer a CLI has and is exactly what the check wants compared.
+   */
   const result = transport === 'service'
-    ? await sendReport('issue', undefined, built.payload, config)
+    ? await sendReport('issue', undefined, built.payload, config, {
+      account: reportScope(config),
+    })
     : await putReport(tenantPath(config, `issues/${built.payload.jiraKey}.json`), built.payload, config);
   out(`${JSON.stringify(result, null, 2)}\n`);
   // A queued or refused report is not the caller's failure to handle.

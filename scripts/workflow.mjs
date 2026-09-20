@@ -23,15 +23,20 @@
 
 import crypto from 'node:crypto';
 import {
-  adoptWorkflow, readWorkflows, resolveGithubRepo, sendReport, trackerOf, unclaimedWorkflows,
-  workflowsPath, writeWorkflows,
+  actorsForKey, adoptWorkflow, readWorkflows, reportScope, resolveGithubRepo, saveSession,
+  sendReport, trackerOf, unclaimedWorkflows, workflowsPath, writeWorkflows,
 } from './core.mjs';
+import { cardFor, cardLine, publishCard, readTracker, readWriteBack } from './card.mjs';
 
 // Mirrors adapters/teamflow/schema.py. The service is the enforcement;
 // these exist so a typo is a message here rather than a 400 there.
 export const ORDERS = ['priority', 'rank', 'age'];
 export const TRACKERS = ['jira', 'linear', 'github'];
-export const STATUSES = ['planning', 'running', 'blocked', 'done', 'cancelled'];
+// `archived` is a run that is over and should stop being offered
+// (MACLEOD-601): `teamflow tidy` writes it on an empty planning run
+// nobody ever filled. Not `cancelled`, which says somebody decided
+// against work they meant to do.
+export const STATUSES = ['planning', 'running', 'blocked', 'done', 'cancelled', 'archived'];
 export const TICKET_STATES = ['waiting', 'running', 'done', 'blocked', 'skipped', 'rework'];
 // Where a ticket is in the cycle. Coarser than the stage the hooks
 // report, on purpose: the board draws the stage from what it observed,
@@ -93,7 +98,15 @@ export const USAGE = `teamflow workflow — the pool of tickets a run works thro
   teamflow workflow ticket <KEY> [--state <s>] [--cycle <c>] [--reason <why>] [--to <name>]
       Move one ticket through the cycle. States: waiting, running, done,
       blocked, skipped, rework. Cycle: build, test, audit, status,
-      deploy, verified, rework.`;
+      deploy, verified, rework. Publishes the ticket's own card as well
+      as the run's record, and prints what the card AND the tracker now
+      say.
+
+  teamflow workflow reconcile [--dry-run]
+      Every divergence between the runs, the cards, the executions and
+      the trackers, and the repair for each. A phase is not finished,
+      and a run cannot be declared done, while this list is non-empty.
+      \`teamflow tidy\` is the same pass.`;
 
 // A hyphen, not the underscore the wf_ shape suggests: the id becomes a
 // path segment and adapters/teamflow/store.py allows no underscore in
@@ -229,8 +242,18 @@ export function published(workflow) {
   return out;
 }
 
-export async function publish(workflow, config) {
-  return sendReport('workflow', null, published(workflow), config);
+export async function publish(workflow, config, { flush = true } = {}) {
+  /*
+   * Through the organisation check, like every other publisher
+   * (MACLEOD-586, MACLEOD-601 audit finding 3). This document is the
+   * most identifying thing the plugin sends -- every ticket key in the
+   * pool, the run's name, its phases and who is running it -- and it
+   * is republished once per ticket that moves, and now unprompted by
+   * reconciliation. It was going round the check entirely.
+   */
+  return sendReport('workflow', null, published(workflow), config, {
+    account: reportScope(config), flush,
+  });
 }
 
 function now() {
@@ -496,6 +519,95 @@ export function gateSaid(ticket, verdict) {
   ticket.gates = { ...(ticket.gates || {}), [verdict.cycle]: verdict.payload.status };
 }
 
+// --- the ticket's own card, and the end of the run --------------------
+//
+// MACLEOD-601. The gate chips above are the run's verdict about a
+// GATE; this is the run's verdict about the TICKET, which nothing
+// published at all. The merge and the deploy happen in the
+// orchestrator's session, bound to some other key, so the card kept
+// whatever stage the last hook in some team's worktree had left on it.
+
+/**
+ * Remember that the card has been told, exactly as `gateSaid` does.
+ *
+ * A hint and nothing more, for the same reason: it keeps a command that
+ * changed nothing from republishing, and losing it costs one extra
+ * write rather than a card stuck for ever. The truth is recomputed from
+ * `cardFor(ticket)` every time.
+ */
+export function cardSaid(ticket, card) {
+  ticket.card = { stage: card.stage, status: card.status };
+}
+
+/** Whether the board already says what the ticket says. */
+export function cardOwed(ticket) {
+  const want = cardFor(ticket);
+  if (!want) return undefined;
+  const told = ticket.card;
+  if (told && told.stage === want.stage && told.status === want.status) return undefined;
+  return want;
+}
+
+/** What the run still has open: nothing done, skipped or cancelled out. */
+export function openTickets(workflow) {
+  return (workflow.tickets || []).filter((t) => t.state !== 'done' && t.state !== 'skipped');
+}
+
+/**
+ * A run with nothing open finishes itself.
+ *
+ * "The last ticket verified finishes the run." A run left `running`
+ * with nothing to do sits on the board and in every picker for ever,
+ * and nothing was ever going to move it: the orchestrator's last act is
+ * closing the last ticket, and the step after that is the one it is
+ * most likely to be interrupted before reaching.
+ *
+ * Only from `running`. A `planning` run with no tickets has not
+ * finished, it has not started; `blocked` and `cancelled` are
+ * somebody's decision and not this function's to overturn.
+ */
+export function finishRun(workflow) {
+  if (!workflow || workflow.status !== 'running') return false;
+  if (!(workflow.tickets || []).length) return false;
+  if (openTickets(workflow).length) return false;
+  workflow.status = 'done';
+  workflow.updatedAt = now();
+  return true;
+}
+
+/**
+ * Close every actor on this machine still working on a finished ticket.
+ *
+ * Widening MACLEOD-574's pending-end mechanism rather than building a
+ * second one: the flag is set here and the existing bounded, fail-open
+ * `flushPendingEnds` is what delivers it, so a send that does not land
+ * leaves the end owed exactly as it already does.
+ *
+ * The run knows something the actor does not. An agent whose worktree
+ * was removed or whose process was killed never sends `SubagentStop`
+ * and never reaches `SessionEnd`, so it stands at `running` and the
+ * lane counts it; the ticket being over is the only evidence anywhere
+ * that it is not.
+ */
+export function closeActors(key, config = {}, at = now()) {
+  let closed = 0;
+  for (const state of actorsForKey(key, config)) {
+    if (state.ended && state.status !== 'running') continue;
+    saveSession({
+      ...state,
+      ended: true,
+      status: state.status === 'running' ? 'idle' : state.status,
+      agent: state.agent ? { ...state.agent, endedAt: state.agent.endedAt || at } : state.agent,
+      // Carried by the next publish anything on this machine makes,
+      // which is the same path a killed session's ends already take.
+      pendingEnd: Boolean(state.binding?.key),
+      updatedAt: at,
+    });
+    closed += 1;
+  }
+  return closed;
+}
+
 // --- printing --------------------------------------------------------
 
 function line(ticket, workflow) {
@@ -535,7 +647,11 @@ export function render(workflow, state) {
     out.push('  found while building:');
     for (const d of found) out.push(`    ${d.from} waits on ${d.on}${d.reason ? ` — ${d.reason}` : ''}`);
   }
-  const others = Object.values(state.workflows).filter((w) => w.id !== workflow.id);
+  // Archived runs leave the pickers (MACLEOD-601). They stay readable
+  // by name and by id -- nothing is destroyed -- but a listing that
+  // offered 144 empty runs nobody ever filled is a listing nobody reads.
+  const others = Object.values(state.workflows)
+    .filter((w) => w.id !== workflow.id && w.status !== 'archived');
   if (others.length) {
     out.push(`  other workflows: ${others.map((w) => w.name).join(', ')}`);
   }
@@ -638,6 +754,30 @@ export async function main(args, {
     }
     print(`TeamFlow adopted "${taken.name}" (${taken.id}) into this organisation. `
       + 'Nothing was sent and nothing was removed.');
+    return 0;
+  }
+
+  /*
+   * The whole pass, on demand (MACLEOD-601). Before the workflow is
+   * resolved, because reconciling is about every run this organisation
+   * holds and not about whichever one is current — the 144 empty runs
+   * and the 31 stale cards were spread over all of them, and a repair
+   * that only ever looked at the current run would have found four.
+   *
+   * Dynamically imported: reconcile.mjs reads this module's own
+   * `cardOwed` and `publish`, and a static import here would be a cycle
+   * evaluated in whichever order the entry point happened to choose.
+   */
+  if (sub === 'reconcile') {
+    const { reconcile, renderPass } = await import('./reconcile.mjs');
+    const { FULL } = await import('./reconcile.mjs');
+    const pass = await reconcile(config, {
+      dryRun: rest.includes('--dry-run'),
+      deep: true,
+      limit: FULL,
+      announce: (keys) => print(`Closing in the tracker: ${keys.join(', ')}.`),
+    });
+    print(renderPass(pass));
     return 0;
   }
 
@@ -796,7 +936,10 @@ export async function main(args, {
     // After the workflow, so a board that draws the loop already knows
     // the ticket is in rework. Never fatal: the plan is saved either way.
     const send = async (on, verdict) => {
-      const sent = await sendReport('runtime', verdict.slot, verdict.payload, config)
+      // Keyed sidecars, up to thirteen of them per command, through the
+      // organisation check like everything else (audit finding 3).
+      const sent = await sendReport('runtime', verdict.slot, verdict.payload, config,
+        { account: reportScope(config) })
         .catch(() => ({ ok: false }));
       // Queued counts: the outbox will deliver it. Anything else and the
       // hint is not written, so the next command says it again.
@@ -823,10 +966,72 @@ export async function main(args, {
       put += 1;
     }
     if (put) print(`Put ${put} gate ${put === 1 ? 'verdict' : 'verdicts'} on other tickets right.`);
+
+    /*
+     * And the ticket's own card (MACLEOD-601). The gate chips above say
+     * what happened at a GATE; this says where the ticket now is, which
+     * is what the board actually draws and what nothing published. The
+     * merge and the deploy happen in this session, bound to some other
+     * key, so without this the card keeps whatever stage the last hook
+     * in some team's worktree left on it -- 31 of them did.
+     */
+    const card = cardFor(ticket);
+    if (card) {
+      const sent = await publishCard(ticket.key, card, { workflow: target, config, info })
+        .catch(() => ({ ok: false }));
+      if (sent.ok || sent.queued) cardSaid(ticket, card);
+      /*
+       * Done means done everywhere on this machine too. An agent whose
+       * worktree was removed never sent a `SubagentStop`, so it stands
+       * at `running` on a ticket the run has finished; the run knowing
+       * the ticket is over is the only evidence anywhere that it is not.
+       */
+      if (ticket.state === 'done') {
+        const closed = closeActors(ticket.key, config);
+        if (closed) {
+          const { flushPendingEnds } = await import('./hook-core.mjs');
+          await flushPendingEnds(config, closed).catch(() => 0);
+          print(`Closed ${closed} run${closed === 1 ? '' : 's'} still open on ${ticket.key}.`);
+        }
+      }
+      if (!sent.ok && !sent.queued) {
+        print(`${ticket.key}: the card could not be sent to the board`
+          + `${sent.reason ? `: ${sent.reason}` : '.'}`);
+      }
+    }
     // Again, because what the board has been told is part of the plan now.
     save(state, config);
+
+    /*
+     * The last ticket verified finishes the run. Before the line below,
+     * so what is printed is the run as it now stands rather than as it
+     * was a moment ago.
+     */
+    if (finishRun(target)) {
+      save(state, config);
+      await publish(target, config);
+      print(`"${target.name}" has nothing open left; the run is done.`);
+    }
+
     const open = ready(target);
     print(`${ticket.key} is ${ticket.state}${ticket.cycle ? ` at ${ticket.cycle}` : ''}.`);
+    /*
+     * And the one line that says what the card AND the tracker now say.
+     *
+     * Two reads of this organisation's own state, after the report so
+     * the answer is the one the report produced. It is the step the
+     * build skill is about to be told to read instead of remembering to
+     * move the tracker by hand, so it never claims a ticket is closed
+     * everywhere when it is not: where the tracker is behind it names
+     * the reason and what to do about it.
+     */
+    if (card) {
+      const tracker = await readTracker(ticket.key, config).catch(() => ({ known: false }));
+      const writeBack = tracker.connected
+        ? await readWriteBack(config).catch(() => ({ known: false }))
+        : { known: false };
+      print(cardLine(ticket.key, card, tracker, writeBack));
+    }
     print(open.phase
       ? `Phase ${open.phase.n} is ${open.phase.state}; ready: ${open.tickets.map((t) => t.key).join(', ') || 'nothing'}.`
       : 'Every phase is done.');

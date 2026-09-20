@@ -68,6 +68,8 @@ const USAGE = `teamflow \u2014 delivery reporting for TeamFlow
                                    the pool of tickets a run works through;
                                    \`teamflow workflow --help\` lists its flags
   teamflow sync                    publish the current state now
+  teamflow tidy [--dry-run]        repair every divergence between the runs, the
+                                   cards, the executions and the trackers
   teamflow doctor                  transport, account, credits, tracker MCP and connections
   teamflow trackers [list]         the issue trackers this org has connected
   teamflow trackers connect <tracker> [--projects a,b] [--filter <team>]
@@ -205,6 +207,12 @@ async function status() {
   // hook that refused it exits 0 and prints nothing, so this is where a
   // person finds out why their ticket stopped moving.
   const refused = refusalLine(bindingRefusalFor(cwd, config));
+  // What the last reconcile pass repaired, and what it left owed
+  // (MACLEOD-601). A hook cannot print, and the pass is bounded on
+  // purpose, so "31 cards are still wrong" has to be readable somewhere
+  // or the boundedness is indistinguishable from not working.
+  const { reconcileLine } = await import('./reconcile.mjs');
+  const tidied = reconcileLine();
   print({
     tenantId: tenantId(config),
     pluginVersion: pluginVersion() || 'unknown',
@@ -241,6 +249,7 @@ async function status() {
     ...(outbox.queued || outbox.legacy || outbox.discarded.ownerless || outbox.discarded.expired
       ? { outbox: outboxLine(outbox) }
       : {}),
+    ...(tidied ? { reconcile: tidied } : {}),
     transport: transportOf(config),
     serviceUrl: serviceUrl(config),
     credential: credentialKind(config) || 'none',
@@ -390,6 +399,14 @@ async function doctor() {
   const outbox = await outboxSummary(config);
   if (outbox.discarded.ownerless || outbox.discarded.expired) clearDiscards();
   const refusedBinding = refusalLine(bindingRefusalFor(cwd, config));
+  /*
+   * What the last reconcile pass did, and what it left owed
+   * (MACLEOD-601). Doctor is where somebody looks when a ticket has
+   * stopped moving, and "the board is behind and the plugin knows"
+   * belongs beside the other reasons it might be.
+   */
+  const { reconcileLine } = await import('./reconcile.mjs');
+  const tidied = reconcileLine();
   const report = {
     claudeProbe: claudeBin ? 'ran' : `skipped: ${claudeSkipped}`,
     pluginVersion: pluginVersion() || 'unknown',
@@ -402,6 +419,7 @@ async function doctor() {
     ...(outbox.queued || outbox.legacy || outbox.discarded.ownerless || outbox.discarded.expired
       ? { outbox: outboxLine(outbox) }
       : {}),
+    reconcile: tidied || 'no pass recorded yet; run `teamflow tidy`',
     transport,
     serviceUrl: serviceUrl(config),
     credential: credentialKind(config) || 'none',
@@ -826,6 +844,21 @@ try {
   }
   else if (command === 'unbind') unbind();
   else if (command === 'sync') await sync();
+  else if (command === 'tidy') {
+    // The whole reconcile pass on demand (MACLEOD-601). `deep` because
+    // this one may ask the tracker: releasing a binding on a finished
+    // ticket is the one repair that needs the tracker's own answer, and
+    // a hook never waits for it.
+    const { FULL, reconcile, renderPass } = await import('./reconcile.mjs');
+    print(renderPass(await reconcile(config, {
+      dryRun: args.includes('--dry-run'),
+      deep: true,
+      limit: FULL,
+      // Said before anything is paid, because these are real issues in
+      // somebody's Linear and not just cards on a board.
+      announce: (keys) => print(`Closing in the tracker: ${keys.join(', ')}.`),
+    })));
+  }
   else if (command === 'doctor') await doctor();
   else if (command === 'login') await login();
   else if (command === 'logout') await logout();

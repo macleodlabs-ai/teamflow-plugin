@@ -3,6 +3,67 @@
 What changed in each published version of the TeamFlow plugin, newest first.
 Only what a person using it would notice.
 
+## 0.3.16
+
+- **The first command after updating may send a burst of reports, and each
+  one costs a credit.** Closing a ticket now publishes the ticket's own card,
+  and a run that had been closing tickets without one has a backlog of them.
+  Runs that were already finished when you updated are marked as already-told
+  and cost nothing; a run still in progress has its cards brought up to date.
+  **Run `teamflow tidy --dry-run` first.** It changes nothing and prints two
+  numbers you want before you spend anything: how many reports a real pass
+  would send, and — separately — which issues it would ask your tracker to
+  close.
+- **Closing a ticket in a run now closes it everywhere.** `teamflow workflow
+  ticket <KEY> --state done --cycle verified` publishes the ticket's card at
+  Verified, closes any run still claiming to be working on it, and, where
+  two-way write-back is on, is what moves the issue in Linear, GitHub or Jira.
+  It prints one line saying what the card **and** the tracker now say —
+  `MACLEOD-538: card DEV_VERIFIED · linear done`. Read that line: where the
+  tracker has not moved it names the reason and what to do, and it never
+  claims a ticket is closed everywhere when it is not. Moving the issue by
+  hand stops being the routine step and becomes the fallback the line tells
+  you to use.
+- **The last ticket of a run finishes the run.** A run is no longer left
+  running with nothing open in it.
+- **`teamflow tidy` repairs a board that has drifted, and the plugin now does
+  a little of it on its own.** Four things it puts right: a card whose run has
+  moved on, a run or agent still shown as working when it has finished or gone
+  quiet for half an hour, a run with nothing left open, and a ticket binding
+  left on work that has shipped. `--dry-run` lists everything first. A couple
+  of repairs also happen quietly at the end of a session; `teamflow status`
+  and `teamflow doctor` say what the last pass did and what it could not.
+- **A card is never republished as Verified unless your tracker agrees.** If
+  somebody has reopened the issue, or moved it since the run's verdict, the
+  repair is listed and not sent — because sending it would ask the service to
+  close, in your tracker, an issue a person deliberately reopened. Those show
+  as `owed`: decide which side is right and run it again.
+- **A report the service rejects is tried once, not for ever.** It is held
+  with the reason, shown in `teamflow status` and `teamflow doctor`, and
+  retried only when you run `teamflow tidy`. Previously a report the service
+  would never accept was re-sent on every session, and everything behind it
+  waited.
+- **Empty planning runs left lying around for a week can be retired.**
+  `teamflow tidy` archives them: they leave the pickers, stay readable, and
+  `teamflow workflow status running` brings one back. Only `tidy` does this,
+  never a session on its own, so a run you started on Friday is still there on
+  Monday.
+- **A reviewer sending a ticket back no longer takes the whole run off the
+  board.** `--state rework` was a word the service did not know, and it
+  refuses a run document whole rather than field by field, so every later
+  update of that run was rejected — silently, at the moment the run had
+  something important to say.
+- **Every report now names the organisation it belongs to, and one that does
+  not is refused.** Four kinds of report did not: the run document itself, its
+  gate results, ad hoc items and CI reports. Signed in to one organisation
+  with another's key still on the machine, those could land on the wrong
+  board. Nothing changes for a machine signed in to one organisation. A report
+  already queued from a machine that had no organisation is kept, not thrown
+  away, and waits for a session that can deliver it.
+- **`teamflow status` and `teamflow doctor` gained a `reconcile` line**: what
+  the last pass repaired, what is still owed, and anything held back with its
+  reason.
+
 ## 0.3.15
 
 - **Security: a ticket binding now names the organisation it was made under,

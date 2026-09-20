@@ -141,10 +141,21 @@ A ticket's events used to be stored in three shapes — the issue document's `ex
   "label": "Unit tests",
   "stage": "LOCAL_TEST",           // optional: not every event moves a ticket
   "status": "failed",              // optional: not every event is a run
+  "endedAt": "2026-09-19T05:14:00Z", // optional: when the run stopped
   "summary": "3 of 214 failed",
   "evidence": [ /* the capped list above */ ]
 }
 ```
+
+`endedAt` is a clock and nothing else (MACLEOD-601). It is absent while a run
+is going, so its presence is what tells *still running* from *was running when
+something last looked* — the board used to claim somebody was working now on
+the strength of an event from sixteen hours ago. `agent.endedAt` and
+`session.endedAt` already said it for the two rows that carry those blocks;
+this is the same fact for a row that carries neither, such as a CI reporter's
+or a card republished by `teamflow tidy`. It is allowed inside `executions[]`
+and nowhere else: the issue document has `updatedAt` already, and a second
+clock beside it would be a second answer to when the ticket last moved.
 
 ### Who ran it: the `agent` and `session` blocks
 
@@ -273,11 +284,11 @@ live on the board rather than in a session.
 It may carry:
 
 - `id` (`wf-` and hex) and `name` — the workflow is addressable, so a ticket the filter missed can be added to it by name
-- `status`, `createdAt`, `updatedAt`
+- `status`, `createdAt`, `updatedAt`. `status` is one of `planning`, `running`, `blocked`, `done`, `cancelled`, `archived`. `archived` is a run that is over and should stop being offered — the empty planning run nobody ever filled, retired by `teamflow tidy` (MACLEOD-601). It is deliberately not `cancelled`, which says somebody decided against work they meant to do; an archived run stays readable and leaves the pickers
 - `actor`: `id`, `displayName` — who is running it, in exactly the two fields a report already uses for an actor and no others. A workflow's queued tickets have nobody on them by definition, so without this the board reads a run somebody is sitting in front of as nobody's work. No email, no machine, no account; optional, because a document written before the field existed is still valid. `id` is a slug (`[a-z0-9._-]`, capped at 80) and the service refuses anything else: a free-text id took a home directory path and a whole email address, and the first of those names a client the reader's organisation may not be allowed to know about. `displayName` is a stated identity — a configured actor name or the one the working copy is set up with — never the machine's login, because a run owned by a unix account is a person on the board who does not exist
 - `filter`: `tracker`, `project`, `state`, `label`, `order` — **what the order was turned into**
 - `scope.deploy` — whether deploying is in scope for this run
-- `tickets[]`: `key`, `rank`, `phase`, `state`, `cycle`, `addedBy`, `updatedAt`
+- `tickets[]`: `key`, `rank`, `phase`, `state`, `cycle`, `addedBy`, `updatedAt`. `state` is one of `waiting`, `running`, `done`, `blocked`, `skipped`, `rework` — the same six the plugin and the dashboard spell, and the enum refuses the whole document rather than the field, so a state missing from one of the three spellings is a run that stops reaching the board entirely (MACLEOD-601)
 - `dependencies[]`: `from`, `on`, `reason`, `found` — which ticket waits on which, and whether planning or a team building found it
 - `phases[]`: `n`, `state`, `tickets[]`
 

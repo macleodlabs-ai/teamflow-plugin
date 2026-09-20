@@ -542,6 +542,37 @@ export async function handleEvent(input = {}) {
   // session that does any work at all.
   if (event === 'Stop' || absorbed) await flushPendingEnds(config, 3, sessionId);
 
+  /*
+   * And a slice of the reconcile pass (MACLEOD-601).
+   *
+   * AFTER the publish above and never before it. Reconciliation must
+   * never sit between a ticket and its own report: this whole module
+   * runs inside `failOpen`, which swallows a throw and exits 0, so a
+   * bug here would show up as tickets that silently stop advancing —
+   * which is the failure mode the ticket exists to remove, not to add
+   * a second source of.
+   *
+   * `reconcileOnHook` never throws and is bounded at two repairs. On
+   * `Stop` the hook has already posted a report and already flushed
+   * pending ends, so two more posts on the same warm connection is the
+   * marginal cost. On `SessionStart` — which is on the fast path, where
+   * the tool is waiting — it does no network at all: it closes runs
+   * that have gone silent with file writes and posts nothing.
+   */
+  if (event === 'Stop' || event === 'SessionStart') {
+    const { reconcileOnHook } = await import('./reconcile.mjs');
+    /*
+     * `sessionId` excludes this session's own actors (MACLEOD-601
+     * audit, finding 11). A session being resumed has a row whose
+     * `updatedAt` is from whenever it last did anything — yesterday,
+     * for a `--resume` — so a `SessionStart` would otherwise close the
+     * agent that is about to carry on working. It self-heals on the
+     * next publish, and a board that flickers an agent to ended every
+     * time somebody resumes is still wrong.
+     */
+    await reconcileOnHook(config, { network: event === 'Stop', sessionId });
+  }
+
   // After the publish, never before: the board's last word on the item
   // is the state above, and forgetting the key first would have
   // published nothing at all. It never reopens -- a new request is a
