@@ -457,6 +457,19 @@ Binding is also where a title is learned: see below.
 
 `/teamflow:doctor` reports the transport, the service account and whether this machine can report, the configured tracker, the resolved issue source and whether that tracker's bundled MCP server is visible; authenticate it once through `/mcp`.
 
+### TeamFlow in `/mcp` (MACLEOD-637)
+
+The plugin's `.mcp.json` declares TeamFlow's own MCP server beside Atlassian's, Linear's and GitHub's, so `/mcp` lists `teamflow` and gives it the same actions: view its tools, Reconnect, and enable or disable it for the project. It is an HTTP server at `https://codercat.io/mcp` with a `headersHelper` — `node "${CLAUDE_PLUGIN_ROOT}/scripts/mcp-headers.mjs"` — that Claude Code runs on every connect and reconnect. The helper prints `{"Authorization": "Bearer dat_…"}`: the machine's one-hour device access token, minted and refreshed by the same `accessToken()` call reports use — plus `X-Machine-Id`, the same random machine id reports carry, so the one-machine rule (MACLEOD-620) holds over MCP too. The service guards `/mcp` itself (`mcp.gateway_auth: "app"`) and accepts there exactly what `/v1/call` accepts; `scripts/postdeploy.sh` fails unless `/mcp` answers a tokenless `tools/list` with 401 and `WWW-Authenticate: Bearer`. The token is never a refresh token, a pre-0.3.24 `dk_` or a browser sign-in, and it is sent only when the MCP url's origin is the one the machine's authorization was issued by and the one the plugin is configured for (MACLEOD-616) — a repository's environment pointing elsewhere gets no token. Claude Code's own MCP OAuth is not used: it needs dynamic client registration, which Cognito does not offer, and the plugin's credential is the device authorization.
+
+| What you want | How |
+| --- | --- |
+| Connect / authenticate | `/teamflow:login` (the consent page), then Reconnect `teamflow` in `/mcp` |
+| Disable for a project | `/mcp` → `teamflow` → disable; reporting is unaffected |
+| Disconnect this machine | `/teamflow:logout`, which revokes the device; the next connect prints no header |
+| Check it | `/teamflow:doctor` (`teamflowMcp`: connected, tool count, or the reason); `/teamflow:status` says whether a header could be printed, without minting one |
+
+When the machine is not authorized, or the token may not go to that url, the helper prints `{}` on stdout, the reason on stderr and exits 0, so `/mcp` shows `teamflow` as not connected rather than hanging.
+
 ### Picking the next ticket
 
 A session that never names an issue reports nothing, and nobody notices until the work is missing from the board. `/teamflow:next` (the `next` skill, `teamflow next` from any shell) is the other end of that: it takes the top-priority open ticket, assigns it in the tracker and binds it, so the hooks attribute everything after it. On `SessionStart` and `UserPromptSubmit` a session with nothing bound is told to run it, in one sentence.

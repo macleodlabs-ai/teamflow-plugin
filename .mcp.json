@@ -1,5 +1,10 @@
 {
   "mcpServers": {
+    "teamflow": {
+      "type": "http",
+      "url": "https://codercat.io/mcp",
+      "headersHelper": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/mcp-headers.mjs\""
+    },
     "atlassian": {
       "type": "http",
       "url": "https://mcp.atlassian.com/v2/mcp"

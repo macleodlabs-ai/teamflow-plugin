@@ -3,6 +3,23 @@
 What changed in each published version of the TeamFlow plugin, newest first.
 Only what a person using it would notice.
 
+## 0.3.26
+
+- **TeamFlow shows up in `/mcp`, like Linear.** The plugin now brings
+  TeamFlow's own MCP server, listed as `teamflow`, with the usual
+  actions: see its tools, Reconnect, and switch it off or on for a
+  project. It connects with the authorization `/teamflow:login` already
+  gave this computer — no second sign-in, no key. If the computer is not
+  authorized, `teamflow` shows as not connected and the fix is
+  `/teamflow:login`, then Reconnect. `/teamflow:doctor` now says whether it
+  connects and how many tools it offers, and `/teamflow:status` whether it
+  is authorized.
+- **The plugin's own folders follow your account, not the checkout.** The
+  per-machine and data folders now come from your account's home directory,
+  like your config and session already did, so a repository that sets
+  `$HOME` cannot choose where TeamFlow keeps them. `teamflow doctor` lists
+  the config file it actually read.
+
 ## 0.3.25
 
 - **When a free trial ends, the plugin says so.** If your organisation's

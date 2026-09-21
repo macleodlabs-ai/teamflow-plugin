@@ -15,6 +15,7 @@ import {
   dataDirWritable,
   fetchAccount,
   gitInfo,
+  globalConfigPath,
   isWorktree,
   latestSessionForCwd,
   credentialRefusal,
@@ -230,6 +231,9 @@ async function status() {
   const tidied = reconcileLine();
   const ignoredConfig = ignoredProjectLine(ignoredProjectKeys(cwd));
   const refusedCredential = credentialRefusal(config);
+  // TeamFlow's own entry in /mcp (MACLEOD-637), from local state only.
+  const { mcpReadinessLine } = await import('./mcp.mjs');
+  const teamflowMcp = await mcpReadinessLine(config);
   print({
     tenantId: tenantId(config),
     pluginVersion: pluginVersion() || 'unknown',
@@ -281,6 +285,7 @@ async function status() {
     credential: credentialKind(config) || 'none',
     identity: identity(probe?.email || session?.email, probe?.account?.account)
       || (credentialKind(config) ? 'not verified; run /teamflow:doctor' : 'not signed in; run /teamflow:login'),
+    teamflowMcp,
     // No balance and no key here (MACLEOD-612). A seat is the unit a team
     // buys, so a number counting reports is nothing the person reading this
     // can act on; and a key they are no longer offered is not a setting to
@@ -438,6 +443,10 @@ async function doctor() {
   const tidied = reconcileLine();
   const ignoredConfig = ignoredProjectLine(ignoredProjectKeys(cwd));
   const refusedCredential = credentialRefusal(config);
+  // TeamFlow's own MCP server (MACLEOD-637): connected with the header
+  // the /mcp helper would print, then asked for its tools.
+  const { mcpStatus, mcpStatusLine } = await import('./mcp.mjs');
+  const teamflowMcp = mcpStatusLine(await mcpStatus(config));
   const report = {
     claudeProbe: claudeBin ? 'ran' : `skipped: ${claudeSkipped}`,
     pluginVersion: pluginVersion() || 'unknown',
@@ -469,11 +478,13 @@ async function doctor() {
     // A finding rather than trivia: nothing is being reported for that
     // ticket at all, and no other line here would say so (MACLEOD-586).
     ...(refusedBinding ? { binding: refusedBinding } : {}),
+    teamflowMcp,
     trackerMcp: mcpVisible
       ? `${server} visible`
       : `${server} not visible yet; TeamFlow bundles it, restart/reload plugin then use /mcp to authenticate`,
     configFiles: [
-      path.join(process.env.HOME || '', '.config', 'teamflow', 'config.json'),
+      // The file actually read: the account's home, not $HOME (MACLEOD-623).
+      globalConfigPath(),
       path.join(cwd, '.teamflow.json'),
     ],
   };

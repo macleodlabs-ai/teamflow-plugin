@@ -378,7 +378,7 @@ function mergeConfig(...configs) {
 
 export function dataDir() {
   return process.env.CLAUDE_PLUGIN_DATA ||
-    path.join(os.homedir(), '.local', 'share', 'teamflow');
+    path.join(userHome(), '.local', 'share', 'teamflow');
 }
 
 export function projectId(cwd) {
@@ -2533,10 +2533,12 @@ function boundedIssue(found) {
  *
  * TEAMFLOW_GH_BIN is the tests' stub, and only the test sandbox may name
  * one: from anywhere else it is an environment variable a repository can
- * set, naming a program this plugin would then run.
+ * set, naming a program this plugin would then run. "The test sandbox" is
+ * the in-process flag `enableTestHome()` sets, not TEAMFLOW_TEST_SANDBOX,
+ * which is itself an environment variable (MACLEOD-622 re-audit).
  */
 export function ghBinary() {
-  return (process.env.TEAMFLOW_TEST_SANDBOX === '1' && process.env.TEAMFLOW_GH_BIN) || 'gh';
+  return (testHome && process.env.TEAMFLOW_GH_BIN) || 'gh';
 }
 
 /**
@@ -4036,7 +4038,7 @@ function scheduleRetry(item, result) {
  * service and refuses itself.
  */
 export function machineDir() {
-  return path.join(os.homedir(), '.local', 'share', 'teamflow');
+  return path.join(userHome(), '.local', 'share', 'teamflow');
 }
 
 /**

@@ -21,7 +21,7 @@ If they press Deny the command stops and says so; nothing was issued and nothing
 
 What this leaves on the machine is the plugin's authorization for this one computer, bound to the user's seat: a long-lived refresh token that is only ever sent to TeamFlow's token endpoint, and one-hour access tokens minted from it for the reports themselves. It stays authorized until somebody revokes it — `/teamflow:logout` revokes it at the service, and the user or an owner can revoke it from the Organisation page, which lists every connected computer. Which organisation it syncs to is chosen on the consent page, so `--org` does nothing here.
 
-This is the whole of TeamFlow onboarding.
+This is the whole of TeamFlow onboarding. It is also how TeamFlow's own MCP server — `teamflow` in `/mcp` — is authenticated: it connects with this same authorization, so after logging in tell the user to Reconnect `teamflow` in `/mcp` if it showed as not connected. There is no separate MCP sign-in.
 
 If the command fails it prints the reason. "Could not reach" means the service did not answer and the thing to do is try again. A code that expired or was never approved needs a fresh one: run the command again.
 
