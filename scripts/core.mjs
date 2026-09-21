@@ -3335,6 +3335,43 @@ export function ambientDestination(config = {}) {
 }
 
 /**
+ * Whether a configured `apiKey` may be used at all (MACLEOD-630).
+ *
+ * The hosted service accepts no key: it refuses one on sight, and revokes
+ * whatever it recognises. So a key is never sent there, whatever set it
+ * — not the global file, not the environment — and the only refusal a
+ * person sees is the one line `status` and `doctor` print. The code path
+ * stays, dormant, for a self-hosted service: this machine, or an origin
+ * the user listed in their own global file (`trustedOrigins`, which the
+ * environment and a repository cannot write). Never the hosted origin,
+ * and never a remote origin on an environment variable's say-so.
+ */
+export function apiKeyUsable(config = {}) {
+  if (!config.apiKey) return false;
+  const target = ambientDestination(config);
+  if (!target.ok) return false;
+  return !HOSTED_ORIGINS.has(target.origin)
+    && target.origin !== originOf(defaultServiceUrl());
+}
+
+/**
+ * The hosted service under every name it answers to. The two aliases 301 to
+ * the primary host, so a key sent to either is a key sent to the service that
+ * refuses and revokes it — and a user can list an alias in `trustedOrigins`
+ * from an old config without knowing it is the same service.
+ */
+const HOSTED_ORIGINS = new Set([
+  'https://codercat.io', 'https://www.codercat.io', 'https://teamflow.macleodlabs.com',
+]);
+
+/** The one line about an ignored key, or undefined when there is none to say. */
+export function ignoredKeyReason(config = {}) {
+  if (!config.apiKey || apiKeyUsable(config)) return undefined;
+  return 'a configured key is ignored: the service does not accept one. '
+    + 'Authorize this machine with /teamflow:login';
+}
+
+/**
  * The rule for the credential this config would actually use.
  *
  * A stored session answers with the origin that issued it. An access
@@ -3383,7 +3420,12 @@ export function credentialTarget(config = {}) {
  */
 export function credentialRefusal(config = {}) {
   const target = credentialTarget(config);
-  return target.ok ? undefined : target.reason;
+  if (!target.ok) return target.reason;
+  // The destination is fine and the only credential on offer is a key
+  // the service will not take: said here, once, so the same line reaches
+  // status, doctor and the session-start hook.
+  if (!credentialKind(config)) return ignoredKeyReason(config);
+  return undefined;
 }
 
 /**
@@ -3417,7 +3459,9 @@ export function unreachableReason(error, config = {}) {
 //      revocable refresh token.
 //   2. `accessToken` handed in directly, which is how CI passes the
 //      token it got by exchanging its GitHub Actions OIDC token.
-//   3. `apiKey`, for non-interactive installs that cannot do either.
+//   3. `apiKey`, for non-interactive installs that cannot do either —
+//      against a self-hosted service only. The hosted one refuses a key
+//      on sight, so one is never sent there (`apiKeyUsable`, MACLEOD-630).
 //
 // Callers ask for a credential rather than reading `apiKey`, and the
 // outbox stores none: a queued report resolves its credential when it
@@ -3437,7 +3481,7 @@ export async function credential(config = {}) {
     // A session that will not refresh has expired or been revoked.
     // Fall through to a key if there is one rather than going dark,
     // and carry the reason so doctor can say what happened.
-    if (config.apiKey) {
+    if (apiKeyUsable(config)) {
       return { kind: 'api_key', header: 'X-Api-Key', value: String(config.apiKey), degraded: token.reason };
     }
     return undefined;
@@ -3445,7 +3489,7 @@ export async function credential(config = {}) {
   if (config.accessToken) {
     return { kind: 'bearer', header: 'Authorization', value: `Bearer ${config.accessToken}` };
   }
-  if (config.apiKey) {
+  if (apiKeyUsable(config)) {
     return { kind: 'api_key', header: 'X-Api-Key', value: String(config.apiKey) };
   }
   return undefined;
@@ -3461,7 +3505,7 @@ export function credentialKind(config = {}) {
   // than by deleting a file.
   if (auth.isDeviceSession()) return 'device';
   if (auth.hasSession() || config.accessToken) return 'bearer';
-  if (config.apiKey) return 'api_key';
+  if (apiKeyUsable(config)) return 'api_key';
   return undefined;
 }
 

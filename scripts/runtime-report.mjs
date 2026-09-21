@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import * as auth from './auth.mjs';
 import {
-  loadConfig, putReport, reportScope, sendReport, tenantId, tenantPath, transportOf,
+  apiKeyUsable, loadConfig, putReport, reportScope, sendReport, tenantId, tenantPath, transportOf,
 } from './core.mjs';
 
 function arg(name, fallback) {
@@ -67,7 +67,7 @@ if (ci.ok) {
   // matches it (MACLEOD-583).
   if (ci.account) config.account = ci.account;
 } else if (ci.attempted) {
-  process.stderr.write(`TeamFlow: OIDC sign-in failed (${ci.reason}); ${config.apiKey ? 'falling back to TEAMFLOW_API_KEY' : 'no fallback credential is configured'}\n`);
+  process.stderr.write(`TeamFlow: OIDC sign-in failed (${ci.reason}); ${apiKeyUsable(config) ? 'falling back to TEAMFLOW_API_KEY' : 'no fallback credential is configured'}\n`);
 }
 
 // The service derives the object path from the envelope's slot and the

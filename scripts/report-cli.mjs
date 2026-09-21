@@ -21,6 +21,7 @@ import { fileURLToPath } from 'node:url';
 import {
   actor,
   cachedIssueTitle,
+  credentialRefusal,
   gitInfo,
   gitSnapshot,
   issueProject,
@@ -290,7 +291,14 @@ export async function main(argv = process.argv.slice(2), io = {}) {
     return 0;
   }
   if (transport === 'none') {
-    err('TeamFlow: nothing to report to. Run /teamflow:login in Claude Code, or set TEAMFLOW_API_KEY.\n');
+    // Why, when there is a why: a configured key that is not sent, or an
+    // address a credential may not go to, is a refusal the person should
+    // read here and not only in `status` (MACLEOD-616, MACLEOD-630). And
+    // never "set a key": the service accepts none.
+    const refused = credentialRefusal(config);
+    err(refused
+      ? `TeamFlow: not sent — ${refused}\n`
+      : 'TeamFlow: nothing to report to. Run /teamflow:login in Claude Code.\n');
     return 2;
   }
 

@@ -295,10 +295,17 @@ every case the old stored secret covered, and TeamFlow issues no such secret
 — `apiKey` set against this service is refused with `api_keys_disabled`
 rather than quietly demoted to.
 
-The plugin itself still resolves `apiKey` (`TEAMFLOW_API_KEY`), last of the
-three, for anyone pointing `serviceUrl` at a service that does issue one. It
-is last because a signed-in developer should stop sending a long-lived secret
-the moment there is something better.
+The plugin never sends a configured `apiKey` (`TEAMFLOW_API_KEY`, or the
+global file) to TeamFlow, whichever layer set it: the service refuses a key on
+sight and revokes any it recognises, so sending one could only burn it
+(MACLEOD-630). `status` and `doctor` say so in one line — "a configured key is
+ignored … authorize this machine with /teamflow:login" — and nothing is sent.
+The code path is dormant, not deleted: it is reached only for a self-hosted
+service that does issue keys, and only when that service's origin is listed
+in `trustedOrigins` in your own `~/.config/teamflow/config.json` — never from
+a repository's `.teamflow.json`, and never on an environment variable alone.
+There it is last of the three, because a signed-in developer should stop
+sending a long-lived secret the moment there is something better.
 
 `/teamflow:doctor` warns when a session has expired or been revoked, and says
 to run `/teamflow:login` again. On TeamFlow that is not a demotion to

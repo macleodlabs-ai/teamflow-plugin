@@ -3,6 +3,17 @@
 What changed in each published version of the TeamFlow plugin, newest first.
 Only what a person using it would notice.
 
+## 0.3.22
+
+- **A configured key is never sent to TeamFlow.** The service now refuses a
+  key on sight, whatever header or link it arrives in, and revokes any it
+  recognises — so the plugin stops offering one. If `TEAMFLOW_API_KEY` or the
+  global file still names a key, `status` and `doctor` say once that it is
+  ignored and that `/teamflow:login` is what authorizes this machine. Nothing
+  changes for a machine that is signed in. A self-hosted service that does
+  issue keys still gets one, and only when its address is listed in
+  `trustedOrigins` in your own `~/.config/teamflow/config.json`.
+
 ## 0.3.21
 
 - **Nothing the plugin says mentions a credit any more.** A seat is a
