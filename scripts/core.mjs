@@ -5,6 +5,7 @@ import crypto from 'node:crypto';
 import { spawnSync } from 'node:child_process';
 
 import * as auth from './auth.mjs';
+import { refusalOf } from './refusal.mjs';
 import { TOOL_CAPABILITIES } from './tools.mjs';
 
 // Jira and Linear share this key shape; the configured tracker decides how it is labelled and linked.
@@ -3879,76 +3880,114 @@ function scheduleRetry(item, result) {
 }
 
 /**
- * A refusal the kit names by `reason_code`, said in the plugin's own
- * words (MACLEOD-613, for MACLEOD-610).
+ * Where this MACHINE keeps what is true of the machine rather than of one
+ * install of the plugin (MACLEOD-620 audit, B1).
  *
- * `reason_code` is the kit's own convention and the only name it uses:
- * `errors.py`'s `Reject`, `flow.py`'s `rate_limited` /
- * `insufficient_credits` / `wall_cap_exceeded`, `mcp_http.py`'s
- * `bad_json` / `input_too_large`, and `abuse.py`'s `reporting_paused`
- * all carry it. There is no field called `slug` anywhere in the kit —
- * the first cut of this read one, which made this table dead code that
- * nothing could notice, because the kit's own `message` is good enough
- * that the fall-through still read well.
- *
- * The table exists so the sentence is the plugin's, in the plugin's
- * vocabulary — the kit says "account", everything a TeamFlow user reads
- * says "organisation" — and so it survives the service rewording its
- * `message`. A code this table has never heard of falls through to that
- * message, which is what every refusal did before.
+ * Not `dataDir()`. Claude Code gives every config directory its own
+ * `CLAUDE_PLUGIN_DATA`, so two config directories on one laptop — a
+ * rotation pool — are two data directories; Cursor, Codex and the CLI use
+ * `~/.local/share/teamflow`. The device credential they all present is
+ * home-rooted (`~/.config/teamflow/session.json`), so anything keyed to it
+ * has to be home-rooted too, or one laptop is several machines to the
+ * service and refuses itself.
  */
-// Null-prototyped, because the key is the service's to choose
-// (MACLEOD-613 audit, finding 3; the same fix MACLEOD-605 made to
-// `BY_ID`). On a plain object `reason_code: "toString"` looks up
-// `Object.prototype.toString`, which is truthy, so `reason` becomes a
-// Function — and `JSON.stringify` drops a Function, so the reason
-// disappears from the state file and from `teamflow status` entirely.
-// That is the exact failure this whole path exists to remove.
-const REFUSAL_REASONS = Object.assign(Object.create(null), {
-  reporting_paused: 'reporting is paused for this organisation — contact support',
-});
-
-/**
- * How much of the service's own words are worth keeping.
- *
- * `serviceUrl` is settable from a cloned repository's `.teamflow.json`,
- * so `message` is attacker-reachable and the session state file is the
- * target: the audit persisted 5,038 characters of it, with ESC and CR
- * in the middle. `JSON.stringify` escapes the control characters on the
- * way to a terminal, so this is not an injection — it is a state file
- * somebody else decides the size and shape of, which is reason enough.
- * A sentence a person can read is under two hundred characters.
- */
-const REASON_MAX = 200;
-
-function readableReason(text) {
-  // C0 and C1, which is every escape, newline and carriage return.
-  const clean = String(text).replace(/[\u0000-\u001f\u007f-\u009f]+/g, ' ').trim();
-  // By code point, not by code unit: `slice` cuts an emoji that straddles
-  // the limit in half and stores the lone high surrogate, which is a
-  // broken string every reader of the state file then carries around.
-  return [...clean].slice(0, REASON_MAX).join('');
+export function machineDir() {
+  return path.join(os.homedir(), '.local', 'share', 'teamflow');
 }
 
 /**
- * What the service said, in the shape the kit actually answers in.
+ * The refusals that lift by themselves (MACLEOD-620).
  *
- * Every kit refusal is `{status, reason_code, message, billing}` — see
- * `flow.py:252`, which builds it from `errors.py`'s `Reject`, and
- * `abuse.py:141`. Read in one place so a new refusal is named wherever
- * it arrives rather than only on the branch somebody remembered, and so
- * the reason never degrades to an HTTP number while the service was
- * telling us in words.
+ * Each is remembered per organisation, on this machine, until a report for
+ * that organisation is accepted again — so `teamflow status`, `teamflow
+ * doctor` and the next session's start can say it. A hook exits 0 and
+ * prints nothing, and a board that has gone quiet on purpose must not look
+ * like one that broke. Per organisation because an accepted report for one
+ * says nothing about another (audit, S2).
  */
-function refusalOf(body, fallback) {
-  const code = typeof body?.reason_code === 'string' ? body.reason_code : undefined;
-  const named = code ? REFUSAL_REASONS[code] : undefined;
-  const said = typeof body?.message === 'string' ? readableReason(body.message) : undefined;
-  return {
-    reasonCode: code,
-    reason: named || said || fallback,
+const SOFT_REFUSALS = new Set(['reporting_paused', 'payment_failed', 'usage_exceeds_plan', 'credential_in_use']);
+
+function softRefusalPath(scope) {
+  const name = String(scope || UNSCOPED).toLowerCase().replace(/[^a-z0-9._-]+/g, '-').slice(0, 80) || UNSCOPED;
+  return path.join(machineDir(), 'refusals', `${name}.json`);
+}
+
+/**
+ * The soft refusal this machine last met for this organisation and has not
+ * seen lift, or undefined. `scope` is what a report names as its
+ * organisation — `reportScope(config)`, or a binding's own account.
+ */
+export function readSoftRefusal(scope) {
+  try {
+    const found = JSON.parse(fs.readFileSync(softRefusalPath(scope), 'utf8'));
+    if (found && typeof found.reason === 'string' && SOFT_REFUSALS.has(found.reasonCode)) return found;
+  } catch {}
+  return undefined;
+}
+
+function noteSoftRefusal(scope, refusal) {
+  const file = softRefusalPath(scope);
+  try {
+    if (refusal && SOFT_REFUSALS.has(refusal.reasonCode)) {
+      fs.mkdirSync(path.dirname(file), { recursive: true });
+      fs.writeFileSync(file, `${JSON.stringify({
+        reasonCode: refusal.reasonCode, reason: refusal.reason, at: new Date().toISOString(),
+      })}\n`, { mode: 0o600 });
+    } else if (!refusal && fs.existsSync(file)) {
+      // Accepted again for this organisation: the cause is gone, and so is
+      // its notice. Another organisation's is not this report's to clear.
+      fs.rmSync(file, { force: true });
+    }
+  } catch {
+    // A sandbox that cannot write here loses the notice, never the report.
+  }
+}
+
+/**
+ * This machine's own id, for the one-machine rule (MACLEOD-620).
+ *
+ * Random, made once and kept in `machineDir()` — never the hostname, which
+ * changes with the network and says something about the person. One file
+ * per home directory, whatever `CLAUDE_PLUGIN_DATA` says, so every config
+ * directory and every tool on the laptop is one machine (audit, B1). A
+ * devcontainer or remote shell that shares the home directory shares it
+ * too; a copied credential file does not.
+ *
+ * '' when the id cannot be kept. A fresh id per process would make every
+ * session look like a new machine, and a reporter that sends none is
+ * simply never asked.
+ */
+const MACHINE_ID = /^[A-Za-z0-9_-]{16,64}$/;
+let machineIdCache;
+
+export function machineId() {
+  if (machineIdCache !== undefined) return machineIdCache;
+  const file = path.join(machineDir(), 'machine-id');
+  const read = () => {
+    try {
+      const value = fs.readFileSync(file, 'utf8').trim();
+      return MACHINE_ID.test(value) ? value : undefined;
+    } catch {
+      return undefined;
+    }
   };
+  let id = read();
+  if (!id) {
+    try {
+      fs.mkdirSync(machineDir(), { recursive: true });
+      // `wx`: two first hooks racing must not end with two ids.
+      fs.writeFileSync(file, `m_${crypto.randomBytes(16).toString('hex')}\n`, { mode: 0o600, flag: 'wx' });
+    } catch {}
+    id = read();
+  }
+  machineIdCache = id || '';
+  return machineIdCache;
 }
+
+export function resetMachineIdCache() {
+  machineIdCache = undefined;
+}
+
 
 let paymentNoticeShown = false;
 
@@ -4077,6 +4116,7 @@ async function postEnvelope(endpoint, envelope, idempotencyKey, config, account 
   const refused = carrierRefusal(account, owner);
   if (refused) return { ok: false, retry: false, refused: true, reason: refused };
   const answer = (result) => ({ ...result, owner });
+  const machine = machineId();
   let response;
   try {
     response = await fetch(`${serviceUrl(config)}${route}`, {
@@ -4085,6 +4125,8 @@ async function postEnvelope(endpoint, envelope, idempotencyKey, config, account 
         'Content-Type': 'application/json',
         [cred.header]: cred.value,
         'Idempotency-Key': idempotencyKey,
+        // An identifier, not content (docs/REPORTING_CONTRACT.md).
+        ...(machine ? { 'X-Machine-Id': machine } : {}),
       },
       body: JSON.stringify(envelope),
       // `Authorization` is stripped by fetch across a redirect; `X-Api-Key`
@@ -4102,9 +4144,13 @@ async function postEnvelope(endpoint, envelope, idempotencyKey, config, account 
   const status = response.status;
   if (status === 402) {
     notePaymentRequired(config, body);
+    const refusal = refusalOf(body, 'no reporting seat on this account');
+    // `payment_failed` may arrive as a 402 as well as a 403; either way it
+    // is a pause that lifts by itself, and is remembered like one.
+    noteSoftRefusal(account, refusal);
     return answer({
       ok: false, retry: false, status, paymentRequired: true,
-      ...refusalOf(body, 'no reporting seat on this account'),
+      ...refusal,
     });
   }
   const retryAfterMs = parseRetryAfter(response.headers.get('retry-after'));
@@ -4121,13 +4167,16 @@ async function postEnvelope(endpoint, envelope, idempotencyKey, config, account 
     // 400, 401, 403, 413. Re-posting the same body cannot change the
     // answer, and one refused report must never dam the outbox in
     // front of the good reports behind it.
+    const refusal = refusalOf(body, `service refused the report (${status})`);
+    noteSoftRefusal(account, refusal);
     return answer({
       ok: false,
       retry: false,
       status,
-      ...refusalOf(body, `service refused the report (${status})`),
+      ...refusal,
     });
   }
+  noteSoftRefusal(account, undefined);
   return answer({
     ok: true,
     status,
@@ -4441,7 +4490,7 @@ export async function fetchAccount(config) {
     let body;
     try { body = await response.json(); } catch { body = undefined; }
     if (!response.ok) {
-      return { ok: false, status: response.status, reason: body?.message || `service returned ${response.status}` };
+      return { ok: false, status: response.status, ...refusalOf(body, `service returned ${response.status}`) };
     }
     return { ok: true, status: response.status, account: body, credential: cred.kind, email: cred.email, degraded: cred.degraded };
   } catch (error) {

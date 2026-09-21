@@ -3,6 +3,28 @@
 What changed in each published version of the TeamFlow plugin, newest first.
 Only what a person using it would notice.
 
+## 0.3.23
+
+- **Automatic reporting pauses, said in plain words.** If this machine's
+  credential is already reporting from another machine, you see "This
+  credential is already in use. Run /teamflow:login on this machine to give
+  it its own." If your organisation's usage is far beyond a normal team, you
+  see "Usage on the credential exceeds the plan. Contact us to discuss
+  Enterprise plans." Each one is followed by a link to
+  [the fair use guide](https://codercat.io/docs/fair-use/). A failed payment
+  pauses reporting the same way, and says so. `teamflow status`,
+  `teamflow doctor` and the next session's start show the pause for the
+  organisation it applies to. It lifts by itself, and the board catches up
+  at the end of the next turn.
+- **Each machine sends a random machine id with its reports.** It's made
+  once and kept in `~/.local/share/teamflow`, so every Claude Code config
+  directory and every other tool on your laptop is one machine. It's never
+  your hostname. A devcontainer that shares your home directory is the
+  same machine.
+- **Refusals everywhere else read the service's reason code too.** Signing
+  in, switching organisation, admin codes, ad hoc keys and projects say
+  "organisation" where the service says "account".
+
 ## 0.3.22
 
 - **A configured key is never sent to TeamFlow.** The service now refuses a

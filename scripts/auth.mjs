@@ -22,6 +22,7 @@ import {
   isLoopbackOrigin, originOf, readJson, safeExec, serviceUrl, serviceUrlSource,
   trustedOrigins, unreachableReason, writeJson,
 } from './core.mjs';
+import { refusalOf } from './refusal.mjs';
 import { BY_ID } from './tools.mjs';
 
 // Fixed and small on purpose: every one of these has to be registered
@@ -884,7 +885,7 @@ async function deviceCall(config, route, payload) {
       // The grant's own slugs. The caller branches on these, so they
       // are carried through rather than flattened into prose.
       error: body?.error,
-      reason: body?.detail || body?.message || body?.error || `the service answered ${response.status}`,
+      reason: refusalOf(body, `the service answered ${response.status}`).reason,
     };
   }
   return { ok: true, body: body || {} };
@@ -1050,7 +1051,7 @@ export async function revokeDevice(config, deviceId, token) {
   if (!response.ok) {
     let body;
     try { body = await response.json(); } catch { body = undefined; }
-    return { ok: false, status: response.status, reason: body?.detail || body?.error || `the service answered ${response.status}` };
+    return { ok: false, status: response.status, ...refusalOf(body, `the service answered ${response.status}`) };
   }
   return { ok: true };
 }
@@ -1127,7 +1128,7 @@ async function seatCall(config, route, idToken, account) {
     return { ok: true, bound: false, reason: 'this service does not bind members to seats' };
   }
   if (!response.ok) {
-    return { ok: false, status: response.status, reason: body?.message || body?.detail || body?.error || `identity binding returned ${response.status}` };
+    return { ok: false, status: response.status, ...refusalOf(body, `identity binding returned ${response.status}`) };
   }
   return { ok: true, bound: true, account: body?.account, name: body?.name, member: body?.member };
 }
@@ -1160,7 +1161,7 @@ export async function listOrgs(config, idToken) {
   let body;
   try { body = await response.json(); } catch { body = undefined; }
   if (!response.ok) {
-    return { ok: false, status: response.status, reason: body?.message || body?.detail || body?.error || `the service answered ${response.status}` };
+    return { ok: false, status: response.status, ...refusalOf(body, `the service answered ${response.status}`) };
   }
   return {
     ok: true,
@@ -1364,7 +1365,7 @@ export async function githubOidcAccessToken(config = {}) {
     if (!response.ok || !body?.access_token) {
       // `repository_not_registered` is the one an owner can fix, and
       // the service's own message names the route that fixes it.
-      return { ok: false, attempted: true, status: response.status, reason: body?.message || body?.detail || body?.error || `the service refused the OIDC token (${response.status})` };
+      return { ok: false, attempted: true, status: response.status, ...refusalOf(body, `the service refused the OIDC token (${response.status})`) };
     }
     return {
       ok: true, attempted: true, token: body.access_token,
@@ -1431,7 +1432,7 @@ async function repoCall(config, method, route, credentialHeader, payload) {
   let body;
   try { body = await response.json(); } catch { body = undefined; }
   if (!response.ok) {
-    return { ok: false, status: response.status, reason: body?.message || body?.detail || body?.error || `the service answered ${response.status}` };
+    return { ok: false, status: response.status, ...refusalOf(body, `the service answered ${response.status}`) };
   }
   return { ok: true, ...body };
 }

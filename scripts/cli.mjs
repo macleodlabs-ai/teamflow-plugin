@@ -27,6 +27,8 @@ import {
   outboxSummary,
   parseBindArgument,
   publishState,
+  readSoftRefusal,
+  reportScope,
   refusalLine,
   retireSharedBinding,
   resolveGithubRepo,
@@ -45,6 +47,7 @@ import {
   staleBuild,
   tracePath,
 } from './core.mjs';
+import { refusalOf } from './refusal.mjs';
 
 // Two subcommands live in their own modules because they are the two a
 // tool other than Claude Code actually runs: `report` moves a ticket and
@@ -135,7 +138,7 @@ async function trackerConnections(config) {
       return { ok: false, reason: 'this credential is not an org account, so it has no tracker connections' };
     }
     if (response.status === 404) return { ok: true, connections: [] };
-    if (!response.ok) return { ok: false, reason: body?.message || body?.detail || code || `service returned ${response.status}` };
+    if (!response.ok) return { ok: false, ...refusalOf(body, `service returned ${response.status}`) };
     const list = Array.isArray(body) ? body : body?.trackers;
     return { ok: true, connections: Array.isArray(list) ? list : [] };
   } catch (error) {
@@ -257,6 +260,8 @@ async function status() {
     summary: state?.summary,
     loopCount: state?.loopCount || 0,
     lastPublishResult: state?.lastPublishResult,
+    // Machine-wide, and until a report is accepted again (MACLEOD-620).
+    ...(readSoftRefusal(reportScope(config)) ? { reportingPaused: readSoftRefusal(reportScope(config)).reason } : {}),
     ...(outbox.queued || outbox.legacy || outbox.discarded.ownerless || outbox.discarded.expired
       ? { outbox: outboxLine(outbox) }
       : {}),
@@ -450,6 +455,9 @@ async function doctor() {
     // and print nothing.
     ...(ignoredConfig ? { configIgnored: ignoredConfig } : {}),
     ...(refusedCredential ? { credentialRefused: refusedCredential } : {}),
+    // A finding: the service is refusing this machine's reports, on
+    // purpose, until its cause goes (MACLEOD-620).
+    ...(readSoftRefusal(reportScope(config)) ? { reportingPaused: readSoftRefusal(reportScope(config)).reason } : {}),
     credential: credentialKind(config) || 'none',
     signedIn: auth.readSession() ? `yes, ${auth.readSession().email || 'session present'}` : 'no; run /teamflow:login',
     apiKeyFallback: config.apiKey ? 'configured' : 'not configured',
@@ -801,7 +809,7 @@ async function trackers() {
       ? ` Trackers you can authorise: ${body.providers.join(', ')}.`
       : '';
     throw new Error(`TeamFlow could not start ${provider}: `
-      + `${body?.detail || body?.error || `the service returned ${response.status}`}.${can}`);
+      + `${refusalOf(body, `the service returned ${response.status}`).reason}.${can}`);
   }
   const minutes = Math.max(1, Math.round(Number(body.expires_in || 600) / 60));
   print(`Open this to authorise ${provider}:\n\n  ${body.authorize_url}\n\n`

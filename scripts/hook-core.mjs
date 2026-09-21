@@ -30,6 +30,8 @@ import {
   publishState,
   readJson,
   recordLaunch,
+  readSoftRefusal,
+  reportScope,
   refusalLine,
   reporterInfo,
   repositoryRoot,
@@ -119,6 +121,16 @@ function projectSentence(project) {
 // ticket under the same `session_id` minutes earlier — its context
 // flipped between whichever worktree had bound last. An agent reads its
 // own binding and the session reads its own; neither can see the other's.
+// The organisation a session's reports go to, the way `publishState` names
+// it, so the notice read here is the one the report path wrote.
+function sessionSoftRefusal(state) {
+  try {
+    return readSoftRefusal(state?.binding?.account || state?.account || reportScope(loadConfig(state?.cwd || process.cwd())));
+  } catch {
+    return undefined;
+  }
+}
+
 export function claudeContext(event, state, justBound, stale = staleBuildNotice(), project = undefined,
   signedIn = true, refused = undefined, credentialRefused = undefined) {
   if (!FAST.includes(event)) return undefined;
@@ -152,6 +164,11 @@ export function claudeContext(event, state, justBound, stale = staleBuildNotice(
   if (event === 'SessionStart' && credentialRefused) {
     credential.push(`TeamFlow: nothing is reaching the board — ${credentialRefused}`);
   }
+  // And a soft refusal this machine met and has not yet seen lift
+  // (MACLEOD-620): reporting pauses, the hooks stay silent, so this is
+  // the one place a session hears why. It lifts by itself.
+  const soft = event === 'SessionStart' ? sessionSoftRefusal(state) : undefined;
+  if (soft) credential.push(`TeamFlow: reporting is paused — ${soft.reason}`);
   if (!state.binding?.key) {
     return JSON.stringify({
       hookSpecificOutput: {

@@ -15,6 +15,7 @@
 // hook that only ever reports should not pay to parse this.
 import * as auth from './auth.mjs';
 import { serviceUrl } from './core.mjs';
+import { refusalOf } from './refusal.mjs';
 
 const USAGE = `teamflow admin \u2014 operator commands, for superadmins
 
@@ -111,7 +112,7 @@ export async function adminCall(config, method, route, payload) {
       // The service's own message, verbatim. On a 403 it is the one
       // that says which email is signed in and that it is not a
       // superadmin, which is the whole of the diagnosis.
-      reason: body?.message || body?.detail || body?.error || `the service answered ${response.status}`,
+      ...refusalOf(body, `the service answered ${response.status}`),
     };
   }
   return { ok: true, status: response.status, body: body ?? {} };

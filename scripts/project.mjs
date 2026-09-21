@@ -22,6 +22,7 @@ import {
   serviceUrl,
   writeJson,
 } from './core.mjs';
+import { refusalOf } from './refusal.mjs';
 
 /**
  * The sentence, in one place, because three surfaces say it: `teamflow
@@ -121,7 +122,7 @@ export async function fetchProjects(config = {}, { ttlMs = TTL_MS, timeoutMs, no
     if (!response.ok) {
       return {
         ok: false,
-        reason: body?.message || body?.detail || body?.error || `service returned ${response.status}`,
+        ...refusalOf(body, `service returned ${response.status}`),
       };
     }
     const projects = Array.isArray(body?.projects) ? body.projects : [];

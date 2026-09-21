@@ -53,6 +53,7 @@ import {
   writeJson,
   writeLocalBinding,
 } from './core.mjs';
+import { refusalOf } from './refusal.mjs';
 
 export { isAdHocKey };
 
@@ -133,7 +134,7 @@ export async function mint(config = {}) {
     let body;
     try { body = await response.json(); } catch { body = undefined; }
     if (!response.ok) {
-      return { ok: false, status: response.status, reason: body?.message || `service returned ${response.status}` };
+      return { ok: false, status: response.status, ...refusalOf(body, `service returned ${response.status}`) };
     }
     if (!isAdHocKey(body?.key)) {
       return { ok: false, reason: 'the service did not answer an ad hoc key' };

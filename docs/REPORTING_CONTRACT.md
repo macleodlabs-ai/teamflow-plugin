@@ -10,6 +10,7 @@ A reporter posts one report at a time to the service:
 POST <serviceUrl>/v1/report
 Authorization:   Bearer <access token>
 Idempotency-Key: <sha256 of the report's content, excluding updatedAt>
+X-Machine-Id:    <this machine's random id, when it has one>
 
 { "kind": "issue" | "runtime", "slot": "<slot>", "payload": { ... } }
 ```
@@ -18,13 +19,14 @@ A reporter authenticates as itself: a developer's machine with the device creden
 
 `kind` is `issue` for a ticket's current state and `runtime` for one background sidecar; `slot` is present only for `runtime` and must be one of the slots below. The payload is a `TicketState` or a `RuntimeState` as defined in **Allowed current-state data**.
 
-Three properties of this transport are load-bearing:
+Four properties of this transport are load-bearing:
 
 - **The tenant comes from the credential.** The account behind the token or key owns the tenant prefix. A `tenantId` in the payload is dropped, because a body that names a tenant is describing somebody else's data.
 - **Unknown fields are dropped, not rejected.** The service answers 200 and lists what it dropped in `dropped_fields`. A reporter that grows a field, or is talked into attaching a prompt, a diff or a log line, cannot make that field reach the store by naming it something the service has never heard of.
+- **`X-Machine-Id` is an identifier, not content** (MACLEOD-620). It's `m_` and 32 random hex characters, made once and kept at `~/.local/share/teamflow/machine-id` — one per home directory, whatever `CLAUDE_PLUGIN_DATA` says, so every Claude Code config directory and every other tool on one laptop sends the same id for the one home-rooted device credential. It is never the hostname, the user name or anything derived from the machine. A devcontainer or remote shell that shares the home directory shares it. The service uses it only to keep a device credential to one machine at a time, and never stores it with a report. It's additive: a reporter that can't keep an id sends no header and is never asked, and so is an older plugin.
 - **The idempotency key is the report's content hash.** A heartbeat that repeats an unchanged report is the same request, replayed rather than counted again. Only real progress is a new report. Reporting is included in the seat and is not priced by volume: the count exists so that fair use can be told from a runaway loop, and nothing a person does at a keyboard reaches it.
 
-Answers: 2xx accepted (`replay: true` when it was a repeat); 402 the organisation has no reporting seat, which is logged once and never blocks; 403 `viewer_cannot_report`, refused and not retried; 401 `api_keys_disabled`, a key was presented and none is accepted — refused, not retried, and the key is dead; 429 rate limited, queued and retried after `Retry-After` or a capped backoff; any other 4xx the report was refused and is not retried; 5xx and network failures are queued and retried with the key they were queued with.
+Answers: 2xx accepted (`replay: true` when it was a repeat); 402 the organisation has no reporting seat, which is logged once and never blocks; 403 `viewer_cannot_report`, refused and not retried; 401 `api_keys_disabled`, a key was presented and none is accepted — refused, not retried, and the key is dead; 403 (or 402) `reporting_paused`, `payment_failed`, `usage_exceeds_plan` or `credential_in_use`, a soft refusal: dropped rather than held, never counted, shown by `teamflow status`, `teamflow doctor` and once at session start, and lifted by itself, after which the next `Stop` re-sends current state; 429 rate limited, queued and retried after `Retry-After` or a capped backoff; any other 4xx the report was refused and is not retried; 5xx and network failures are queued and retried with the key they were queued with.
 
 The legacy transport writes the same documents straight to S3 at the paths below with AWS credentials, and is selected when `dataUri` is configured and no service credential is available.
 

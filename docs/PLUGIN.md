@@ -312,6 +312,22 @@ to run `/teamflow:login` again. On TeamFlow that is not a demotion to
 something lesser — it is the only credential there is, so reporting stops
 until the session comes back, and doctor is where that is visible.
 
+### Devcontainers and remote shells: mount both directories, or neither
+
+A device credential is for one machine, and the service refuses a second
+machine reporting on it while the first still is (`credential_in_use`,
+MACLEOD-620). The plugin tells the service which machine it is with a random
+id kept at `~/.local/share/teamflow/machine-id`, beside the per-organisation
+pause notices in `~/.local/share/teamflow/refusals/`. The credential itself is
+in `~/.config/teamflow/`.
+
+So a devcontainer or remote shell that should report as this machine must
+mount **both** `~/.config/teamflow` and `~/.local/share/teamflow` from the
+host, or **neither** and run `/teamflow:login` inside to get a credential of
+its own. Mounting only `~/.config/teamflow` gives the container the host's
+credential with a machine id of its own, so it is a second machine on one
+credential and is refused whenever the host is reporting.
+
 ## Superadmin invite codes
 
 An invite code lets one organisation start without paying. The service creates it with the seats and the complimentary period the code carries instead of a Stripe subscription, and `admin.superadmins` in `service.config.json` names who may issue one.
