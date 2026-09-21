@@ -17,7 +17,7 @@ It prints the organisation reports are attributed to, and any others the signed-
 npx -y github:macleodlabs-ai/teamflow-plugin org switch <id>
 ```
 
-Reports published after the switch are attributed to the new organisation; nothing already published moves. If it says the user is not signed in, tell them to run the login skill.
+Reports published after the switch are attributed to the new organisation; nothing already published moves. If it says the user is not signed in as a person, tell them to run `teamflow login --browser` (a personal sign-in; the plugin's device authorization cannot switch organisations). A device authorization reports to the organisation chosen on the consent page; to move it, run the login skill again and choose there.
 
 Inside Claude Code the plugin is already on disk, so
 `node "${CLAUDE_PLUGIN_ROOT}/scripts/cli.mjs" org` is the same command without the npx round trip. Use it when `CLAUDE_PLUGIN_ROOT` is set.

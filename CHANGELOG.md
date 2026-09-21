@@ -3,6 +3,39 @@
 What changed in each published version of the TeamFlow plugin, newest first.
 Only what a person using it would notice.
 
+## 0.3.24
+
+- **`/teamflow:login` authorizes the plugin on the consent page, every
+  time.** It opens TeamFlow's consent page in your browser — naming the tool
+  and this computer, with the code your terminal shows — instead of the
+  hosted sign-in page. Approve once and the machine stays authorized until
+  it is revoked. With no browser here it prints the code and the page's
+  address for a browser anywhere; `--device` still works and does the same.
+- **Reports now carry a one-hour access token.** The long-lived part of the
+  authorization is sent only to TeamFlow's token endpoint, never with a
+  report, and revoking the computer (by `/teamflow:logout` or on the
+  Organisation page) stops it on its next report. Many sessions and agents on
+  one machine refresh together without ever signing it out.
+- **Machines authorized before this version keep reporting**, and switch to
+  the new tokens by themselves on their first report, keeping their place on
+  the Organisation page. An older copy of the plugin on the same machine keeps
+  working with what this one writes.
+- **Operator commands need a person.** `teamflow admin` and `teamflow org`
+  ask for `teamflow login --browser`, a personal sign-in kept apart from the
+  plugin's authorization; nothing reports with it.
+- **A repository can no longer choose where issue titles are looked up.**
+  GitHub titles come from `api.github.com`, or from a GitHub Enterprise host
+  named as `githubApi` in your own `~/.config/teamflow/config.json` — never
+  from an address an environment variable in a checkout names. Titles are
+  also cut to 256 characters and stripped of control characters before they
+  reach a card.
+- **A repository can no longer choose which files count as yours.** Your
+  TeamFlow config and session are read from your account's home directory,
+  not from `$HOME`, which a checkout can set. On a machine with no account
+  record for the user (some containers), TeamFlow now reads no credential
+  and `teamflow status` says why, instead of trusting `$HOME`.
+- **The test sandbox never opens a browser.** (Developers of the plugin only.)
+
 ## 0.3.23
 
 - **Automatic reporting pauses, said in plain words.** If this machine's

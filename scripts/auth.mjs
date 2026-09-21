@@ -1,16 +1,31 @@
 // Ephemeral credentials for TeamFlow reporters.
 //
-// A developer signs in once with `/teamflow:login`: authorization code
-// with PKCE against the Cognito hosted UI, a loopback redirect, and a
-// refresh token written to ~/.config/teamflow/session.json at 0600.
-// Access tokens live for an hour, are held in memory only, and are
-// refreshed a few minutes before they expire. CI signs in per job
-// instead, exchanging the GitHub Actions OIDC token for an access
-// token, so a workflow needs no stored secret at all.
+// The plugin is AUTHORIZED, never logged in (MACLEOD-622, the owner:
+// "Plugin always uses credentials issued via device auth flow. Login is
+// for users into dashboard."). `/teamflow:login` runs the device
+// authorization grant and opens the consent page — which names the tool
+// and the machine, with sign-in inside it — in this machine's browser.
+// What comes back is a pair, like an IDE's: a long-lived refresh token
+// bound to one device record, written to ~/.config/teamflow/session.json
+// at 0600 and sent only to the service's device token endpoint, and a
+// one-hour access token minted from it, which is what rides on each
+// request. Authorized once, authorized until somebody revokes the device.
+// CI signs in per job instead, exchanging the GitHub Actions OIDC token
+// for an access token, so a workflow needs no stored secret at all.
 //
-// Nothing here ever writes an access token to disk. A refresh token is
-// revocable and scoped to one machine; an access token on disk is a
-// bearer secret with an hour of life and no way to take it back.
+// The loopback authorization-code + PKCE flow below is NOT a plugin path
+// any more. It stays, reachable only as `teamflow login --browser`, for
+// the one thing a machine's credential must never do: act as a person
+// (operator commands, `admin.is_superadmin`). What it signs in is kept in
+// its own file and nothing reports with it.
+//
+// A device access token IS cached on disk (device-access.json, 0600),
+// unlike the Cognito one, and the difference is revocation: every use of
+// a device access token is checked against its device record, so a
+// revoked device's cached token stops working on the next call. Held in
+// memory only, every hook process — one per tool call — would pay a
+// round trip to the token endpoint and the long-lived secret would ride
+// on nearly every event after all.
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import http from 'node:http';
@@ -18,7 +33,7 @@ import os from 'node:os';
 import path from 'node:path';
 
 import {
-  credentialDestination, credentialRefusal, defaultServiceUrl, globalConfigPath,
+  credentialDestination, credentialRefusal, defaultServiceUrl, globalConfigPath, userHome,
   isLoopbackOrigin, originOf, readJson, safeExec, serviceUrl, serviceUrlSource,
   trustedOrigins, unreachableReason, writeJson,
 } from './core.mjs';
@@ -48,21 +63,67 @@ const DEVICE_INTERVAL_MS = 5000;
 // grant's own number, and the point of it is that a client which
 // ignores the answer gets itself cut off.
 const SLOW_DOWN_MS = 5000;
+// The service's device token endpoint: the device-code poll, the
+// refresh, and a `dk_` migration all go here (MACLEOD-622). Always built
+// from `serviceUrl(config)`, never read back from the session file.
+const DEVICE_TOKEN_ROUTE = '/v1/auth/device/token';
+const DEVICE_CODE_GRANT = 'urn:ietf:params:oauth:grant-type:device_code';
+// How long a service that could not migrate a `dk_` is left alone before
+// the next attempt, so a service that predates the pair costs one extra
+// request an hour rather than one per hook.
+const MIGRATE_RETRY_MS = 60 * 60 * 1000;
+// A migration another process won: how long to wait for it to write the
+// session file before falling back to the old credential for this call.
+const MIGRATE_WAIT_ATTEMPTS = 10;
+const MIGRATE_WAIT_MS = 100;
 
 export function sessionPath() {
-  return path.join(os.homedir(), '.config', 'teamflow', 'session.json');
+  // The account's home, not $HOME (MACLEOD-623): see `userHome` in core.mjs.
+  return path.join(userHome(), '.config', 'teamflow', 'session.json');
 }
 
-// Two kinds of session, and both are a credential this machine can
-// report with: a refresh token from the browser sign-in, or a device
-// credential from the code flow. A file with neither is not a session.
+/** The cached device access token, beside the session (see the header). */
+export function deviceAccessPath() {
+  return path.join(path.dirname(sessionPath()), 'device-access.json');
+}
+
+/**
+ * A PERSON's sign-in, kept apart from the plugin's authorization
+ * (MACLEOD-622). Written only by `teamflow login --browser`, read only by
+ * `adminIdToken`; reporting never looks here.
+ */
+export function personalSessionPath() {
+  return path.join(path.dirname(sessionPath()), 'personal-session.json');
+}
+
+// Three kinds of session, and all are a credential this machine can
+// report with: a device's refresh token (the one `teamflow login` makes
+// now), a device credential from before it (`deviceToken`, a `dk_`), or a
+// refresh token from the old browser sign-in. A file with none is not a
+// session.
+//
+// The device pair is written with `refreshToken` and `tokenUrl` on
+// purpose: plugin 0.3.23 and older, sharing this data directory, read it
+// as an ordinary refresh-token session and refresh it at `tokenUrl` —
+// which the service accepts, form-encoded, as a device refresh — so an
+// older copy keeps reporting after a newer one authorized the machine.
 export function readSession() {
   const session = readJson(sessionPath());
   return (session?.refreshToken || session?.deviceToken) ? session : undefined;
 }
 
 export function isDeviceSession(session = readSession()) {
-  return session?.kind === DEVICE_KIND && Boolean(session.deviceToken);
+  return session?.kind === DEVICE_KIND && Boolean(session.deviceToken || session.refreshToken);
+}
+
+/** A device credential from before MACLEOD-622, not yet migrated. */
+export function isLegacyDeviceSession(session = readSession()) {
+  return isDeviceSession(session) && Boolean(session.deviceToken) && !session.refreshToken;
+}
+
+function readPersonalSession() {
+  const session = readJson(personalSessionPath());
+  return session?.refreshToken ? session : undefined;
 }
 
 /**
@@ -115,6 +176,13 @@ function rememberTrustedOrigin(config, typed = undefined) {
   // first version of this function turned that into a permanent entry in
   // their own global file (MACLEOD-616 follow-up, B1). Only `--service`
   // typed this run, or `serviceUrl` already in the file, counts.
+  //
+  // UNTESTED, AND NOT THE GATE THAT IS (MACLEOD-623). Every caller runs
+  // `deliberateService` first, which refuses an environment-chosen origin
+  // before a sign-in starts — so no test can reach this line with one,
+  // and deleting it leaves the suite green. It is a second lock behind a
+  // tested first. Do not remove `deliberateService` believing this one is
+  // proven: it is not.
   const source = serviceUrlSource(config, typed);
   if (source !== 'typed' && source !== 'global') return false;
   if (trustedOrigins().includes(origin)) return false;
@@ -209,8 +277,13 @@ function saveSession(session) {
   writeJson(sessionPath(), { ...session, updatedAt: new Date().toISOString() });
 }
 
+function savePersonalSession(session) {
+  writeJson(personalSessionPath(), { ...session, updatedAt: new Date().toISOString() });
+}
+
 export function clearSession() {
   forgetCachedToken();
+  try { fs.unlinkSync(deviceAccessPath()); } catch { /* none cached */ }
   try {
     fs.unlinkSync(sessionPath());
     return true;
@@ -226,8 +299,13 @@ export function clearSession() {
 
 let cached;
 
+// The device access token's in-memory copy (MACLEOD-622); the one on
+// disk is `deviceAccessPath()`.
+let deviceCached;
+
 export function forgetCachedToken() {
   cached = undefined;
+  deviceCached = undefined;
 }
 
 function fingerprint(value) {
@@ -460,12 +538,47 @@ function printLine(line) {
   process.stderr.write(`${line}\n`);
 }
 
-function openInBrowser(url) {
+/**
+ * Where a browser opener may run from while the test sandbox is up: only
+ * a program inside the sandbox's own temporary tree, which is where the
+ * integration tests put their fake `open`. The real `/usr/bin/open` is
+ * never inside it (MACLEOD-622: a test run opened the owner's browser).
+ *
+ * The marker can only take the ability away. A repository that sets it
+ * stops this machine opening a consent page — the address is printed
+ * instead — and gains nothing: the program that may then run is one that
+ * already sits beside the redirected HOME.
+ */
+function sandboxedOpener(name) {
+  const home = process.env.HOME || '';
+  if (!home) return undefined;
+  let root;
+  try { root = fs.realpathSync(path.dirname(home)); } catch { return undefined; }
+  if (root === path.parse(root).root) return undefined;
+  for (const dir of String(process.env.PATH || '').split(path.delimiter)) {
+    if (!dir) continue;
+    const candidate = path.join(dir, name);
+    let real;
+    try { real = fs.realpathSync(candidate); } catch { continue; }
+    return real.startsWith(`${root}${path.sep}`) ? real : undefined;
+  }
+  return undefined;
+}
+
+export function openInBrowser(url) {
+  // Said not to, by the person (`TEAMFLOW_NO_BROWSER=1`, a container's
+  // setting) or by the test sandbox, which sets it too. Nothing spawned.
+  if (process.env.TEAMFLOW_NO_BROWSER === '1') return false;
   const opener = process.platform === 'darwin'
     ? ['open', [url]]
     : process.platform === 'win32'
       ? ['cmd', ['/c', 'start', '', url]]
       : ['xdg-open', [url]];
+  if (process.env.TEAMFLOW_TEST_SANDBOX === '1') {
+    const fake = sandboxedOpener(opener[0]);
+    if (!fake) return false;
+    return safeExec(fake, opener[1], { timeout: 5000 }).ok;
+  }
   return safeExec(opener[0], opener[1], { timeout: 5000 }).ok;
 }
 
@@ -481,6 +594,14 @@ export async function login(config = {}, {
   // `--service <url>`, as typed this run. The one thing that makes a
   // non-hosted address a deliberate choice rather than a variable.
   service = undefined,
+  // Where the result is kept (MACLEOD-622). The CLI always passes true:
+  // `teamflow login --browser` is a person signing in for operator
+  // commands, written to its own file, and nothing reports with it.
+  // False writes the plugin's session, which is what this function did
+  // before the device flow became the only way to authorize the plugin;
+  // kept so the flow is intact should it ever be wanted again, and
+  // reached today only by the tests of its mechanics.
+  personal = false,
 } = {}) {
   // Before discovery: nothing, not even a capabilities probe, goes to an
   // address only the environment named (MACLEOD-616 follow-up, B1).
@@ -572,7 +693,7 @@ export async function login(config = {}, {
     }
 
     const email = bound.member || claimsOf(exchanged.body.id_token).email;
-    saveSession({
+    (personal ? savePersonalSession : saveSession)({
       version: SESSION_VERSION,
       issuer: auth.issuer,
       clientId: auth.clientId,
@@ -932,6 +1053,11 @@ export async function deviceLogin(config = {}, {
   notify = printLine, label = deviceLabel(), tool = detectTool(),
   timeoutMs = LOGIN_TIMEOUT_MS, sleep = wait, now = () => Date.now(),
   service = undefined,
+  // Whether the consent page is opened here (MACLEOD-622). The default
+  // is not to: a caller that wants the page opened — `teamflow login` —
+  // passes the opener, so a test or a library caller never shells out to
+  // a browser by accident.
+  openUrl = undefined, noBrowser = false, canOpenBrowser = browserPossible(),
 } = {}) {
   // As in `login`, and before the first request: a device grant is a
   // credential this machine will hold, and an address the environment
@@ -954,9 +1080,21 @@ export async function deviceLogin(config = {}, {
   // §3.3.1). Both are printed, because which is useful depends on where
   // the browser is (MACLEOD-604).
   const short = verificationUrl(grant.verification_url, config);
-  notify(`To connect the TeamFlow plugin, open ${short} in a browser on any`
-    + ` device and confirm the code ${grant.user_code}`);
-  if (url && url !== short) notify(`Or open this link, which carries the code: ${url}`);
+  // The consent page, opened here when there is a browser to open it in
+  // (MACLEOD-622): one page naming the tool and this machine, with the
+  // code on it and sign-in inside it — never the identity provider's bare
+  // sign-in page. The code is printed either way, so the person can check
+  // the page they are looking at is the one this terminal started.
+  const opened = (openUrl && url && !noBrowser && canOpenBrowser) ? await openUrl(url) : false;
+  if (opened) {
+    notify(`Opened the TeamFlow consent page in your browser. Check it shows the code`
+      + ` ${grant.user_code}, then approve. This terminal keeps waiting.`);
+    notify(`If it did not open: ${url}`);
+  } else {
+    notify(`To connect the TeamFlow plugin, open ${short} in a browser on any`
+      + ` device and confirm the code ${grant.user_code}`);
+    if (url && url !== short) notify(`Or open this link, which carries the code: ${url}`);
+  }
 
   let interval = Math.max(1000, (Number(grant.interval) || 0) * 1000 || DEVICE_INTERVAL_MS);
   // Whichever runs out first: the caller's patience or the code's own
@@ -964,16 +1102,19 @@ export async function deviceLogin(config = {}, {
   const deadline = now() + Math.min(timeoutMs, (Number(grant.expires_in) || 600) * 1000);
   while (now() + interval <= deadline) {
     await sleep(interval);
-    const answer = await deviceCall(config, '/v1/auth/device/token', { device_code: grant.device_code });
+    // The grant named, so the service answers with the pair
+    // (MACLEOD-622). A service that predates it ignores the field and
+    // answers with the single `dk_` credential, which is kept as before.
+    const answer = await deviceCall(config, DEVICE_TOKEN_ROUTE,
+      { device_code: grant.device_code, grant_type: DEVICE_CODE_GRANT });
     if (answer.ok) {
       const body = answer.body;
       if (!body.access_token) return { ok: false, reason: 'the service approved the code but issued no credential' };
-      saveSession({
+      forgetCachedToken();
+      try { fs.unlinkSync(deviceAccessPath()); } catch { /* none cached */ }
+      const common = {
         version: SESSION_VERSION,
         kind: DEVICE_KIND,
-        // Not a refresh token: there is nothing to exchange it for.
-        // It is the credential, and revoking it is instant.
-        deviceToken: body.access_token,
         deviceId: body.device_id,
         // As for a browser session: the origin that granted it
         // (MACLEOD-616).
@@ -982,12 +1123,25 @@ export async function deviceLogin(config = {}, {
         email: body.member,
         account: body.account,
         createdAt: new Date().toISOString(),
-      });
-      forgetCachedToken();
+      };
+      saveSession(body.refresh_token
+        ? {
+          ...common,
+          // The long-lived secret, for the token endpoint only.
+          refreshToken: body.refresh_token,
+          // Read by older copies of the plugin only (see readSession);
+          // this version builds the address from serviceUrl every time.
+          tokenUrl: `${serviceUrl(config)}${DEVICE_TOKEN_ROUTE}`,
+        }
+        // Not a refresh token: there is nothing to exchange it for.
+        // It is the credential, and revoking it is instant.
+        : { ...common, deviceToken: body.access_token });
+      if (body.refresh_token) rememberDeviceAccess(body, body.refresh_token);
       rememberTrustedOrigin(config, service);
       return {
         ok: true, device: true, email: body.member, account: body.account,
         accountName: body.account_name, deviceId: body.device_id, label,
+        paired: Boolean(body.refresh_token), opened,
       };
     }
     if (answer.error === 'authorization_pending') continue;
@@ -1022,7 +1176,13 @@ export async function signOut(config = {}) {
   let revoked = false;
   let reason;
   if (isDeviceSession(session) && session.deviceId) {
-    const answer = await revokeDevice(config, session.deviceId, session.deviceToken);
+    // An access token, not the refresh token: the refresh token goes to
+    // the token endpoint and nowhere else (MACLEOD-622). A legacy `dk_`
+    // is its own bearer.
+    // Through `accessToken`, which checks the destination first
+    // (MACLEOD-616): a refresh is a credential sent, too.
+    const bearer = session.deviceToken || (await accessToken(config)).token;
+    const answer = await revokeDevice(config, session.deviceId, bearer);
     revoked = answer.ok;
     reason = answer.ok ? undefined : answer.reason;
   }
@@ -1136,10 +1296,20 @@ async function seatCall(config, route, idToken, account) {
 // Record which organisation the stored session is bound to, after a switch.
 // Nothing here is a credential: the refresh token is untouched, so the
 // session keeps working whether or not this write lands.
+//
+// The plugin's own session when it is a browser session from before the
+// device flow; otherwise the personal sign-in that made the switch
+// (MACLEOD-622). Never a device session: the account on it is the one its
+// device record reports to, which a person's switch does not move.
 export function rememberOrg(account, name) {
   const session = readSession();
-  if (!session) return false;
-  saveSession({ ...session, account, accountName: name });
+  if (session && !isDeviceSession(session)) {
+    saveSession({ ...session, account, accountName: name });
+    return true;
+  }
+  const personal = readPersonalSession();
+  if (!personal) return false;
+  savePersonalSession({ ...personal, account, accountName: name });
   return true;
 }
 
@@ -1238,17 +1408,139 @@ export async function accessToken(config = {}) {
   // `credential()` (MACLEOD-616).
   const target = credentialDestination(config, sessionOrigin(session));
   if (!target.ok) return { ok: false, refused: true, reason: target.reason };
-  // A device credential is the credential. Nothing to exchange, no
-  // expiry to race, and no round trip on the way to a report.
-  if (isDeviceSession(session)) {
+  if (isDeviceSession(session)) return deviceAccessToken(config, session);
+  return cognitoToken(config, session, saveSession);
+}
+
+// --- device access tokens (MACLEOD-622) ------------------------------
+
+function rememberDeviceAccess(body, refreshToken) {
+  deviceCached = {
+    token: body.access_token,
+    expiresAt: Date.now() + (Number(body.expires_in) || 3600) * 1000,
+    refresh: fingerprint(refreshToken),
+  };
+  // Written through a per-process temp file and a rename (writeJson), so
+  // twenty processes refreshing at once leave one whole file behind —
+  // whichever wrote last — and every token any of them minted still works.
+  writeJson(deviceAccessPath(), deviceCached);
+  return deviceCached;
+}
+
+function cachedDeviceAccess(refreshToken) {
+  const want = fingerprint(refreshToken);
+  const fresh = (entry) => entry && entry.refresh === want && entry.token
+    && entry.expiresAt - REFRESH_MARGIN_MS > Date.now();
+  if (fresh(deviceCached)) return deviceCached;
+  const onDisk = readJson(deviceAccessPath());
+  if (fresh(onDisk)) {
+    deviceCached = onDisk;
+    return onDisk;
+  }
+  return undefined;
+}
+
+async function deviceTokenRequest(config, refreshToken) {
+  // To `serviceUrl(config)` and nowhere else. `accessToken` has already
+  // checked that this is the origin that issued the session, and a
+  // repository file cannot name it (MACLEOD-616) — so neither a
+  // `.teamflow.json` nor a poisoned `tokenUrl` in the session file can
+  // redirect the one request that carries the long-lived secret.
+  return deviceCall(config, DEVICE_TOKEN_ROUTE, { grant_type: 'refresh_token', refresh_token: refreshToken });
+}
+
+/**
+ * The bearer a device session reports with.
+ *
+ * A paired session (a refresh token) is exchanged for a one-hour access
+ * token, cached, and refreshed a few minutes early. The refresh token is
+ * never rotated by the service, which is what makes this safe with many
+ * processes at once: each of them may refresh, all of them succeed, and
+ * nothing ever signs the machine out. A failed refresh leaves the session
+ * exactly where it was — the next call tries again, and only a revoke at
+ * the service (or `teamflow logout`) ends it.
+ *
+ * A legacy session (a `dk_` from before MACLEOD-622) is migrated on first
+ * use: the `dk_` goes to the token endpoint once, comes back as a pair on
+ * the same device record, and the session is rewritten with the refresh
+ * token in place of the `dk_`. Until that succeeds the `dk_` keeps
+ * reporting as it always did.
+ */
+async function deviceAccessToken(config, session = readSession()) {
+  const base = { ok: true, device: true, email: session?.email, refreshed: false };
+  if (isLegacyDeviceSession(session)) {
+    const migrated = await migrateLegacyDevice(config, session);
+    if (migrated) return deviceAccessToken(config, migrated);
+    return { ...base, token: session.deviceToken, legacy: true };
+  }
+  const hit = cachedDeviceAccess(session.refreshToken);
+  if (hit) return { ...base, token: hit.token, expiresAt: hit.expiresAt };
+  const answer = await deviceTokenRequest(config, session.refreshToken);
+  if (!answer.ok || !answer.body?.access_token) {
     return {
-      ok: true,
-      token: session.deviceToken,
+      ok: false,
       device: true,
-      email: session.email,
-      refreshed: false,
+      status: answer.status,
+      error: answer.error,
+      reason: answer.error === 'invalid_grant'
+        ? 'this machine is no longer authorized (the device was revoked, or its seat has gone); '
+          + 'run /teamflow:login to authorize it again'
+        : `could not refresh this machine's authorization: ${answer.reason || 'no access token'}`,
     };
   }
+  const kept = rememberDeviceAccess(answer.body, session.refreshToken);
+  return { ...base, token: kept.token, expiresAt: kept.expiresAt, refreshed: true };
+}
+
+/**
+ * Trade a `dk_` for a pair, once. Returns the rewritten session, or
+ * undefined to keep reporting with the `dk_` for now.
+ */
+async function migrateLegacyDevice(config, session) {
+  const marker = readJson(deviceAccessPath());
+  if (marker?.migrateAfter && marker.migrateAfter > Date.now()
+    && marker.legacy === fingerprint(session.deviceToken)) return undefined;
+  const answer = await deviceTokenRequest(config, session.deviceToken);
+  if (answer.ok && answer.body?.refresh_token && answer.body?.access_token) {
+    // Re-read, then write: ONLY the credential fields change. A field a
+    // newer or older copy of the plugin added survives, and nothing that
+    // names whose reports these are (`account`, `deviceId`, `email`) is
+    // added or altered: `ownerFrom` reads them, and a report queued a
+    // moment ago under the old owner would be refused at the send point
+    // as somebody else's.
+    const current = readJson(sessionPath()) || session;
+    const { deviceToken: _retired, ...rest } = current;
+    const next = {
+      ...rest,
+      refreshToken: answer.body.refresh_token,
+      tokenUrl: `${serviceUrl(config)}${DEVICE_TOKEN_ROUTE}`,
+    };
+    saveSession(next);
+    rememberDeviceAccess(answer.body, answer.body.refresh_token);
+    return next;
+  }
+  if (answer.error === 'invalid_grant') {
+    // Most likely another process on this machine migrated this very
+    // `dk_` a moment ago and is writing the session now. Read it back
+    // rather than sign anybody out; if it never appears, the `dk_` is
+    // presented as it stands and the service decides.
+    for (let attempt = 0; attempt < MIGRATE_WAIT_ATTEMPTS; attempt += 1) {
+      const now = readSession();
+      if (now && now.refreshToken && isDeviceSession(now)) return now;
+      await wait(MIGRATE_WAIT_MS);
+    }
+  }
+  // A service that predates the pair, or one that could not be reached:
+  // not an answer about this credential. Leave it alone for a while.
+  writeJson(deviceAccessPath(), {
+    legacy: fingerprint(session.deviceToken), migrateAfter: Date.now() + MIGRATE_RETRY_MS,
+  });
+  return undefined;
+}
+
+// --- the Cognito refresh (the old browser session, and `--browser`) --
+
+async function cognitoToken(config, session, save) {
   // The refresh token is about to be sent to `session.tokenUrl`, which a
   // pre-fix sign-in inside a hostile repository could have chosen
   // (MACLEOD-616 follow-up, F1). Checked before the cache, so a session
@@ -1278,9 +1570,9 @@ export async function accessToken(config = {}) {
   // others. Persist a new one when it arrives; keep the old one when
   // it does not.
   const nextRefresh = refreshed.body.refresh_token || session.refreshToken;
-  if (refreshed.body.refresh_token) saveSession({ ...session, refreshToken: nextRefresh });
+  if (refreshed.body.refresh_token) save({ ...session, refreshToken: nextRefresh });
   const email = claimsOf(refreshed.body.id_token).email || session.email;
-  if (email !== session.email) saveSession({ ...session, refreshToken: nextRefresh, email });
+  if (email !== session.email) save({ ...session, refreshToken: nextRefresh, email });
   rememberToken(refreshed.body, nextRefresh, email);
   return { ok: true, token: cached.token, idToken: cached.idToken, expiresAt: cached.expiresAt, email, refreshed: true };
 }
@@ -1294,8 +1586,27 @@ export async function accessToken(config = {}) {
 // was granted without it refreshes fine and still cannot call an admin
 // route, so say that rather than sending a header the service will
 // answer 403 to.
+//
+// A PERSON's token, never the machine's (MACLEOD-622): the personal
+// sign-in `teamflow login --browser` keeps in its own file comes first,
+// then a browser session from before the device flow was the only way to
+// authorize the plugin. A device authorization is refused with the way
+// out named, because a machine must not be able to satisfy
+// `admin.is_superadmin`.
+export const PERSONAL_SIGN_IN_NEEDED = 'this machine is authorized as a device, which is not a person, '
+  + 'and operator commands need a person: run `teamflow login --browser` for a personal sign-in '
+  + '(it does not change how this machine reports)';
+
 export async function adminIdToken(config = {}) {
-  const token = await accessToken(config);
+  const personal = readPersonalSession();
+  let token;
+  if (personal) {
+    const target = credentialDestination(config, sessionOrigin(personal));
+    if (!target.ok) return { ok: false, refused: true, reason: target.reason };
+    token = await cognitoToken(config, personal, savePersonalSession);
+  } else {
+    token = await accessToken(config);
+  }
   if (!token.ok) return token;
   if (!token.idToken) {
     return {
@@ -1303,9 +1614,8 @@ export async function adminIdToken(config = {}) {
       reason: token.device
         // A device credential names a seat, not an address, and the
         // admin and organisation routes are the address's.
-        ? 'this machine is signed in with a device credential, which names a seat but not a verified address; '
-          + 'run `teamflow login` where a browser can be opened for the routes that need one'
-        : 'this session has no ID token; sign in again with `teamflow login` so the openid scope is granted',
+        ? PERSONAL_SIGN_IN_NEEDED
+        : 'this session has no ID token; sign in again with `teamflow login --browser` so the openid scope is granted',
     };
   }
   return { ok: true, token: token.idToken, email: token.email, expiresAt: token.expiresAt };

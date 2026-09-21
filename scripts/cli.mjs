@@ -57,9 +57,12 @@ import { refusalOf } from './refusal.mjs';
 const TRACKER_MCP = { jira: 'atlassian', linear: 'linear', github: 'github' };
 const USAGE = `teamflow \u2014 delivery reporting for TeamFlow
 
-  teamflow login [--org <id>] [--no-browser] [--device] [--service <url>]
-                                   sign in once, naming an org if asked for one;
-                                   --service to sign in to your own TeamFlow
+  teamflow login [--no-browser] [--service <url>]
+                                   authorize this machine's plugin once, on the
+                                   consent page (opened here, or printed with a
+                                   code for a browser anywhere); it stays
+                                   authorized until revoked.
+                                   --service to authorize against your own TeamFlow
                                    rather than the hosted one (an environment
                                    variable is not enough — a repository can
                                    set one)
@@ -614,23 +617,40 @@ function replacedSession(before, after) {
   return `This replaced the session that was here: ${was}.\n`;
 }
 
+/**
+ * `teamflow login`: authorize this machine's plugin (MACLEOD-622).
+ *
+ * Always the device flow, always the consent page — opened here when
+ * there is a browser, printed when there is not. `--device` is kept as a
+ * synonym for old instructions. The owner's rule is that the plugin is
+ * authorized, never logged in, so the hosted sign-in page is not a way to
+ * authorize it any more: `--browser` is a PERSON signing in for operator
+ * commands, kept apart, and nothing reports with it.
+ */
 async function login() {
-  // Read before anything is written: auth.login overwrites the file.
+  // Read before anything is written: a sign-in overwrites the file.
   const before = auth.readSession();
   const noBrowser = args.includes('--no-browser') || Boolean(config.noBrowser);
-  const wantsDevice = args.includes('--device');
   const canOpen = auth.browserPossible();
   // `--service` is the address as well as the provenance: it is what the
   // sign-in talks to, and the reason the plugin may trust it afterwards.
   const service = serviceFlag(args);
   if (service) config.serviceUrl = service;
-  if (wantsDevice || ((noBrowser || !canOpen) && await serviceOffersDevice())) {
-    return deviceLogin(wantsDevice ? undefined
-      : `No browser can be opened here${canOpen ? '' : ' (no display)'}, so TeamFlow is asking for a code instead.`,
-    before);
-  }
+  if (args.includes('--browser')) return personalLogin(noBrowser, service);
+  return deviceLogin((noBrowser || !canOpen)
+    ? `No browser can be opened here${canOpen ? '' : ' (no display)'}, so TeamFlow prints the consent page's address instead.`
+    : undefined, before, { noBrowser, canOpen });
+}
+
+/**
+ * `teamflow login --browser`: a person signing in, for the commands that
+ * must be a person — `teamflow admin`, `teamflow org`. Not plugin
+ * authorization: written to its own file, and reporting never uses it.
+ */
+async function personalLogin(noBrowser, service) {
   const result = await auth.login(config, {
     service,
+    personal: true,
     account: orgFlag(args),
     // `--no-browser` is for the person who knows their box has none, or
     // whose browser is somewhere else entirely. The URL is printed and
@@ -643,7 +663,7 @@ async function login() {
   if (result.ambiguous) {
     throw new Error('TeamFlow signed you in, but that address holds a seat on more than one organisation:\n'
       + `${auth.organisationLines(result.accounts)}\n`
-      + 'Run `teamflow login --org <id>` with the one to sync under.');
+      + 'Run `teamflow login --browser --org <id>` with the one to use.');
   }
   if (!result.ok) {
     // The URL is not repeated when it was already printed while the
@@ -652,18 +672,16 @@ async function login() {
     const url = result.authorizeUrl && !result.printedUrl
       ? `\nOpen this URL by hand and try again: ${result.authorizeUrl}`
       : '';
-    const elsewhere = result.printedUrl
-      ? '\nIf the browser you can use is on another machine, run `teamflow login --device` instead.'
-      : '';
-    throw new Error(`TeamFlow sign-in failed: ${result.reason}${url}${elsewhere}`);
+    throw new Error(`TeamFlow personal sign-in failed: ${result.reason}${url}`);
   }
-  const probe = await fetchAccount(config);
-  const org = result.accountName || result.account || (probe.ok ? probe.account?.account : undefined);
-  print(`TeamFlow signed in${result.email ? ` as ${result.email}` : ''}${org ? `, org ${org}` : ''}.\n`
-    + replacedSession(before, { email: result.email, account: org })
-    + `${await signedInLines()}\n`
-    + `Reporting now uses a one-hour access token refreshed in the background; `
-    + `the refresh token is at ${auth.sessionPath()} and /teamflow:logout removes it.`);
+  const org = result.accountName || result.account;
+  print(`TeamFlow signed you in${result.email ? ` as ${result.email}` : ''}${org ? `, org ${org}` : ''}, `
+    + 'for operator commands (`teamflow admin`, `teamflow org`).\n'
+    + 'This is a personal sign-in, not plugin authorization: it is kept at '
+    + `${auth.personalSessionPath()} and nothing reports with it. `
+    + (auth.isDeviceSession()
+      ? 'This machine keeps reporting with its device authorization.'
+      : 'To connect the plugin on this machine, run /teamflow:login.'));
 }
 
 /**
@@ -681,17 +699,7 @@ async function signedInLines() {
     + 'Your next report will appear on the board.';
 }
 
-// Whether asking for a code is an option at all. A service that
-// predates the flow publishes no such block, and must not be sent to
-// a route it would answer 404 to.
-async function serviceOffersDevice() {
-  // Not gated on the rest of the block being usable: the code flow
-  // needs neither an issuer nor a client id, so a service that
-  // publishes only that much can still sign this machine in.
-  return Boolean((await auth.discoverAuth(config)).device);
-}
-
-async function deviceLogin(because, before) {
+async function deviceLogin(because, before, { noBrowser = false, canOpen = false } = {}) {
   if (because) print(because);
   if (orgFlag(args)) {
     // The organisation is chosen in the browser, by the person
@@ -701,7 +709,9 @@ async function deviceLogin(because, before) {
   }
   const service = serviceFlag(args);
   if (service) config.serviceUrl = service;
-  const result = await auth.deviceLogin(config, { service });
+  const result = await auth.deviceLogin(config, {
+    service, openUrl: auth.openInBrowser, noBrowser, canOpenBrowser: canOpen,
+  });
   if (!result.ok) {
     // A code is one-shot: expired, spent or never approved, the way out
     // is always a fresh one, and a failure that does not say so leaves
@@ -710,8 +720,8 @@ async function deviceLogin(because, before) {
     // the terminal to ask again is the wrong advice (MACLEOD-567).
     const again = result.error === 'access_denied'
       ? ' If that was not you, nothing was issued and nothing needs undoing.'
-      : ' Run `teamflow login --device` again for a fresh code.';
-    throw new Error(`TeamFlow device sign-in failed: ${result.reason}.${again}`);
+      : ' Run /teamflow:login again for a fresh code.';
+    throw new Error(`TeamFlow was not connected: ${result.reason}.${again}`);
   }
   const probe = await fetchAccount(config);
   const org = result.account || (probe.ok ? probe.account?.account : undefined);
@@ -726,7 +736,11 @@ async function deviceLogin(because, before) {
     + 'It stays connected on this computer until you sign it out: the '
     + `credential is at ${auth.sessionPath()}, /teamflow:logout revokes it here `
     + 'and at the service, and the members page lists every computer connected '
-    + 'this way.');
+    + 'this way.'
+    + (result.paired
+      ? ' Each report carries a one-hour access token; the long-lived part is sent '
+        + 'only to TeamFlow\'s token endpoint.'
+      : ''));
 }
 
 // `teamflow org`, and `teamflow org switch <id>`.
@@ -742,6 +756,16 @@ async function org() {
     if (!target) throw new Error('Usage: teamflow org switch <id>. `teamflow org` lists the ids.');
     const moved = await auth.switchOrg(config, token.token, target);
     if (!moved.ok) throw new Error(`TeamFlow could not switch to ${target}: ${moved.reason}`);
+    // A device authorization reports to the organisation it was approved
+    // into, and a person's switch does not move it (MACLEOD-622): its
+    // session is left alone, because the account on it is what queued
+    // reports are addressed to, and saying otherwise would be false.
+    if (auth.isDeviceSession()) {
+      print(`Your personal sign-in now names ${moved.name || moved.account}. This machine's `
+        + `device authorization still reports to ${auth.readSession()?.account || 'the organisation it was approved into'}; `
+        + 'to move it, run /teamflow:login and choose the organisation on the consent page.');
+      return;
+    }
     auth.rememberOrg(moved.account, moved.name);
     print(`This machine now syncs to TeamFlow under ${moved.name || moved.account}. `
       + 'Reports from this machine are credited to that organisation from now on.');

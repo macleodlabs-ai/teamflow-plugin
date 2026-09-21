@@ -138,21 +138,33 @@ Purge is never implicit.
 
 The dashboard needs no plugin: open it and sign in with your email (Google, GitHub, a passkey or an emailed link). Connecting Claude Code is three commands inside a session: `/plugin marketplace add macleodlabs-ai/teamflow-plugin`, `/plugin install teamflow@macleodlabs`, then `/teamflow:login` once. An in-session install is active immediately on Claude Code 2.1.221 and later (older versions say to run `/reload-plugins`); a terminal install with `claude plugin install` needs `/reload-plugins` in the open session or a new one, which is what its "Restart to apply changes" means. The command exists only in Claude Code, the terminal tool: the Claude app and the website do not have it.
 
+**The plugin is authorized, never logged in** (MACLEOD-622). The owner's rule: "Plugin always uses credentials issued via device auth flow. Login is for users into dashboard." `/teamflow:login` is the device authorization grant, and what it opens is the consent page, never the identity provider's bare sign-in page:
+
 ```text
 /teamflow:login
-  → GET /v1/capabilities for the hosted UI's issuer and client id
-  → authorization code with PKCE (S256), loopback redirect on 127.0.0.1
-  → browser opens; the developer signs in
-  → POST /v1/members/identity with the ID token, claiming the seat
-  → refresh token written to ~/.config/teamflow/session.json at 0600
-  → access token held in memory, refreshed five minutes before expiry
+  → POST /v1/auth/device {label: <hostname>, client: <detected tool>}
+  ← device_code (secret), user_code (WXYZ-1234), verification_url(_complete)
+  → the consent page (/device?code=WXYZ-1234) opens in this machine's browser,
+    or both addresses are printed when there is none
+  (the page says "Claude Code on <machine> wants to sync your work to TeamFlow",
+   shows the code, and has Approve and Deny; somebody not signed in signs in
+   inside that page and lands back on it)
+  → POST /v1/auth/device/token {device_code, grant_type: urn:…:device_code}
+    (polled at `interval`)
+  ← refresh_token (drt_…) + access_token (dat_…, one hour) + device_id
+  → session.json at 0600: the refresh token, the device id, the origin
+  → device-access.json at 0600: the current access token and its expiry
 ```
 
-The authorize request asks for the sign-in scopes the service publishes, `openid email profile`, plus the paid-API scope it names separately in `auth.api_scope`. Both are needed on one token: the same credential identifies the developer and then calls `/v1/report`. Duplicates are dropped, so an override that already names the API scope does not ask for it twice.
+It is what an IDE does: authorized once, authorized until somebody revokes it. The **refresh token** is the device record's secret — a peppered hash at the service, bound to one person's seat, listed on the Organisation page — and it goes to `POST /v1/auth/device/token` and nowhere else, always at `serviceUrl`, never at the `tokenUrl` stored in the file and never at an address a repository file names. The **access token** is what rides on each request; it lives an hour and is refreshed five minutes early. It is a signed claim naming the device record, and the service checks every use against that record, so revoking the device — `teamflow logout`, the member's own devices list, or an owner's revoke on the Organisation page — ends the refresh token and every access token it minted on the next call, not at the end of the hour.
 
-The seat binding is not optional. A member who has just signed in holds a token from the pool and nothing else, so the service cannot yet tell which seat is theirs, and an unbound access token authenticates as nobody. The ID token is what claims the seat: it is the one artifact that proves a given subject owns a given verified email. It happens before anything is written, because a session whose token authenticates as nobody is worse than no session, and it is idempotent, so signing in again is free. A service that does not run the orgs module answers 404 and sign-in continues without it.
+**The refresh token is never rotated.** Many hook processes and agents on one machine share one session file and refresh at the same moment when the hour runs out; a refresh token that changed on every use would read that as theft and sign an honest person out. A stolen refresh token is answered by the device record instead: one revoke, and MACLEOD-620's one-machine rule (`credential_in_use`), which keys on the record — now stable across refreshes, where a `dk_` gave every re-authorization a new record. A refresh that fails leaves the session alone; only a revoke or `teamflow logout` ends it, and `status` says why reporting stopped.
 
-Nothing but the refresh token reaches the disk. A refresh token is revocable and scoped to one machine; an access token on disk would be a bearer secret with an hour of life and no way to take it back.
+**Why the access token is cached on disk**, when a Cognito access token never was: that rule's reason was that a token on disk has an hour of life and no way to take it back. A device access token can be taken back — every use is checked against its record — and held in memory only, every hook process (one per tool call) would pay a round trip to the token endpoint, which puts the long-lived secret back on nearly every event.
+
+**A `dk_` from before** keeps reporting across the upgrade. On first use the new plugin presents it once as a refresh token; the service points the *same* device record at a fresh refresh token, the `dk_` matches nothing afterwards, and the session file is rewritten with the refresh token in its place. Several processes migrating at once agree on one winner and the others read back what it wrote. Against a service that cannot migrate yet, the `dk_` keeps reporting and the migration is tried again an hour later. The paired session is written with `refreshToken` and `tokenUrl` on purpose: plugin 0.3.23 and older, sharing the data directory, read it as an ordinary refresh session and keep reporting (the service accepts their form-encoded refresh). A machine that never upgrades keeps reporting with its `dk_` for as long as the device record is not revoked — the service still accepts one as a bearer, and a plugin that asks for a device code without naming the grant still receives one; there is no cutover date yet, and setting one is the owner's decision.
+
+**A person's sign-in is separate.** `teamflow login --browser` runs the old loopback authorization code + PKCE flow against the hosted UI — kept, unlisted, for the one thing a machine's credential must never do, which is act as a person: operator commands (`teamflow admin`) and `teamflow org`. It is written to `~/.config/teamflow/personal-session.json`, the output says it is a personal sign-in and not plugin authorization, and nothing reports with it. Those commands refuse a device authorization and name `--browser`.
 
 ### Forgetting to sign in
 
@@ -160,12 +172,12 @@ Reporting fails open, which means an install nobody has signed in on breaks noth
 
 Every other tool is told twice, in the two places a channel exists (MACLEOD-569).
 
-**At install time**, which is the one moment there is a person's attention and a stream nothing reads as a denial. `teamflow skills install --for <tool>`, `teamflow hooks install --for <tool>` and `teamflow hooks install --git` all end by asking the same local question the hook asks: what transport is configured. On the service transport the last line names the organisation and the project this repository syncs to TeamFlow under; on the legacy S3 transport it says so and points at `teamflow doctor`; with nothing configured at all, the last lines are a block on stderr naming `teamflow login`, `teamflow login --device` and `teamflow status`, and the JSON on stdout carries the same answer as `signIn` so a script can read it. The command still exits **0**: the hooks *are* installed, which is what was asked for, and a non-zero exit would break `&&` in every setup script and fail a build image that signs in later or reports with a CI OIDC token that only exists inside the job. Non-zero is for "the thing you asked for did not happen"; this is a warning, and it is loud. `--dry-run` writes nothing and asks nobody anything, including the service.
+**At install time**, which is the one moment there is a person's attention and a stream nothing reads as a denial. `teamflow skills install --for <tool>`, `teamflow hooks install --for <tool>` and `teamflow hooks install --git` all end by asking the same local question the hook asks: what transport is configured. On the service transport the last line names the organisation and the project this repository syncs to TeamFlow under; on the legacy S3 transport it says so and points at `teamflow doctor`; with nothing configured at all, the last lines are a block on stderr naming `teamflow login` (which opens the consent page here or prints a code for a browser anywhere) and `teamflow status`, and the JSON on stdout carries the same answer as `signIn` so a script can read it. The command still exits **0**: the hooks *are* installed, which is what was asked for, and a non-zero exit would break `&&` in every setup script and fail a build image that signs in later or reports with a CI OIDC token that only exists inside the job. Non-zero is for "the thing you asked for did not happen"; this is a warning, and it is loud. `--dry-run` writes nothing and asks nobody anything, including the service.
 
 **At run time**, once per machine per day and never per event, through whichever field that tool's own documentation calls informational rather than a denial. The rule is unchanged and outranks the notice: stdout is how a hook denies an action in these tools, so nothing TeamFlow prints there may carry `decision`, `permissionDecision`, `continue`, `stopReason` or `cancel: true`. The mechanism, and each piece of it exists because a plausible-looking shortcut was wrong:
 
 - **The table is data**, `notice` in `plugin/scripts/tools.mjs`, beside the doc URL it was read from. `noticeFor` in `adapters.mjs` is the only reader and builds the answer as *the passive value plus one field*, so a notice can never say less than silence does and cannot introduce a key the table did not name.
-- **`audience` is `person` or `agent`** and is never blurred, because it decides *which text is sent*. There are two constants in `hook-cli.mjs`, both with nothing interpolated into them. `NOT_SIGNED_IN` is an imperative — run `teamflow login`, then `teamflow status` — and goes only to a field the vendor says the person reads. `NOT_SIGNED_IN_FOR_AGENT` goes to the three that the model reads (Cursor's `additional_context`, Cline's `contextModification`, Junie's `PreToolUse` fallback); it is declarative, states that this is information for the person and explicitly not a task, asks only that the agent pass it on when it next reports back, and contains no command, no backticks and none of the verbs an agent would read as a step. The reason is not theoretical: the imperative arrives immediately before somebody else's agent takes its next tool call, an agent that simply does as it is told abandons the customer's task, and `teamflow login` opens a browser and blocks on a loopback listener for three minutes, so obeying it can hang the turn. It is not injection — the string is a constant and no report ever reaches it — it is this plugin instructing an agent that is not ours to instruct. A test asserts the split per channel and fails if either branch stops being exercised.
+- **`audience` is `person` or `agent`** and is never blurred, because it decides *which text is sent*. There are two constants in `hook-cli.mjs`, both with nothing interpolated into them. `NOT_SIGNED_IN` is an imperative — run `teamflow login`, then `teamflow status` — and goes only to a field the vendor says the person reads. `NOT_SIGNED_IN_FOR_AGENT` goes to the three that the model reads (Cursor's `additional_context`, Cline's `contextModification`, Junie's `PreToolUse` fallback); it is declarative, states that this is information for the person and explicitly not a task, asks only that the agent pass it on when it next reports back, and contains no command, no backticks and none of the verbs an agent would read as a step. The reason is not theoretical: the imperative arrives immediately before somebody else's agent takes its next tool call, an agent that simply does as it is told abandons the customer's task, and `teamflow login` opens the consent page and polls for up to three minutes, so obeying it can hang the turn. It is not injection — the string is a constant and no report ever reaches it — it is this plugin instructing an agent that is not ours to instruct. A test asserts the split per channel and fails if either branch stops being exercised.
 - **No channel means the day is not spent.** `sayOnce` asks the table first and claims only when there is something to print. This is not hypothetical: Junie's `Stop` looked like the obvious place, and JetBrains' own page says the Stop executor does not surface `systemMessage` in the TUI — so it printed into nothing *and* burnt the notice a Junie-and-Cursor user would have read in Cursor.
 - **The claim is an exclusive create**, `<plugin data>/notices/<day>.lock` opened `wx`. Read-then-write is not enough: Cursor sends `afterFileEdit` and `postToolUse` for one edit, Copilot registers six event names, and these are separate processes. Five concurrent hooks against a read-then-write claim produced five notices; against the lock, one.
 - **It is the transport, not the credential.** A machine with a `dataUri` and no credential is on the legacy S3 transport and its reports land, so it hears nothing.
@@ -192,62 +204,38 @@ All of it is still safe to do by hand instead, because the installer only ever m
 
 **Afterwards**, `teamflow status` is still the surface that answers in full — the credential, the repository and the project in one answer, with `not signed in; run /teamflow:login` when that is the problem — and `teamflow doctor` is the longer form, which on a machine with nothing configured answers with the one line to act on rather than with the legacy S3 probe.
 
-### A machine with no browser
+### A browser elsewhere, or none
 
-The browser does not have to be opened by the plugin. `teamflow login --no-browser`, a box with no display (no `DISPLAY` or `WAYLAND_DISPLAY`, and not macOS or Windows), an `open` that exits non-zero, or a run with no terminal — Claude Code drives the CLI over a pipe — all print the authorize URL immediately and keep the loopback listener up for the whole three minutes. The person opens that URL in a browser on the same machine and the redirect lands where it always did. The URL used to be printed only after the timeout, when the port it points back to had already closed, which is the same as not printing it.
+The consent page does not have to be opened by the plugin, and the browser does not have to be on this machine: nothing redirects back to `127.0.0.1`. `teamflow login --no-browser`, `TEAMFLOW_NO_BROWSER=1`, a box with no display (no `DISPLAY` or `WAYLAND_DISPLAY`, and not macOS or Windows), or an `open` that exits non-zero all print the short address to type on a phone and the long one that carries the code (RFC 8628 §3.3.1), and the command keeps polling. A terminal over SSH, a container and a remote agent authorize exactly like a laptop. `--device` is accepted, for old instructions, and changes nothing.
 
-The browser still has to be on *this* machine, because the redirect goes to `127.0.0.1`. A browser somewhere else is what device-code sign-in is for.
+The organisation is chosen on the consent page, not on the terminal. An address holding seats on several organisations is asked there, which is where the question can be answered; `--org` is ignored and says so. A device authorization reports to the organisation it was approved into; `teamflow org switch` (a person's command) does not move it, and says so — authorize again and choose on the page.
 
-### A browser on another machine
+The address opened is the service's own `verification_url`, with only its origin checked against, and if need be replaced by, the service this machine talks to (MACLEOD-572), and the grant is started only against an origin somebody deliberately chose (MACLEOD-616: never an address only an environment variable named).
 
-`teamflow login --device`, and what a machine with no browser does on its own:
+No test may open a browser. The test sandbox sets `TEAMFLOW_NO_BROWSER=1` and `TEAMFLOW_TEST_SANDBOX=1`; under the second the opener runs only a program inside the sandbox's own temporary tree, so even a test that clears the first reaches its fake `open` and never the system's.
 
-```text
-teamflow login --device
-  → POST /v1/auth/device            (no credential; the machine has none yet)
-  ← device_code (secret), user_code (WXYZ-1234), verification_url, interval
-  → the terminal prints the URL and the code
-  (the person opens https://codercat.io/app/#device in any browser anywhere,
-   signs in as usual, types the code and approves)
-  → POST /v1/auth/device/approve    (their ID token, from the dashboard)
-  → POST /v1/auth/device/token      (polled at `interval`)
-  ← a device credential, stored at ~/.config/teamflow/session.json at 0600
-```
-
-The three paths, and when each one is taken:
-
-| Where the browser is | What runs | What is stored |
-| --- | --- | --- |
-| This machine, openable | the loopback sign-in, browser opened here | a refresh token |
-| This machine, not openable | the loopback sign-in, URL printed here | a refresh token |
-| Any other machine | the device flow (`--device`) | a device credential |
-
-The command chooses without being asked: `--device` forces it, and a run with `--no-browser`, `TEAMFLOW_NO_BROWSER=1`, or no display takes it whenever the service publishes `auth.device` in its capabilities. A service that does not publish it falls back to printing the authorize URL, which is the best that can be done there. When a loopback sign-in times out, the message names `--device`, because "nobody opened the URL" and "the browser is on another machine" look the same from here.
-
-The stored credential is not a token from the identity provider. It is a device credential: bound to that person's seat, held as a peppered hash at the service, shown once, and revocable on its own — `teamflow logout` revokes it at the service as well as removing the file, and the members page lists every machine signed in this way. Nothing about it is refreshed, so `teamflow status` reports the credential as `device` rather than `bearer`, and `teamflow org` and the admin routes refuse it: those need the ID token that names a verified address, and a device credential names a seat.
-
-The organisation is chosen in the browser, not on the terminal. An address holding seats on several organisations is asked on the approval page, which is where the question can be answered; `--org` is ignored by a device sign-in and says so.
+### The personal sign-in (`--browser`)
 
 `GET /v1/capabilities` gets ten seconds and one retry, because a cold Lambda behind CloudFront can spend most of the first window starting up. A service that never answers is reported as unreachable. A service that answers but publishes no auth block is reported as unconfigured, naming `TEAMFLOW_AUTH_ISSUER` and `TEAMFLOW_AUTH_CLIENT_ID` — two different faults, and telling somebody the second when the first happened sends them after configuration that was never the problem.
 
-The loopback listener binds the first free port in 52480-52489. Every one of those is registered as a callback URL on the app client, so the range cannot grow without a deploy. The `state` returned by the identity provider must match the one this process sent, or the code is discarded unredeemed: it belongs to somebody else's sign-in.
+The authorize request asks for the sign-in scopes the service publishes, `openid email profile`, plus the API scope it names in `auth.api_scope`, and the ID token then claims the person's seat (`POST /v1/members/identity`) before anything is written. The loopback listener binds the first free port in 52480-52489. Every one of those is registered as a callback URL on the app client, so the range cannot grow without a deploy. The `state` returned by the identity provider must match the one this process sent, or the code is discarded unredeemed: it belongs to somebody else's sign-in.
 
 ### More than one organisation
 
 An address can hold a live seat on several organisations, and the service refuses to guess which one a sign-in is for: `POST /v1/members/identity` answers `409 ambiguous_seat` with the organisations, their role and their plan. Binding to the wrong one attributes the developer's reports to the wrong organisation, and nothing downstream can undo that.
 
 ```text
-teamflow login
+teamflow login --browser        (a person's sign-in; the consent page asks this itself)
   → 409 ambiguous_seat
   → on a terminal: the organisations as a numbered list, and one question
   → anywhere else (a hook, CI, a pipe): the same list, then
-    "run `teamflow login --org <id>`"
+    "run `teamflow login --browser --org <id>`"
   → POST /v1/members/identity with {id_token, account}
 ```
 
-`teamflow login --org <id>` skips the question. An id the address holds no seat on is refused `no_seat` and nothing is written — a session bound to no seat looks configured and 401s on every report.
+`teamflow login --browser --org <id>` skips the question. An id the address holds no seat on is refused `no_seat` and nothing is written — a session bound to no seat looks configured and 401s on every report.
 
-The session file gains `account` and `accountName` beside the refresh token, so `teamflow org` can say where reports go without a round trip. Nothing else about the file changes: still no access token, still no ID token, still 0600.
+The personal session file gains `account` and `accountName` beside the refresh token, so `teamflow org` can say where reports go without a round trip. Nothing else about the file changes: still no access token, still no ID token, still 0600.
 
 ```bash
 teamflow org                      # the organisation reports go to, and the others
@@ -256,7 +244,7 @@ teamflow org switch <id>          # POST /v1/members/switch, per session
 
 `teamflow org` reads `GET /v1/members/me` with the ID token as the bearer — the access token names a seat, and this has to answer for the address, which is what the other organisations are found by.
 
-A switch is **per session**: the service answers with an account-scoped token for the credential in hand and moves no binding, so this CLI goes to the named organisation and the dashboard tab beside it stays where its holder put it. Reports already published stay where they were published. A device credential — the one `/teamflow:login` leaves on a machine that cannot open a browser — switches the same way and may move to any seat its person holds; an account key cannot switch at all, because it names the account rather than a person.
+A switch is **per session**: the service answers with an account-scoped token for the credential in hand and moves no binding, so this CLI goes to the named organisation and the dashboard tab beside it stays where its holder put it. Reports already published stay where they were published. A device authorization — what `/teamflow:login` leaves on every machine since MACLEOD-622 — is not moved by `teamflow org switch`, which needs a person's sign-in and says the device still reports where it was approved; an account key cannot switch at all, because it names the account rather than a person.
 
 **Which pool a report is charged to.** The one the session is in. Somebody in three organisations is billed to whichever one the credential posting the report is in, which is why the switch is per session and not per person. A person who signed up alone keeps their own pool on joining; the service asks once whether to fold it into the organisation, and `/teamflow:status` names the organisation the reports are going to.
 
@@ -288,7 +276,7 @@ A failed exchange is logged on stderr and the job carries on with whatever crede
 ### Non-interactive fallback
 
 **On TeamFlow there is none, and none is needed.** An environment that cannot
-open a browser is what `teamflow login --device` is for: the code is read on
+open a browser is what `teamflow login` already does there: the code is read on
 one screen and approved on another, so the machine never needs a browser of
 its own. A pipeline is what the OIDC exchange above is for. Those two cover
 every case the old stored secret covered, and TeamFlow issues no such secret
@@ -601,6 +589,35 @@ Environment variables exist so the tests can never reach github.com:
 for `git`, and `TEAMFLOW_GITHUB_API` points the REST fallback somewhere
 else. They sit beside `TEAMFLOW_CLAUDE_BIN`, which does the same for
 `claude`.
+
+The REST host is pinned (MACLEOD-623). A repository can set an
+environment variable, and a title lookup sent where it chose would let it
+write card titles onto somebody else's board, so `TEAMFLOW_GITHUB_API` is
+honoured only when it names this machine (a loopback address, which is
+what the tests use). Everything else goes to `api.github.com`, unless the
+user's own `~/.config/teamflow/config.json` names a GitHub Enterprise API
+as `githubApi` (https only) — the one file a repository cannot reach, and
+the rule `serviceUrl` already follows. Whatever comes back is stripped of
+control characters and cut to GitHub's own 256-character limit before it
+is stored on the binding or drawn on a card.
+
+`gh` itself gets the same treatment: `TEAMFLOW_GH_BIN` names a stub only
+inside the test sandbox, `GH_HOST`, `GH_REPO`, `GH_ENTERPRISE_TOKEN`,
+`GITHUB_ENTERPRISE_TOKEN` and `GH_CONFIG_DIR` are removed from its
+environment, and the repository must be `owner/name` before it is passed as
+`--repo`.
+
+**"The user's own file" is the account's, not `$HOME`'s** (MACLEOD-623).
+`~/.config/teamflow/config.json` and the session are found from
+`os.userInfo().homedir`, because a repository can set `$HOME` and the
+global file is the one place that must be out of its reach. The tests
+redirect HOME, so `$HOME` is honoured only after `enableTestHome()` has run
+inside the process: `plugin/tests/sandbox.mjs` calls it, and every plugin
+process a test spawns loads `plugin/tests/child-sandbox.mjs` through
+`--import` (in `NODE_OPTIONS`, set by the sandbox and the integration
+helpers). It fails closed: `TEAMFLOW_TEST_SANDBOX=1` where that import never
+ran, or no account record for the user, means no credential is read,
+nothing is reported, and `status`/`doctor` say which.
 
 ### Where the branch is, and what its PR is doing
 

@@ -325,7 +325,7 @@ export function safeExec(command, args = [], options = {}) {
       encoding: 'utf8',
       timeout: options.timeout ?? 3000,
       stdio: ['pipe', 'pipe', 'pipe'],
-      env: process.env,
+      env: options.env || process.env,
     });
     return {
       ok: result.status === 0 && !result.error,
@@ -1663,9 +1663,68 @@ export const UNTRUSTED_PROJECT_KEYS = Object.freeze({
   accessTokenOrigin: undefined,
 });
 
+// --- whose home this is (MACLEOD-623) --------------------------------
+//
+// "The user's own file" and the session are anchored on the home
+// directory, and `os.homedir()` honours $HOME — which a repository can set
+// (a `.claude/settings.json` "env" block, an `.envrc`). A repo-chosen HOME
+// made an attacker's directory "the global file": its `serviceUrl` read as
+// the user's own and its `trustedOrigins` were trusted. So these paths come
+// from the account record (`os.userInfo().homedir`), which ignores $HOME.
+//
+// The tests redirect HOME to a throwaway, and ignoring it naively would run
+// every test against the developer's real credentials — the accident that
+// leaked one during MACLEOD-616. So HOME is honoured only after
+// `enableTestHome()` has run IN THIS PROCESS: `plugin/tests/sandbox.mjs`
+// calls it, and child processes get it only from
+// `--import plugin/tests/child-sandbox.mjs`, which the test helpers add. No
+// environment variable can switch it on. (Not "HOME is inside the temp
+// directory": TMPDIR is repository-settable too.)
+//
+// It fails closed. No account record (a container with no passwd entry)
+// is not a reason to fall back to $HOME; and TEAMFLOW_TEST_SANDBOX set
+// where the seam never ran is a harness that forgot it — or a repository
+// pretending to be one. Either way no credential is read, `status` and
+// `doctor` say why, and reporting stops.
+
+let testHome = false;
+
+/** The one switch that lets $HOME stand: called by the test sandbox only. */
+export function enableTestHome() {
+  testHome = true;
+}
+
+/** Why no home can be trusted here, in words, or undefined. */
+export function homeRefusal() {
+  if (testHome) return undefined;
+  if (process.env.TEAMFLOW_TEST_SANDBOX === '1') {
+    return 'TEAMFLOW_TEST_SANDBOX is set in this environment, but this is not a TeamFlow test run, '
+      + 'so TeamFlow reads no credential and reports nothing. If you did not set it yourself, the '
+      + 'repository you have open did (a `.claude/settings.json` "env" block or an `.envrc`); '
+      + 'unset it.';
+  }
+  try {
+    if (os.userInfo().homedir) return undefined;
+  } catch { /* no account record */ }
+  return 'TeamFlow cannot tell whose home directory this is: the operating system has no account '
+    + 'record for this user (a container without a passwd entry?), and $HOME is not trusted in its '
+    + 'place because a repository can set it. No credential is read and nothing is reported until '
+    + 'the user has one.';
+}
+
+/** Nowhere: a path that cannot be read or created, for a refused home. */
+const REFUSED_HOME = path.join(os.devNull, 'teamflow-home-refused');
+
+/** The home directory the user's own files live in (see above). */
+export function userHome() {
+  if (testHome) return os.homedir();
+  if (homeRefusal()) return REFUSED_HOME;
+  return os.userInfo().homedir;
+}
+
 /** The user's own config, the one place a repository cannot write. */
 export function globalConfigPath() {
-  return path.join(os.homedir(), '.config', 'teamflow', 'config.json');
+  return path.join(userHome(), '.config', 'teamflow', 'config.json');
 }
 
 /**
@@ -2022,9 +2081,9 @@ const PR_FIELDS = 'number,url,state,isDraft,mergeable,mergeStateStatus,statusChe
  * of them may interrupt a hook, so the failure is silent.
  */
 export function prSnapshot(cwd, config = {}) {
-  const result = safeExec(process.env.TEAMFLOW_GH_BIN || 'gh',
+  const result = safeExec(ghBinary(),
     ['pr', 'view', '--json', PR_FIELDS],
-    { cwd, timeout: Number(config.lookupTimeoutMs || 5000) });
+    { cwd, timeout: Number(config.lookupTimeoutMs || 5000), env: ghEnv() });
   if (!result.ok) return undefined;
   let pr;
   try { pr = JSON.parse(result.stdout); } catch { return undefined; }
@@ -2067,7 +2126,11 @@ export function refreshDelivery(state, config = {}, info = {}, { force = false, 
 }
 
 export function actor(config, info) {
-  const fallback = info.email?.split('@')[0] || info.name || os.userInfo().username;
+  // No account record (a container without a passwd entry) throws here;
+  // that is an unknown actor, not a crash (MACLEOD-623).
+  let username;
+  try { username = os.userInfo().username; } catch { username = ''; }
+  const fallback = info.email?.split('@')[0] || info.name || username;
   const id = String(config.actorId || fallback || 'unknown').trim().toLowerCase().replace(/[^a-z0-9._-]+/g, '-');
   return { id, displayName: String(config.actorName || info.name || fallback || id) };
 }
@@ -2418,16 +2481,93 @@ export function enrichBinding(state, input) {
 // `gh` at a stub and TEAMFLOW_GITHUB_API points the fallback somewhere
 // that is not github.com. Nothing in a test may reach either.
 
-function githubApiBase() {
-  return String(process.env.TEAMFLOW_GITHUB_API || 'https://api.github.com').replace(/\/+$/, '');
+const DEFAULT_GITHUB_API = 'https://api.github.com';
+
+/**
+ * Where the public issue lookup goes (MACLEOD-623).
+ *
+ * The host is pinned, by the rule `serviceUrl` follows: a repository can
+ * set an environment variable (a `.claude/settings.json` "env" block, an
+ * `.envrc`), and before this TEAMFLOW_GITHUB_API pointed title lookups at
+ * whatever it named — so a hostile checkout could write card titles onto
+ * the victim's board. No credential rides on this request; what it could
+ * do is inject content into derived state.
+ *
+ * So: `api.github.com`, unless the user's OWN global file names a GitHub
+ * Enterprise host as `githubApi` (https only) — the one file a repository
+ * cannot reach. The environment may still point the lookup at this
+ * machine, because a loopback listener is already somebody on the box
+ * (that is what the tests use: a port that refuses the connection).
+ */
+export function githubApiBase() {
+  const trim = (value) => String(value || '').trim().replace(/\/+$/, '');
+  const own = trim(readJson(globalConfigPath(), {})?.githubApi);
+  if (own && originOf(own)?.startsWith('https:')) return own;
+  const env = trim(process.env.TEAMFLOW_GITHUB_API);
+  if (env && isLoopbackOrigin(originOf(env))) return env;
+  return DEFAULT_GITHUB_API;
 }
 
+/**
+ * A title as it may be stored and drawn (MACLEOD-623): no control
+ * characters, and no longer than GitHub itself allows (256). The lookup
+ * answers with somebody else's words, and the binding file and the board
+ * are where they end up — the reason `readableReason` bounds a service's
+ * message (MACLEOD-613).
+ */
+const TITLE_MAX = 256;
+
+export function boundedTitle(text) {
+  const clean = String(text ?? '').replace(/[\u0000-\u001f\u007f-\u009f]+/g, ' ').replace(/\s+/g, ' ').trim();
+  return [...clean].slice(0, TITLE_MAX).join('');
+}
+
+function boundedIssue(found) {
+  if (!found?.title) return found;
+  const title = boundedTitle(found.title);
+  return title ? { ...found, title } : undefined;
+}
+
+/**
+ * The `gh` the plugin runs (MACLEOD-623 audit, S2).
+ *
+ * TEAMFLOW_GH_BIN is the tests' stub, and only the test sandbox may name
+ * one: from anywhere else it is an environment variable a repository can
+ * set, naming a program this plugin would then run.
+ */
+export function ghBinary() {
+  return (process.env.TEAMFLOW_TEST_SANDBOX === '1' && process.env.TEAMFLOW_GH_BIN) || 'gh';
+}
+
+/**
+ * The variables that steer `gh` somewhere other than github.com and the
+ * user's own configuration: a host, a default repository, an enterprise
+ * token, and a config directory (whose `http_unix_socket` can reroute
+ * every request). A repository can set any of them, so the child never
+ * sees them.
+ */
+const GH_STEERING = ['GH_HOST', 'GH_REPO', 'GH_ENTERPRISE_TOKEN', 'GITHUB_ENTERPRISE_TOKEN', 'GH_CONFIG_DIR'];
+
+export function ghEnv(env = process.env) {
+  const out = { ...env };
+  for (const name of GH_STEERING) delete out[name];
+  return out;
+}
+
+/** `owner/name`, as GitHub spells a repository, and nothing that could be read as a flag. */
+const GITHUB_REPO = /^[\w.-]+\/[\w.-]+$/;
+
 async function lookupGithubIssue(repo, number, config = {}) {
-  const gh = safeExec(process.env.TEAMFLOW_GH_BIN || 'gh',
+  // Checked before either path: `--repo` is an argument to a program, and
+  // a value beginning with `-` or carrying a host is not a repository.
+  if (!GITHUB_REPO.test(String(repo)) || String(repo).startsWith('-') || !/^\d+$/.test(String(number))) {
+    return undefined;
+  }
+  const gh = safeExec(ghBinary(),
     ['issue', 'view', String(number), '--repo', repo, '--json', 'title,state'],
-    { timeout: Number(config.lookupTimeoutMs || 5000) });
+    { timeout: Number(config.lookupTimeoutMs || 5000), env: ghEnv() });
   if (gh.ok) {
-    const found = enrichFromToolResult('github', gh.stdout);
+    const found = boundedIssue(enrichFromToolResult('github', gh.stdout));
     if (found?.title) return found;
   }
   try {
@@ -2449,7 +2589,7 @@ async function lookupGithubIssue(repo, number, config = {}) {
       signal: AbortSignal.timeout(Number(config.lookupTimeoutMs || 5000)),
     });
     if (!response.ok) return undefined;
-    return enrichFromToolResult('github', await response.json());
+    return boundedIssue(enrichFromToolResult('github', await response.json()));
   } catch {
     // Offline, rate limited, private, or no such issue. A missing title
     // is a plain card; a thrown error would be a broken hook.
@@ -3382,6 +3522,10 @@ export function ignoredKeyReason(config = {}) {
  * else is ambient.
  */
 export function credentialTarget(config = {}) {
+  // No trustworthy home, no credential of any kind (MACLEOD-623): the
+  // reason reaches `status`, `doctor` and the session-start line.
+  const refusedHome = homeRefusal();
+  if (refusedHome) return { ok: false, reason: refusedHome };
   const session = auth.readSession();
   if (session) {
     const target = credentialDestination(config, auth.sessionOrigin(session));

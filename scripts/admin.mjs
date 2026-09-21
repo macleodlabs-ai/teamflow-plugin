@@ -42,7 +42,7 @@ const EXIT_OK = 0;
 const EXIT_FAILED = 1;
 const EXIT_REFUSED = 2;
 
-const NOT_SIGNED_IN = 'TeamFlow is not signed in. Run `teamflow login` first, as a superadmin.';
+const NOT_SIGNED_IN = 'TeamFlow is not signed in as a person on this machine. Run `teamflow login --browser` first, as a superadmin: operator commands need a person, not the plugin\'s device authorization.';
 
 function out(line) {
   process.stdout.write(`${line}\n`);

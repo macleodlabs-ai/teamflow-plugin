@@ -29,7 +29,7 @@ npx -y github:macleodlabs-ai/teamflow-plugin admin code list
 npx -y github:macleodlabs-ai/teamflow-plugin admin code revoke TF-XXXX-XXXX
 ```
 
-Return the command's result. If it says the signed-in user is not a superadmin, or that no code could be emailed, say so and stop; adding the address is a change to the service's configuration, not something this command can do. If it says TeamFlow is not signed in, have the user run `/teamflow:login` first.
+Return the command's result. If it says the signed-in user is not a superadmin, or that no code could be emailed, say so and stop; adding the address is a change to the service's configuration, not something this command can do. If it says TeamFlow is not signed in as a person, have the user run `teamflow login --browser` first: operator commands need a personal sign-in, and the plugin's own authorization (`/teamflow:login`) is a machine's, which they refuse.
 
 Inside Claude Code the plugin is already on disk, so
 `node "${CLAUDE_PLUGIN_ROOT}/scripts/cli.mjs" admin code list` is the same command without the npx round trip. Use it when `CLAUDE_PLUGIN_ROOT` is set.
