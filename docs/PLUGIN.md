@@ -234,7 +234,7 @@ The loopback listener binds the first free port in 52480-52489. Every one of tho
 
 ### More than one organisation
 
-An address can hold a live seat on several organisations, and the service refuses to guess which one a sign-in is for: `POST /v1/members/identity` answers `409 ambiguous_seat` with the organisations, their role and their plan. Binding to the wrong one credits the developer's reports to the wrong organisation, and nothing downstream can undo that.
+An address can hold a live seat on several organisations, and the service refuses to guess which one a sign-in is for: `POST /v1/members/identity` answers `409 ambiguous_seat` with the organisations, their role and their plan. Binding to the wrong one attributes the developer's reports to the wrong organisation, and nothing downstream can undo that.
 
 ```text
 teamflow login
@@ -287,9 +287,23 @@ A failed exchange is logged on stderr and the job carries on with whatever crede
 
 ### Non-interactive fallback
 
-An environment that can neither open a browser nor mint an OIDC token can set `apiKey` (`TEAMFLOW_API_KEY`) instead. It is the last credential tried: a session, then an access token handed in directly, then the key. A signed-in developer stops sending a long-lived secret the moment there is something better.
+**On TeamFlow there is none, and none is needed.** An environment that cannot
+open a browser is what `teamflow login --device` is for: the code is read on
+one screen and approved on another, so the machine never needs a browser of
+its own. A pipeline is what the OIDC exchange above is for. Those two cover
+every case the old stored secret covered, and TeamFlow issues no such secret
+— `apiKey` set against this service is refused with `api_keys_disabled`
+rather than quietly demoted to.
 
-`/teamflow:doctor` warns when a session has expired or been revoked and reporting has quietly demoted to the key.
+The plugin itself still resolves `apiKey` (`TEAMFLOW_API_KEY`), last of the
+three, for anyone pointing `serviceUrl` at a service that does issue one. It
+is last because a signed-in developer should stop sending a long-lived secret
+the moment there is something better.
+
+`/teamflow:doctor` warns when a session has expired or been revoked, and says
+to run `/teamflow:login` again. On TeamFlow that is not a demotion to
+something lesser — it is the only credential there is, so reporting stops
+until the session comes back, and doctor is where that is visible.
 
 ## Superadmin invite codes
 
@@ -350,9 +364,9 @@ The listing does show the *names* of workflows started before 0.3.14 to whoever 
 
 The projects cache goes cold on upgrade, because its file name changed; the first command after upgrading fetches the list again.
 
-A session that lapses to an API key does not inherit the session's queued reports: the key is a different owner and cannot be shown to be the same organisation without asking the service, so those reports wait for the session to come back, or expire.
+A session that lapses has nothing to lapse to. This service issues no long-lived organisation credential, so there is no second owner for the queue to pass to: reports queued under a session that has expired wait for `teamflow login` to bring it back, or reach the seven-day horizon and go. That is the intended shape rather than a gap — a queue that changed hands on an expiry would be reports written by one credential and delivered by another.
 
-`slot` is present only for `kind: "runtime"`. The service validates the payload against the privacy allowlist, drops any field it does not recognise, lists what it dropped in `dropped_fields`, and writes the document under the tenant its own credential names. One accepted report costs one credit.
+`slot` is present only for `kind: "runtime"`. The service validates the payload against the privacy allowlist, drops any field it does not recognise, lists what it dropped in `dropped_fields`, and writes the document under the tenant its own credential names. Reporting is included in the seat: accepted reports are counted so that fair use can be told from a runaway loop, and never priced by volume.
 
 Two fields the reporter deliberately does **not** send: `tenantId`, because the account behind the credential owns the tenant, and a payload-level `slot`, because the envelope already carries it where the service can check it against the known slots.
 
@@ -363,7 +377,7 @@ The actor rollup (`actors/<id>.json`) has no service equivalent yet. The allowli
 | Answer | What the reporter does |
 | --- | --- |
 | 2xx | done. An identical re-post comes back `replay: true` and is not charged again |
-| 402 | the organisation is out of credits. Logged once per session, never queued, never blocking |
+| 402 | no reporting seat on the organisation. Logged once per session, never queued, never blocking |
 | 429 | rate limited. Queued and retried after `Retry-After`, or after a backoff of 15s doubling to a five-minute cap |
 | other 4xx | the service refused the report. Not retried: the same body cannot get a different answer, and one bad report must not dam the good ones behind it |
 | 5xx, timeout, offline | queued and retried on the next flush, with the idempotency key it was queued with |
@@ -426,11 +440,11 @@ Canonical keys:
 
 **A binding belongs to one organisation (MACLEOD-586).** A repository normally belongs to one, but a person can hold seats on several and switching is per session (MACLEOD-524), so the binding records the organisation it was made under and a binding made under another does not speak: nothing at all is reported under it, and `teamflow status`, `/teamflow:doctor` and the `SessionStart` notice say which organisation it belongs to and that `teamflow work-on <KEY>` binds it here. Without this the tenant a report lands in comes from the credential while the ticket came from the binding, so one customer's key, title, stage, summary, branch and counts were written onto another's board — every report, with no outage needed. The user binding is filed per organisation (`bindings/<organisation>/<project>.json`) rather than per tenant, which is `default` on every service install, so binding under one organisation no longer destroys the other's and switching back needs no re-bind. Nothing is migrated: a binding written before this — no organisation recorded, under the tenant — is still read, and adopted where this data directory has only ever held one organisation's work. Where it has held two there is no safe guess, so it is refused until somebody re-binds it. An install with no service credential has no organisation to compare against and behaves exactly as it always has.
 
-**The last check is at the send point, where the credential is actually chosen.** Every check above asks which credential the configuration *names*, which is deliberately the stable answer and not the true one — a session that will not refresh falls back to an API key, and the organisation that receives a report is the key's. So the organisation a report belongs to travels with it to `postEnvelope` and is compared there against the credential the request will carry: a mismatch is refused, never queued, and `teamflow status` prints the reason as the last publish result. A credential that names no organisation at all — a bearer token handed in with no account, which fingerprints to nothing — cannot carry a report that names one either, because "I cannot tell whose this is" and "it is theirs" have to be answered the same way. Two consequences worth knowing: a session that has expired beside an API key stops reporting until `teamflow login` is run again, even when the key is the same organisation's, because nothing local can tell that it is; and an unstamped binding in a worktree whose data directory cannot be read — the sandboxed-agent case that `.teamflow/binding.json` exists for — is refused rather than adopted, because absent evidence and unreadable evidence are not the same answer.
+**The last check is at the send point, where the credential is actually chosen.** Every check above asks which credential the configuration *names*, which is deliberately the stable answer and not the true one — a session that will not refresh is not the credential it was a moment ago, and on an install that has some other credential configured the organisation receiving a report would be that one's. So the organisation a report belongs to travels with it to `postEnvelope` and is compared there against the credential the request will carry: a mismatch is refused, never queued, and `teamflow status` prints the reason as the last publish result. A credential that names no organisation at all — a bearer token handed in with no account, which fingerprints to nothing — cannot carry a report that names one either, because "I cannot tell whose this is" and "it is theirs" have to be answered the same way. Two consequences worth knowing: an expired session stops reporting until `teamflow login` is run again, whatever else is configured on the machine, because nothing local can show that another credential is the same organisation's; and an unstamped binding in a worktree whose data directory cannot be read — the sandboxed-agent case that `.teamflow/binding.json` exists for — is refused rather than adopted, because absent evidence and unreadable evidence are not the same answer.
 
 Binding is also where a title is learned: see below.
 
-`/teamflow:doctor` reports the transport, the service account and its credits, the configured tracker, the resolved issue source and whether that tracker's bundled MCP server is visible; authenticate it once through `/mcp`.
+`/teamflow:doctor` reports the transport, the service account and whether this machine can report, the configured tracker, the resolved issue source and whether that tracker's bundled MCP server is visible; authenticate it once through `/mcp`.
 
 ### Picking the next ticket
 
@@ -663,10 +677,13 @@ posting it, and `teamflow report --help` lists every flag.
 
 Two differences from the plugin worth knowing:
 
-- **Each invocation is one report and one credit.** The plugin skips an
-  unchanged heartbeat because it compares against the state it last
-  sent; a CLI run has no such state and always carries the clock. Call
-  it at a transition, not on a timer.
+- **Each invocation is one report.** The plugin skips an unchanged
+  heartbeat because it compares against the state it last sent; a CLI
+  run has no such state and always carries the clock. Reporting is
+  included in the seat and is not priced by volume, but a timer is
+  still the wrong caller: it fills the board with repeats of an
+  unchanged state and is what fair use is measured against. Call it at
+  a transition.
 - **It reports the ticket's own document**, the same object the plugin
   owns. A background job that owns a sidecar should keep using
   `runtime-report.mjs` instead, so the two do not contend.

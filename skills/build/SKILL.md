@@ -216,14 +216,14 @@ That sentence is the completion criterion. Anything else means the phase is
 not finished. Three commands, in this order:
 
 ```bash
-teamflow workflow reconcile --dry-run   # what is wrong, and what repairing it costs
+teamflow workflow reconcile --dry-run   # what is wrong, and what repairing it sends
 teamflow workflow reconcile             # repair it
 teamflow workflow reconcile             # confirm: expect "Nothing to reconcile"
 ```
 
 **Always the dry run first.** It changes nothing and it prints two things you
-need before you spend anything: how many reports the pass will send (one
-credit each — on a bad morning that has been 161) and, separately, one line
+need before you repair anything: how many reports the pass will send (on a bad
+morning that has been 161) and, separately, one line
 per tracker saying what the pass will ask of it. `About to ask linear to
 close: …` names the real issues in somebody's Linear it will ask the service
 to close, and names only the ones that tracker has not already closed. Read

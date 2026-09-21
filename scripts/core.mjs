@@ -3327,7 +3327,7 @@ export function ambientDestination(config = {}) {
     // PKCE exchange and an id_token as the price of reading the error
     // message (MACLEOD-616 follow-up, B1).
     reason: `${provenance || `no credential on this machine was issued by ${target.origin}`}`
-      + ' An API key or access token is only sent to TeamFlow, to localhost, or to a service you '
+      + ' A credential is only sent to TeamFlow, to localhost, or to a service you '
       + `named yourself. If ${target.origin} is genuinely yours, add "trustedOrigins": `
       + `["${target.origin}"] to ${globalConfigPath()} — by hand, in that file, so the choice is `
       + 'yours and not an environment variable\'s.',
@@ -3910,13 +3910,19 @@ let paymentNoticeShown = false;
 
 // 402 is a billing problem, not a developer's problem. Say it once and
 // let the session carry on: reporting is observability, never a gate.
+//
+// What a 402 means changed in MACLEOD-612. The service meters by seat
+// now, so an account with a live reporting seat is never refused for
+// balance however hard its agents run. A 402 therefore means one thing
+// only: nobody on this account holds a seat. "Top up" was the old
+// answer and is no longer an answer at all — there is nothing to top up.
 function notePaymentRequired(config, body) {
   if (paymentNoticeShown) return;
   paymentNoticeShown = true;
   const link = body?.payment?.payment_link || body?.payment?.checkout_url;
-  const where = link ? `Top up: ${link}` : `Top up at ${serviceUrl(config)}.`;
+  const where = link ? `Take a seat: ${link}` : `Take a seat at ${serviceUrl(config)}.`;
   try {
-    process.stderr.write(`TeamFlow: reporting paused, the account is out of credits. ${where}\n`);
+    process.stderr.write(`TeamFlow: reporting paused, no reporting seat on this account. ${where}\n`);
   } catch {}
 }
 
@@ -4054,7 +4060,7 @@ async function postEnvelope(endpoint, envelope, idempotencyKey, config, account 
     notePaymentRequired(config, body);
     return answer({
       ok: false, retry: false, status, paymentRequired: true,
-      ...refusalOf(body, 'account is out of credits'),
+      ...refusalOf(body, 'no reporting seat on this account'),
     });
   }
   const retryAfterMs = parseRetryAfter(response.headers.get('retry-after'));

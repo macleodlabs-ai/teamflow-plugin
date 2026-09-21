@@ -3,6 +3,16 @@
 What changed in each published version of the TeamFlow plugin, newest first.
 Only what a person using it would notice.
 
+## 0.3.21
+
+- **Nothing the plugin says mentions a credit any more.** A seat is a
+  person: their agents, subagents, worktrees and CI all report under it, and
+  reporting is not billed by volume. The client skill's guidance on when to
+  report says why a repeated report adds nothing rather than what it costs,
+  and on HTTP 402 it hands your human what the service said, with the link
+  the service gave &mdash; a seat is theirs to add, not the agent's. The
+  `status`, `org` and `logout` skills use the same words.
+
 ## 0.3.20
 
 - **A ticket's state is now sent when it changes, rather than on every hook

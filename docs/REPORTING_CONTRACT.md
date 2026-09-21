@@ -14,7 +14,7 @@ Idempotency-Key: <sha256 of the report's content, excluding updatedAt>
 { "kind": "issue" | "runtime", "slot": "<slot>", "payload": { ... } }
 ```
 
-A reporter authenticates with a short-lived access token: a developer's, from signing in once, or a CI job's, from exchanging its GitHub Actions OIDC token. `X-Api-Key` with a long-lived organisation key is the non-interactive fallback. The credential is resolved per request, so a queued report authenticates with whatever is valid when it is finally delivered.
+A reporter authenticates as itself: a developer's machine with the device credential `teamflow login` leaves behind, or a CI job with a short-lived token it got by exchanging its GitHub Actions OIDC identity. There is no long-lived organisation credential to fall back to — this service issues none, and one presented anywhere is refused with `api_keys_disabled`. The credential is resolved per request, so a queued report authenticates with whatever is valid when it is finally delivered.
 
 `kind` is `issue` for a ticket's current state and `runtime` for one background sidecar; `slot` is present only for `runtime` and must be one of the slots below. The payload is a `TicketState` or a `RuntimeState` as defined in **Allowed current-state data**.
 
@@ -22,9 +22,9 @@ Three properties of this transport are load-bearing:
 
 - **The tenant comes from the credential.** The account behind the token or key owns the tenant prefix. A `tenantId` in the payload is dropped, because a body that names a tenant is describing somebody else's data.
 - **Unknown fields are dropped, not rejected.** The service answers 200 and lists what it dropped in `dropped_fields`. A reporter that grows a field, or is talked into attaching a prompt, a diff or a log line, cannot make that field reach the store by naming it something the service has never heard of.
-- **The idempotency key is the report's content hash.** A heartbeat that repeats an unchanged report is the same request, replayed rather than charged again. Only real progress is a new report, and one accepted report costs one credit.
+- **The idempotency key is the report's content hash.** A heartbeat that repeats an unchanged report is the same request, replayed rather than counted again. Only real progress is a new report. Reporting is included in the seat and is not priced by volume: the count exists so that fair use can be told from a runaway loop, and nothing a person does at a keyboard reaches it.
 
-Answers: 2xx accepted (`replay: true` when it was a repeat); 402 the organisation is out of credits, which is logged once and never blocks; 429 rate limited, queued and retried after `Retry-After` or a capped backoff; any other 4xx the report was refused and is not retried; 5xx and network failures are queued and retried with the key they were queued with.
+Answers: 2xx accepted (`replay: true` when it was a repeat); 402 the organisation has no reporting seat, which is logged once and never blocks; 403 `viewer_cannot_report` or `api_keys_disabled`, refused and not retried; 429 rate limited, queued and retried after `Retry-After` or a capped backoff; any other 4xx the report was refused and is not retried; 5xx and network failures are queued and retried with the key they were queued with.
 
 The legacy transport writes the same documents straight to S3 at the paths below with AWS credentials, and is selected when `dataUri` is configured and no service credential is available.
 
@@ -92,7 +92,7 @@ Each writer owns a deterministic object:
 - deployment owns `deploy.json`;
 - deployed tests own `dev-test.json`;
 - scanners own `security.json`;
-- the tracker webhook owns `tracker.json`, and the same webhook's pull request, review and check deliveries own `pr.json`; `/v1/report` refuses both slots by name, because the webhook proves who sent a delivery with an HMAC signature and a report only proves who holds the tenant's API key.
+- the tracker webhook owns `tracker.json`, and the same webhook's pull request, review and check deliveries own `pr.json`; `/v1/report` refuses both slots by name, because the webhook proves who sent a delivery with an HMAC signature and a report only proves who holds a credential on the tenant.
 
 The browser merges sidecars by execution ID. Independent background jobs therefore do not contend with Claude's primary ticket state.
 

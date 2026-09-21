@@ -88,9 +88,9 @@ export function rulesDocument(skills, { mcp = true, automation = 'rules', covers
     : 'run the command below';
 
   // A tool whose hooks are installed reports on its own. Telling its
-  // agent to report as well would not make the board better: it would
-  // charge the team twice for the same fact, and the second report
-  // would be the one written from memory.
+  // agent to report as well would not make the board better: the second
+  // report is the one written from memory, and it lands on a card the
+  // hook has already said the truth about.
   const automatic = {
     hooks: `## Reporting here is automatic
 
@@ -99,9 +99,10 @@ They report each stage as it happens, with nobody asked to remember.
 
 **Do not report by hand.** Do not narrate tool calls for reporting, and
 do not run \`report\` after a test run or a merge: the hook already did,
-and a second report is a second credit for the same fact. The stage
-vocabulary below is there so you can read the board, and for the rare
-transition no tool call can show.
+and a second report for the same fact adds nothing to the board — it
+says what the card already says, from memory rather than from the tool
+call. The stage vocabulary below is there so you can read the board, and
+for the rare transition no tool call can show.
 
 `,
     'git-hooks': `## Reporting here is on commit
@@ -154,9 +155,11 @@ issue description in a report: they are rejected, and they are not yours
 to send.
 
 Do not report on a timer, do not report the same stage twice, and do not
-report a stage you have not observed. An accepted report costs the team
-one credit. On HTTP 402 stop reporting and show your human the price and
-the payment link. Never let a reporting failure interrupt the work.
+report a stage you have not observed. A report that repeats what the
+card already says adds nothing to the board, and a stage you guessed at
+makes it wrong. On HTTP 402 stop reporting and hand your human what the
+service said, with the link it gave: a seat is theirs to add and not
+yours. Never let a reporting failure interrupt the work.
 
 ## The other TeamFlow commands
 

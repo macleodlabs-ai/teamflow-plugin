@@ -1,11 +1,11 @@
 ---
 name: macleodlabs-teamflow-client
-description: Call the paid TeamFlow service (macleodlabs.teamflow) over MCP or REST. Use this skill whenever a task matches this service's purpose: Near-live delivery map for Jira, Linear and GitHub work done with Claude Code. Reporters post derived stage, status and evidence per issue; the dashboard shows every ticket's swimlane from local dev through audits to verified. One credit per report. Trigger on any request to run, verify, price, or take a seat on TeamFlow, even if the user does not name the service.
+description: Call the subscription TeamFlow service (macleodlabs.teamflow) over MCP or REST. Use this skill whenever a task matches this service's purpose: Near-live delivery map for Jira, Linear and GitHub work done with Claude Code. Reporters post derived stage, status and evidence per issue; the dashboard shows every ticket's swimlane from local dev through audits to verified. A seat is a person: their agents, subagents and CI report under it. Trigger on any request to run, verify, price, or take a seat on TeamFlow, even if the user does not name the service.
 ---
 
 # TeamFlow client
 
-One call costs USD 0.01. The service returns a machine-
+Subscription service: calls are included in the reporting seat they belong to. The service returns a machine-
 verifiable result with a request hash. Do not guess at the schema:
 read it from the service first.
 
@@ -17,24 +17,24 @@ read it from the service first.
    `idempotency_key` (any unique string) so retries are safe.
 3. Call the `macleodlabs_teamflow_call` tool with the request. Over REST:
    POST https://codercat.io/v1/report
-   with headers `X-Api-Key` and `Idempotency-Key`.
+   with headers `Authorization: Bearer` and `Idempotency-Key`.
 4. Read `status` before anything else. Billing statuses are listed
    in capabilities. INVALID and TOO_LARGE are free: fix the request
    and retry.
-5. On HTTP 402 / PAYMENT_REQUIRED the account cannot pay for the call.
-   That is not an error, and the `payment` object is addressed to you:
-   `payment.packs` is empty, because this service sells monthly seats
-   and not credit packs. `payment.plans` lists them, each with
-   `price_usd` and the credits a seat carries per month. There is
-   nothing on that list you can buy: a seat is the account owner's to
-   add, or to enlarge by moving to a bigger plan, from
-   https://codercat.io/app/. Someone opening a new organisation starts
-   at https://codercat.io/signup/. Name the plan you need and why,
-   hand that to a person, and stop.
+5. This service sells a seat, not a number of calls. A report from an
+   account with a live reporting seat is never refused for balance,
+   however many agents are running on it; fair use is reviewed by a
+   person, not enforced by a meter. Two refusals are still possible
+   and neither is about money. 403 `viewer_cannot_report` means the
+   credential belongs to somebody who reads the board and does not
+   report: ask the account's owner to make them a reporting member.
+   402 `insufficient_credits` means the account has no reporting seat
+   at all: one is taken from https://codercat.io/app/, or a new
+   organisation starts at https://codercat.io/signup/.
 
-   Retry only once the balance is positive, and retry with the SAME
-   idempotency key. One key means one job and at most one charge,
-   however many times you send it.
+   Either way, retry the ORIGINAL request with the SAME idempotency
+   key once it is sorted. One key means one job however many times you
+   send it.
 6. Verify: store `request_hash` and `result_hash`. The same
    normalized request on the same service version must reproduce the
    same result hash.

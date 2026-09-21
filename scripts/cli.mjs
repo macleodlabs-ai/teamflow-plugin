@@ -78,7 +78,7 @@ const USAGE = `teamflow \u2014 delivery reporting for TeamFlow
   teamflow sync                    publish the current state now
   teamflow tidy [--dry-run]        repair every divergence between the runs, the
                                    cards, the executions and the trackers
-  teamflow doctor                  transport, account, credits, tracker MCP and connections
+  teamflow doctor                  transport, account, tracker MCP and connections
   teamflow trackers [list]         the issue trackers this org has connected
   teamflow trackers connect <tracker> [--projects a,b] [--filter <team>]
                                    authorise a tracker; prints the URL to open
@@ -273,8 +273,11 @@ async function status() {
     credential: credentialKind(config) || 'none',
     identity: identity(probe?.email || session?.email, probe?.account?.account)
       || (credentialKind(config) ? 'not verified; run /teamflow:doctor' : 'not signed in; run /teamflow:login'),
-    credits: probe?.ok ? probe.account?.credits : undefined,
-    apiKeyConfigured: Boolean(config.apiKey),
+    // No balance and no key here (MACLEOD-612). A seat is the unit a team
+    // buys, so a number counting reports is nothing the person reading this
+    // can act on; and a key they are no longer offered is not a setting to
+    // confirm. `credential` above still names what this machine is holding,
+    // which is the question status is actually being asked.
     dataUriConfigured: Boolean(config.dataUri),
     jiraBaseUrlConfigured: Boolean(config.jiraBaseUrl),
     linearWorkspaceConfigured: Boolean(config.linearWorkspace),
@@ -486,24 +489,21 @@ async function doctor() {
     if (project.none) report.projectFindings = [NO_PROJECT];
 
     // The one question a reporter cannot answer locally: does the org
-    // still have credits? A 402 during a session is silent by design,
-    // so doctor is where it has to be visible.
+    // Can this machine reach the service and be recognised by it? The
+    // balance used to be reported here too, and is not any more
+    // (MACLEOD-612): the service meters by seat, so the number is our
+    // abuse meter rather than the customer's allowance, and a developer
+    // reading a falling number in their own diagnostics would treat it
+    // as a quota they have to ration their agents against.
     const probe = await fetchAccount(config);
     report.serviceAccess = probe.ok ? 'ok' : `not verified: ${probe.reason}`;
     // A session that will not refresh silently demotes the reporter to
-    // its API key. Say so rather than letting it look healthy.
-    if (probe.degraded) report.warning = `the signed-in session is not usable (${probe.degraded}); falling back to the API key. Run /teamflow:login again`;
+    // whatever else is on the machine. Say so rather than letting it
+    // look healthy.
+    if (probe.degraded) report.warning = `the signed-in session is not usable (${probe.degraded}); falling back to the stored credential. Run /teamflow:login again`;
     if (probe.ok) {
-      // The kit's `plan` and `bought` are two credit buckets, not a
-      // plan name: plan credits expire and are spent first. The names
-      // here say which is which so a low balance is readable.
       report.account = probe.account?.account;
       report.identity = identity(probe.email || auth.readSession()?.email, probe.account?.account);
-      report.credits = probe.account?.credits;
-      report.planCredits = probe.account?.plan;
-      report.boughtCredits = probe.account?.bought;
-      if (probe.account?.plan_expires_at) report.planCreditsExpireAt = probe.account.plan_expires_at;
-      if (probe.account?.credits === 0) report.warning = 'no credits left; reports are refused with 402 until the subscription renews or the account is topped up';
     }
 
     // Which trackers may report what happens to the issue. A repo whose keys
@@ -850,8 +850,8 @@ async function logout() {
       : ` The device credential could not be revoked at the service (${out.reason});`
         + ' revoke it from the members page.')
     : '';
-  print(`TeamFlow signed out. ${auth.sessionPath()} removed; reporting stops unless an API key is `
-    + `configured.${revoked}`);
+  print(`TeamFlow signed out. ${auth.sessionPath()} removed; reporting stops unless another `
+    + `credential is configured.${revoked}`);
 }
 
 try {

@@ -11,7 +11,7 @@ Run this command with the shell tool and return its output:
 npx -y github:macleodlabs-ai/teamflow-plugin logout
 ```
 
-It deletes `~/.config/teamflow/session.json`. Reporting stops at the end of the current session's token unless a non-interactive API key is configured. The login skill signs back in.
+It deletes `~/.config/teamflow/session.json`. Reporting stops at the end of the current session's token. The login skill signs back in.
 
 Inside Claude Code the plugin is already on disk, so
 `node "${CLAUDE_PLUGIN_ROOT}/scripts/cli.mjs" logout` is the same command without the npx round trip. Use it when `CLAUDE_PLUGIN_ROOT` is set.
