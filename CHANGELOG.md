@@ -3,6 +3,16 @@
 What changed in each published version of the TeamFlow plugin, newest first.
 Only what a person using it would notice.
 
+## 0.3.25
+
+- **When a free trial ends, the plugin says so.** If your organisation's
+  14-day trial ends without a subscription, reports stop being uploaded and
+  `teamflow status`, `teamflow doctor` and the next session's start say
+  "Your TeamFlow trial has ended. Subscribe to keep your board updating",
+  with the link. Your board stays readable and nothing is deleted. Reports
+  made in the meantime are not queued up; the moment somebody subscribes,
+  the next report sends the current state and the notice goes away.
+
 ## 0.3.24
 
 - **`/teamflow:login` authorizes the plugin on the consent page, every

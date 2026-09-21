@@ -4049,7 +4049,7 @@ export function machineDir() {
  * like one that broke. Per organisation because an accepted report for one
  * says nothing about another (audit, S2).
  */
-const SOFT_REFUSALS = new Set(['reporting_paused', 'payment_failed', 'usage_exceeds_plan', 'credential_in_use']);
+const SOFT_REFUSALS = new Set(['reporting_paused', 'payment_failed', 'usage_exceeds_plan', 'credential_in_use', 'trial_ended']);
 
 function softRefusalPath(scope) {
   const name = String(scope || UNSCOPED).toLowerCase().replace(/[^a-z0-9._-]+/g, '-').slice(0, 80) || UNSCOPED;
