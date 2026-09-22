@@ -3,6 +3,14 @@
 What changed in each published version of the TeamFlow plugin, newest first.
 Only what a person using it would notice.
 
+## 0.3.28
+
+- **Integrations live in Organisation settings.** `teamflow trackers connect`
+  now prints the link to Integrations instead of starting a connection: an
+  owner or admin, signed in as themselves, connects trackers there. Linear
+  connects by consent and GitHub through the TeamFlow App, so neither needs
+  an id or a secret copied by hand.
+
 ## 0.3.27
 
 - **Every problem on the board arrives with its fix, and the fix goes to

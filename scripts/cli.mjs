@@ -94,8 +94,8 @@ const USAGE = `teamflow \u2014 delivery reporting for TeamFlow
                                    report a CI gate's start and finish; \`run\`
                                    runs the command and retries it for you
   teamflow trackers [list]         the issue trackers this org has connected
-  teamflow trackers connect <tracker> [--projects a,b] [--filter <team>]
-                                   authorise a tracker; prints the URL to open
+  teamflow trackers connect        where to connect one: Organisation settings,
+                                   under Integrations
   teamflow repos [list|add]        register a repository for CI OIDC
   teamflow admin code [create|list|revoke]  invite codes, for superadmins
   teamflow admin comp <account> [--days N]  complimentary time for an existing account
@@ -232,17 +232,6 @@ function scopeWords(connection = {}) {
   const scope = connection.scope && !Array.isArray(connection.scope) ? connection.scope : {};
   const named = (scope.names?.length ? scope.names : scope.ids) || [];
   return named.length ? named.join(', ') : 'all';
-}
-
-/** `--projects a,b,c` -> the scope block the service stores. */
-function projectsArg(list) {
-  const at = list.indexOf('--projects');
-  // `--filter` is still read for the connections that were made with it: it
-  // is the team or repository the webhook itself is narrowed to, which is a
-  // different thing from which of that team's projects reach the board.
-  if (at === -1) return undefined;
-  const names = String(list[at + 1] || '').split(',').map((one) => one.trim()).filter(Boolean);
-  return { ids: [], names: [...new Set(names)] };
 }
 
 function connectedProviders(connections) {
@@ -887,65 +876,33 @@ async function org() {
 }
 
 /**
- * `teamflow trackers`, and `teamflow trackers connect <tracker>`.
+ * `teamflow trackers`, and `teamflow trackers connect`.
  *
- * The members page has a button for this; the terminal gets the same flow
- * without one. The CLI cannot finish an authorisation — a consent screen is a
- * browser's job and the callback lands wherever the person opened it — so it
- * asks the service for the URL, prints it, and says what happens next. The
- * connection is already waiting by then, pending, and `teamflow trackers`
- * shows it as connected once the browser has been round.
+ * Only an owner or admin, signed in as themselves, connects a tracker
+ * (ADHOC-23): the service refuses this machine's credential for it. So
+ * `connect` asks the service nothing. It says where the person does it, in
+ * Organisation settings under Integrations, and exits 0: being pointed to the
+ * right place is not a failure.
  */
+function integrationsUrl() {
+  return `${String(serviceUrl(config)).replace(/\/+$/, '')}/app/#integrations`;
+}
+
 async function trackers() {
-  const [action = 'list', target] = args;
+  const [action = 'list'] = args;
   if (action === 'list') {
     const result = await trackerConnections(config);
     if (!result.ok) throw new Error(`TeamFlow could not list your trackers: ${result.reason}`);
     print(result.connections.length
       ? result.connections.map(trackerLine).join('\n')
-      : 'No tracker is connected. `teamflow trackers connect linear` starts one.');
+      : `No tracker is connected. An owner or admin connects one in Organisation settings, under Integrations: ${integrationsUrl()}`);
     return;
   }
-  if (action !== 'connect' || !target) {
-    throw new Error('Usage: teamflow trackers, or teamflow trackers connect <tracker> '
-      + '[--projects a,b] [--filter <team>]');
+  if (action === 'connect') {
+    print(`Connect trackers in Organisation settings, under Integrations: ${integrationsUrl()}`);
+    return;
   }
-  const at = args.indexOf('--filter');
-  const filter = at === -1 ? '' : String(args[at + 1] || '').trim();
-  const scope = projectsArg(args);
-  const cred = await credential(config);
-  if (!cred) throw new Error('TeamFlow needs a credential to connect a tracker; run /teamflow:login.');
-  const provider = String(target).toLowerCase();
-  const response = await fetch(
-    `${serviceUrl(config)}/v1/members/trackers/oauth/${encodeURIComponent(provider)}/start`,
-    {
-      method: 'POST',
-      headers: { [cred.header]: cred.value, 'content-type': 'application/json' },
-      body: JSON.stringify({ ...(filter ? { filter } : {}), ...(scope ? { scope } : {}) }),
-      redirect: 'error',
-      signal: AbortSignal.timeout(Number(config.serviceTimeoutMs || 5000)),
-    },
-  );
-  let body;
-  try { body = await response.json(); } catch { body = undefined; }
-  if (!response.ok || !body?.authorize_url) {
-    // `providers` names the way out when the way in was wrong, and it is the
-    // one thing a person cannot guess.
-    const can = Array.isArray(body?.providers) && body.providers.length
-      ? ` Trackers you can authorise: ${body.providers.join(', ')}.`
-      : '';
-    throw new Error(`TeamFlow could not start ${provider}: `
-      + `${refusalOf(body, `the service returned ${response.status}`).reason}.${can}`);
-  }
-  const minutes = Math.max(1, Math.round(Number(body.expires_in || 600) / 60));
-  print(`Open this to authorise ${provider}:\n\n  ${body.authorize_url}\n\n`
-    + `It expires in ${minutes} minutes. Approve it and TeamFlow creates the webhook itself — `
-    + 'there is nothing to paste. The browser lands back on the members page, and '
-    + `\`teamflow trackers\` shows ${provider} connected once it has.`
-    + (scope
-      ? `\n\nIt will cover ${scope.names.join(', ')}.`
-      : '\n\nIt will cover every project the workspace has. '
-        + 'Pass --projects to narrow it, or choose them on the members page.'));
+  throw new Error('Usage: teamflow trackers, or teamflow trackers connect');
 }
 
 async function repos() {

@@ -580,7 +580,7 @@ What the webhooks contribute, and nothing beyond it:
 
 What a tracker event may never do is set a delivery stage the skill owns. It never moves a ticket backwards or sideways inside `LOCAL_DEV`..`DEV_VERIFIED`, so Jira saying "In Progress" about a ticket the skill already has in `DEV_TEST` is Jira being behind, and the ticket does not move. A ticket the skill has never reported is different: there, an in-progress status is the only signal there is, and it puts the ticket in `LOCAL_DEV`. Nothing is inferred from silence either: no event, no change.
 
-No hook changes when a tracker is connected, and nothing stops when one breaks. With every connection dead the board draws exactly what the plugin and the background reporters report, which is what it drew before trackers existed. A connection is made once per organisation by an owner on the members page, not in this plugin's config.
+No hook changes when a tracker is connected, and nothing stops when one breaks. With every connection dead the board draws exactly what the plugin and the background reporters report, which is what it drew before trackers existed. A connection is made once per organisation by an owner or admin, signed in on the dashboard, under Integrations in Organisation settings, not in this plugin's config. `teamflow trackers connect` asks the service nothing: it prints where to connect one (`<service>/app/#integrations`) and exits 0, because a change to an integration needs a person.
 
 `teamflow status` prints one line per connection under `trackerConnections` — the provider, its project, team or repository filter, when it last delivered and its last error, which are the four things anybody asks when issues are not appearing:
 
