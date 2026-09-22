@@ -74,6 +74,88 @@ A session that has never launched an `Agent` has no agents, so a developer
 who `cd`s into a second repository gets an actor of their own — two
 repositories must not overwrite each other's stage — and no `agent` block.
 
+## Every dispatched agent is a node on the board
+
+The owner's ruling (MACLEOD-639): all work is represented, and the tool
+guarantees it rather than the orchestrator remembering. A session dispatched
+thirteen teams into worktrees with no `teamflow workflow create`, and the
+board had no run, no phases and no edges for a day. `plugin/scripts/dispatch.mjs`
+is the answer, on the events the hooks already see:
+
+- **The `Agent` (`Task`) tool's PreToolUse in the parent** — registered in
+  `hooks.json` for that tool alone, with a 2 s timeout — is the dispatch.
+  Claude Code holds the dispatch until this hook exits, so it is local only:
+  from `name`, `description`, `subagent_type` and `isolation`, never
+  `prompt`, the plugin (a) makes sure a live run exists for the
+  organisation, creating one named after the bound ticket or `Unplanned run
+  <date>` with `origin: auto`, status `running`, no `--order-text`; (b) puts
+  the session's own ticket in the pool; (c) records the launch, marked
+  `pending` when the agent is owed a node — sent to a worktree, or
+  dispatched by a session that holds no ticket. The run is created under an
+  exclusive lockfile next to `workflows.json` (stale after 10 s) and re-read
+  once the lock is held, so thirty dispatches at once make one run. No
+  credential refresh, mint or publish happens on this event.
+- **The mint is on the async path.** The first of the dispatch's async
+  events — the tool's own PostToolUse, the agent's `SubagentStart`, or the
+  agent's first tool event — mints the ad hoc key (`POST /v1/adhoc`, bounded
+  by the service timeout), publishes the item once with a title derived from
+  the label and the task and no execution, adds it to the pool as
+  `addedBy: dispatch`, `running/build`, and publishes the run. A foreground
+  agent's PostToolUse only arrives when it has finished, which is why the
+  agent's own events can settle it. The mint record, one file per session
+  and tool call under `sessions/<id>.mints/`, is the idempotency key: a
+  re-entered hook reads the key it already has, and a mint that failed on
+  the network is tried again on a later event, up to five times.
+- **Gates on minting.** Only in a repository bound to TeamFlow — a binding
+  on disk for it in this organisation, a session bound by a person, the
+  project's `.teamflow.json` naming the organisation in `org`, or the
+  organisation's cached projects claiming the repository; otherwise the
+  launch carries reason `unbound` and no run is created. At most 50 nodes a
+  session, after which an agent goes under the session's ticket with reason
+  `cap`. An agent launched by an agent is never minted a node: it is bound
+  to its parent's node with reason `nested`.
+- **The agent's `SubagentStart`** matches its launch as before and binds
+  the agent to its node, at manual strength: a prompt naming the parent
+  ticket does not pull it off, a later `work-on` in the worktree wins because
+  it is newer. An agent with no node and no binding inherits the session's
+  key on its first tool event — below a branch name, so its own repository
+  still outranks it — and a person in a second repository is never rebound.
+- **`git worktree add` and a non-interactive `claude`** through Bash, on
+  PostToolUse (the async path; a synchronous hook on every shell command is
+  a cost every command would pay), make sure the run exists. No node is
+  minted for them: there is no agent to name yet.
+- **The nudge.** On the one dispatch that had to create the run, one line —
+  `TeamFlow created run "<name>" for this work; plan it with `teamflow
+  workflow depends` so the board shows the phases.` — is said on the
+  dispatching tool's own PostToolUse (Claude Code reads `additionalContext`
+  there) or the next prompt, whichever comes first, and never on
+  SessionStart.
+- **The proof.** `teamflow status` and `teamflow doctor` always print
+  `dispatched: N agents dispatched, M unrepresented, …`. `M` is agents with
+  neither a node nor a key to report under, and is meant to read 0; a
+  service that refused to mint shows as `under the session's ticket` with
+  its reason in brackets. Every path fails open: a refused mint, a service
+  that is down, a throw — the hook exits 0, prints nothing a tool reads as
+  a denial, and the agent still reaches the board under the session's
+  ticket.
+- **CLAUDE.md.** The rule itself — create, plan/add, depends, ticket — goes
+  into the project's own instructions between `<!-- BEGIN teamflow workflow
+  -->` markers: written by `teamflow skills install --for <tool>` (Claude Code
+  into `CLAUDE.md`, every other tool inside its rules document), by
+  `teamflow hooks install --git` (into `CLAUDE.md` when the repository keeps
+  one, else `AGENTS.md`, which it creates when neither file exists), and by
+  the first `SessionStart` of the main session in a project bound to
+  TeamFlow that already has a `CLAUDE.md` — never a new file, never inside
+  a linked git worktree (an agent's, or a main session started with
+  `claude -w`; told apart by `git rev-parse --git-dir` differing from
+  `--git-common-dir`), replaced in place, unchanged on a second write. `teamflow skills uninstall --for claude-code` takes it back
+  out and nothing else.
+
+On the wire this is two fields (`docs/REPORTING_CONTRACT.md`): `origin: auto`
+on a workflow document and `dispatch` in `tickets[].addedBy`, mirrored in
+`adapters/teamflow/schema.py` and `src/types.ts`. The board draws an `auto`
+run as unplanned — real nodes, unknown edges — until `depends` levels it.
+
 ## What does this tool actually send?
 
 `agent_id` is documented on `SubagentStart` and `SubagentStop` and on tool
@@ -710,6 +792,140 @@ node plugin/scripts/runtime-report.mjs \
 ```
 
 The reporter posts `{ "kind": "runtime", "slot": "audit-dev", "payload": ... }` to the service, signing in per job when it runs in GitHub Actions. `--tenant` is legacy and applies only to the S3 transport. Background reporter failure always exits successfully so observability cannot break delivery.
+
+### A gate's start and finish, from CI
+
+A sidecar written once as `running` and never rewritten was the live board's deploy gate for 41 hours (MACLEOD-639). So a sidecar carries a lifecycle: `startedAt` is what its deadline is measured from, `endedAt` is what closes it, and `url` is a link to the run itself — the customer's own CI page, never its output (https, one line, at most 512 characters, or the report is refused with a sentence). `runtime-report.mjs` takes `--started <iso>`, `--ended [<iso>]` and `--url <https>`; a `running` report is started now unless told otherwise, and any terminal status is ended now unless told otherwise.
+
+`teamflow ci` is the two lines a workflow author writes. `start` writes the gate as running with the runner's own link, `end` or `fail` closes it with the same id and the start's clock, and the gate id is any string your pipeline uses — `deploy`, `test`, `sonar`, `smoke-eu` — landing in the slot its family suggests:
+
+```yaml
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write          # the reporter trades this for a one-hour token; no secret
+    env:
+      TEAMFLOW_JIRA_KEY: ${{ github.event.inputs.jira }}
+    steps:
+      - uses: actions/checkout@v4
+      - run: npx -y github:macleodlabs-ai/teamflow-plugin ci start deploy
+      - run: make deploy
+      - if: success()
+        run: npx -y github:macleodlabs-ai/teamflow-plugin ci end deploy
+      - if: failure() || cancelled()
+        run: npx -y github:macleodlabs-ai/teamflow-plugin ci fail deploy --summary "deploy step failed"
+```
+
+The terminal step runs under `always()`-shaped conditions so a cancelled or failed job still closes the gate; `.github/workflows/teamflow-runtime-example.yml` is the same shape as a whole file. A gate reported this way is external to the plugin: it is never retried by the plugin, whatever happens to it.
+
+`teamflow ci run <gate> -- <command>` is the third form, for a gate the plugin should run itself: it reports the start, runs the command, and when the command fails or gives no verdict within **twice** the gate's deadline (the command is killed then, and never at the 1× the board only draws doubtfully at) it retries it — the policy below — with every try on the sidecar as `attempts[]` and the reason it is still going as `retry`. The step exits with the command's last exit code, so it still fails when the gate does. The key is any shape the service takes: `CORE-217`, or `owner/repo#12` for a GitHub tracker.
+
+## What the plugin does when a gate fails or goes quiet
+
+The owner's rule: a started gate with no finish past its deadline is "no verdict", never "running forever"; and it is up to the plugin to fix and re-run a gate, while a person is only told there is a delay, and why. Deadlines are deploy 30 min, CI and test 2 h, audit 1 h, per gate family, overridable per organisation under `delivery.gate_deadlines` (minutes, by slot or family; the same numbers the service serves in the bundle). The board draws a running gate as doubtful at 1× its deadline; the plugin writes it closed (`idle`, "no verdict for N") at 2×, and never before, so a deploy that takes 45 minutes is amber at 30 and nothing is written until 60. The 2× lives inside the one derivation (`gateStatuses` in `workflow.mjs`), so the verdict and the revisit cannot disagree and a gate cannot take turns between answers.
+
+Before it gives up, the plugin retries. The policy is one pure function, `decide()` in `selfheal.mjs`, and it says one of three things about a gate: re-run it (which attempt, when), it is delayed (why), or nothing. Three attempts by default (`delivery.retry.attempts`, or the bundle's `adapter.delivery.retry`):
+
+- A **failed** gate is re-run at once — during a `/teamflow:build` run that means the agent fixes it and puts the ticket back at the gate, and the running verdict it writes carries `retry {attempt 2, of 3}`. After the last attempt, or when the rework loop reaches sixteen, the gate is `failed` with `retry.status: delayed`, the reason and `notifiedAt`, and the run is `stalled` at that gate.
+- A **silent** gate is given 1× its deadline, then 2×, then 4× — each attempt's window doubles — and re-run by the orchestrator on the next phase tick (`teamflow workflow ticket`, any ticket) and at session start, with a fresh clock. After the last window it is a delay, the same way.
+- A **stalled run whose blocking gate later reports** — a deploy that finally answers, a CI job that finishes — resumes by itself at the next session start or `teamflow status`: the ticket moves past the gate (or into rework if the verdict was a failure), the run is running again, and one `hygiene[]` row on the run says `resumed after deploy gate verdict`.
+
+What a person sees is the plugin's own state in its own words: the session-start line reads `TeamFlow: deploy gate on MACLEOD-573 delayed · 3 attempts · deploy command exited 1` or `TeamFlow: resumed plan Onboarding hardening after the deploy gate verdict on MACLEOD-573`, and nothing when there is nothing to say. It never contains anybody's request and never a command for the reader to run; nothing is queued for anybody's next session.
+
+### What a lead can ask the plugin to do
+
+A lead watching the board can still act — from the dashboard, as a named intent the service holds for the machine that has the ticket. At every hook round, at session start and in `teamflow status` the plugin asks `GET /v1/members/actions?for=<machineId>`, performs each action it can, answers each with an outcome (`done`, `refused` or `failed`) and its own sentence of at most 120 characters, and never repeats one. Five kinds, and nothing else is an action:
+
+| Kind | What the plugin does |
+| --- | --- |
+| `fix` | Shows the text (≤ 500 characters) to the agent as `Fix from Steve, 10:12: …`, in the person's name, as guidance. Never executed, never passed to a shell, never authority over the session's rules. |
+| `bump` | Restarts the retry policy for the stalled gate on that key now, not at its deadline. |
+| `rerun_gate` | Runs the gate again when this machine knows how: a command configured under `delivery.gate_commands` **in your own `~/.config/teamflow/config.json`** (an argv array, or one string split on whitespace; never text from the action, and never from a `.teamflow.json` inside a clone — `delivery` is ignored there), through `teamflow ci run` in the background, reported `done` once the process has started. Only the run's own gates (`test`, `audit`, `deploy`): an external gate such as SonarQube is refused — the plugin never retries what it did not run. Refused with the reason when no command is configured, and `deploy runs only from the main session` from a worktree. |
+| `resume_plan` | Puts the run back to running and tells the session which phase is ready. |
+| `skip_gate` | Passes the ticket over the gate in the person's name: the gate reads `idle` with `skipped by Steve: flaky suite, verified by hand` — never `success`, which only a run earns — and the run records a `hygiene[]` row saying who. A reason is required; only ever from the service, after its own authority check. |
+
+An action for a ticket no session on this machine is on waits, and the next session bound to that ticket — on any of the developer's machines the service chooses — is shown it first, from the machine's own ledger. Each action is written to that ledger as taken *before* it is performed, so a hook killed halfway never runs a re-run twice. What the ticket's report carries is `actions[] {id, kind, by, at, outcome, reason}`: outcomes and the plugin's sentence, never the action's text. `teamflow config set intake off` makes this machine perform nothing and answer every action `refused: intake off on this machine`, so the lead learns why; `on` (the default) turns it back. The round runs on the async hook path (`Stop`) and in `teamflow status`, never at session start, which does no network at all and only prints what the last round left for it; every call in a round shares one budget, so a service that does not answer costs a round its budget once and never a hook that hangs.
+## External gates: SonarQube
+
+The columns of the delivery flow are gates in a pipeline (MACLEOD-639). An
+organisation on the Growth plan or above can make an external system one of
+them, and SonarQube is the first. It reports the way a CI job does — as a
+runtime sidecar, in a `sonarqube` slot of its own that only the webhook can
+write — but nothing runs on your machine: SonarQube posts its own webhook to
+TeamFlow at the end of every analysis, signed with a secret you paste once.
+
+What lands on the board is the quality gate's verdict for the ticket the
+analysed branch belongs to: `success` when the gate passed, `failed` with the
+failing conditions as metric names and numbers (`new_coverage 63.2 < 80`),
+`idle` when the project has no quality gate. No finding, no rule text, no file
+name and no line of code leave SonarQube for TeamFlow.
+
+### Connecting SonarQube
+
+1. **Make the connection.** It is a paste-connect like a Jira webhook
+   (docs/TRACKERS.md, appendix), with the provider `sonarqube` and, if you
+   want only one SonarQube project, its key as the filter. Until the members
+   page offers the button, an owner does it with the dashboard's access token:
+
+   ```bash
+   curl -X POST https://codercat.io/v1/members/trackers \
+     -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+     -d '{"provider": "sonarqube", "filter": "my-service"}'
+   ```
+
+   The answer carries the webhook `url` and the `secret`, **shown once**.
+
+2. **Create the webhook in SonarQube.** Project Settings → Webhooks →
+   Create (or Administration → Configuration → Webhooks for every project):
+
+   | Field | What to put in it |
+   | --- | --- |
+   | Name | `TeamFlow` |
+   | URL | the `url` TeamFlow answered with |
+   | Secret | the `secret` TeamFlow answered with |
+
+   SonarQube signs every delivery with `X-Sonar-Webhook-HMAC-SHA256` over the
+   body using that secret; a delivery that does not verify is refused and the
+   connection's last error says so.
+
+3. **Name the ticket.** SonarQube tells TeamFlow the analysed branch, and a
+   branch named `feature/ACME-42-rate-limit` is ACME-42 by the same rule the
+   plugin binds a branch with. A pull request analysis names the pull
+   request's number and not its branch, so it cannot be attributed from the
+   payload alone; pass the key or the branch to the scanner instead, and it
+   is read first whether the analysis is a branch or a pull request:
+
+   ```bash
+   sonar-scanner -Dsonar.analysis.teamflow.key="$GITHUB_HEAD_REF"
+   ```
+
+   An analysis that names no ticket is accepted and ignored, so `main` never
+   puts a card on the board; and a branch that looks like a key nobody in
+   your organisation uses (`next-15`) is accepted and not written, by the
+   same rule that keeps a Dependabot pull request off the board.
+
+4. **Give it a column.** An owner adds an external gate to the
+   organisation's pipeline (`PUT /v1/members/pipeline`, Growth and above):
+
+   ```json
+   {"id": "quality", "label": "SonarQube", "stages": [], "kind": "external",
+    "rework": true, "deadlineMin": 60,
+    "external": {"system": "sonarqube", "project": "my-service"}}
+   ```
+
+   With the gate in place the verdict is drawn in that column; without one it
+   is drawn at Local Audit under the gate id `sonarqube`, so the connection
+   works before the pipeline is edited. `project` is optional: a gate that
+   names one matches only that SonarQube project, a gate that names none
+   matches every project on the connection.
+
+SonarQube fires once, when the analysis finishes, so the sidecar carries
+`endedAt` and never a `startedAt` it did not see. A start/finish/error system
+that does have a start — a CI reporter — writes both through
+`plugin/scripts/runtime-report.mjs`, and a gate that started and never
+finished is "no verdict" past its deadline on the board.
 
 ## Reporting by hand
 

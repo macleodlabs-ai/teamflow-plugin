@@ -40,6 +40,60 @@ const home = () => process.env.HOME || os.homedir();
 export const GIT_BEGIN = '# BEGIN teamflow';
 export const GIT_END = '# END teamflow';
 
+// --- the rule, in the project's own instructions (MACLEOD-639) ---------
+//
+// The owner's ruling: every plan and every dispatched agent is on the
+// board, always, and the plugin says so in CLAUDE.md so no orchestrator
+// has to remember. Its own markers, distinct from the skills block, so
+// an AGENTS.md that carries both keeps both. Written between markers
+// and replaced in place: nothing of the user's above or below moves.
+export const RULE_BEGIN = '<!-- BEGIN teamflow workflow -->';
+export const RULE_END = '<!-- END teamflow workflow -->';
+
+export const WORKFLOW_RULE = `## TeamFlow: every plan and every dispatched agent is on the board
+
+Before any agent or team is dispatched, the run exists on the board and each
+piece of work is a node in it. In Claude Code the command is
+\`node "\${CLAUDE_PLUGIN_ROOT}/scripts/cli.mjs"\`; elsewhere it is \`teamflow\`.
+
+1. \`teamflow workflow create "<name>"\` (or \`/teamflow:build\`) — one run per plan.
+2. \`teamflow workflow plan --keys A,B,C\` or \`teamflow workflow add <KEY>\` for every
+   ticket; \`teamflow adhoc start "<what the work is>"\` for work that has none.
+3. \`teamflow workflow depends <KEY> --on <KEY> --reason "<why>"\` for each edge, so the
+   board shows the phases.
+4. \`teamflow workflow ticket <KEY> --state running|done|rework\` as each one moves.
+
+If a session dispatches agents without doing this, the TeamFlow plugin does it:
+it creates a run marked as auto-created, mints an ad hoc node for each agent
+sent to a worktree (titled from the agent's name and description, never its
+prompt), and binds the agent to it. \`teamflow status\` then reads
+"N agents dispatched, 0 unrepresented", and the auto-created run still wants
+\`depends\` before the board can draw its phases.`;
+
+/**
+ * Put the rule in the project's instructions, idempotently.
+ *
+ * `file` defaults to CLAUDE.md. With `onlyExisting` the file is never
+ * created -- that is the SessionStart hook's contract, which writes only
+ * into a CLAUDE.md the project already keeps -- and an unchanged block
+ * is not rewritten, so a second call changes nothing.
+ */
+export function installWorkflowRule({ root = process.cwd(), file, onlyExisting = false, written = [] } = {}) {
+  const target = file || path.join(root, 'CLAUDE.md');
+  if (onlyExisting && !fs.existsSync(target)) {
+    written.push({ file: target, action: 'absent' });
+    return written;
+  }
+  writeBlock(target, WORKFLOW_RULE, written, { begin: RULE_BEGIN, end: RULE_END });
+  return written;
+}
+
+/** Take the rule back out. Only what install put there goes. */
+export function uninstallWorkflowRule({ root = process.cwd(), file, written = [] } = {}) {
+  removeBlock(file || path.join(root, 'CLAUDE.md'), written, { begin: RULE_BEGIN, end: RULE_END });
+  return written;
+}
+
 // The three moments a repository knows about without any agent at all.
 // Each maps to a stage through the same classifier every other hook
 // uses; see adapters.mjs.
@@ -129,6 +183,13 @@ export function installGitHooks({ root = process.cwd(), dryRun = false } = {}) {
       header: '#!/bin/sh',
       mode: 0o755,
     });
+  }
+  // And the rule (MACLEOD-639), into the instructions file the repository
+  // keeps: CLAUDE.md when there is one, else AGENTS.md, which every other
+  // agent tool reads.
+  if (!dryRun) {
+    const claude = path.join(root, 'CLAUDE.md');
+    installWorkflowRule({ root, file: fs.existsSync(claude) ? claude : path.join(root, 'AGENTS.md'), written });
   }
   return { scope: 'git', dir, written, covers: Object.values(GIT_HOOKS).map((h) => h.covers) };
 }

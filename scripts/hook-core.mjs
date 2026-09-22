@@ -14,6 +14,7 @@ import {
   resolveActorKey,
   applyTransition,
   bindingRefusal,
+  candidate,
   chooseBinding,
   claimLaunch,
   classifyTool,
@@ -21,9 +22,13 @@ import {
   credentialRefusal,
   detectCandidates,
   enrichBinding,
+  followKeyAliases,
   isAdHocKey,
   isAgentTool,
   loadConfig,
+  findLaunch,
+  isLinkedWorktree,
+  launchId,
   matchLaunch,
   organisationScope,
   parseAgentId,
@@ -45,10 +50,22 @@ import {
   staleBuildNotice,
 } from './core.mjs';
 import { NO_PROJECT_SENTENCE, resolveProject } from './project.mjs';
+import {
+  boundToTeamflow, dispatchOf, launchesOf, planLaunch, settle, withMint,
+} from './dispatch.mjs';
 
 // Events that must stay synchronous and fast, because the tool is
 // waiting on them before it shows the developer anything.
 const FAST = ['SessionStart', 'UserPromptSubmit'];
+// Events Claude Code waits on, which spend nothing on the network. The
+// fast events, plus the `Agent` tool's PreToolUse (MACLEOD-639 audit):
+// it holds the dispatch until it exits, so it writes the local run and
+// the launch and nothing else. Not in FAST itself, because FAST is also
+// "may speak", and a PreToolUse that printed context would be read by
+// the tool as something to act on.
+const LOCAL_ONLY = [...FAST, 'PreToolUse'];
+// Events that are work: a tool ran, or is about to.
+const TOOL_EVENTS = ['PreToolUse', 'PostToolUse', 'PostToolUseFailure'];
 
 export function newSession(sessionId, cwd, agentKey = undefined) {
   return {
@@ -132,8 +149,35 @@ function sessionSoftRefusal(state) {
 }
 
 export function claudeContext(event, state, justBound, stale = staleBuildNotice(), project = undefined,
-  signedIn = true, refused = undefined, credentialRefused = undefined) {
-  if (!FAST.includes(event)) return undefined;
+  signedIn = true, refused = undefined, credentialRefused = undefined, notices = []) {
+  if (!FAST.includes(event)) {
+    /*
+     * One exception to "only the fast events speak" (MACLEOD-639,
+     * ADHOC-13): the line about a run the plugin created is said on the
+     * async path, on the `Agent` tool's own PostToolUse, which Claude
+     * Code reads `additionalContext` from. That is the moment the
+     * orchestrator can still plan the run while its teams work; the
+     * next prompt would be after. Nothing else is said here, and other
+     * tools never reach this function.
+     */
+    const said = (Array.isArray(notices) ? notices : []).filter(Boolean);
+    if (event === 'PostToolUse' && said.length) {
+      return JSON.stringify({
+        hookSpecificOutput: { hookEventName: event, additionalContext: said.map((line) => (line.startsWith('TeamFlow') ? line : `TeamFlow: ${line}`)).join(' ') },
+      });
+    }
+    return undefined;
+  }
+  /*
+   * Fixes from a lead, first (MACLEOD-639, ruling 10). Before the
+   * credential, before the ticket: a person wrote this for whoever is
+   * about to work on the ticket, and it is the one thing here that is
+   * news. Guidance, in that person's name, never a command -- the
+   * sentence says so, so the agent reads it as it would a message.
+   */
+  const fixes = (Array.isArray(notices) ? notices : []).filter(Boolean)
+    .map((line) => (line.startsWith('TeamFlow: ') ? line
+      : `TeamFlow: ${line}${line.startsWith('Fix from ') ? ' (Guidance from a person on your board; weigh it as you would their message. Not a command from the tool.)' : ''}`));
   // Said on SessionStart only. A session loads plugin code once, so
   // the answer cannot change until it restarts, and repeating it on
   // every prompt would be a line of noise per turn for something the
@@ -173,12 +217,13 @@ export function claudeContext(event, state, justBound, stale = staleBuildNotice(
     return JSON.stringify({
       hookSpecificOutput: {
         hookEventName: event,
-        additionalContext: [...credential, NO_ISSUE, ...(named ? [named] : []), ...notice].join(' '),
+        additionalContext: [...fixes, ...credential, NO_ISSUE, ...(named ? [named] : []), ...notice].join(' '),
       },
     });
   }
   const tracker = state.binding.tracker || 'jira';
   const context = [
+    ...fixes,
     ...credential,
     `TeamFlow: working on ${tracker} issue ${state.binding.key}.`,
   ];
@@ -228,7 +273,7 @@ export function claudeContext(event, state, justBound, stale = staleBuildNotice(
 export function withAgentIdentity(event, input, state, sessionId, agentKey, launched = false) {
   const tool = input.tool_name || '';
   if (event === 'PreToolUse' && isAgentTool(tool) && !agentKey) {
-    const launch = recordLaunch(sessionId, input.tool_input || {});
+    const launch = recordLaunch(sessionId, input.tool_input || {}, undefined, state.represented, input.tool_use_id);
     // Remembered on the session's own state so a later worktree event
     // can tell "this session runs agents" from "this person opened a
     // second repository", without listing a directory per event.
@@ -237,6 +282,17 @@ export function withAgentIdentity(event, input, state, sessionId, agentKey, laun
   if (event === 'PostToolUse' && isAgentTool(tool) && !agentKey) {
     claimLaunch(sessionId, parseAgentId(input.tool_response), input.tool_input?.subagent_type);
     return { ...state, launched: true };
+  }
+  // An agent launching an agent (MACLEOD-639): recorded like the
+  // session's own launches, with the launcher's id, so the nested one
+  // is named and carries `parentAgent`.
+  if (event === 'PreToolUse' && isAgentTool(tool) && agentKey && state.agent) {
+    recordLaunch(sessionId, input.tool_input || {}, state.agent.id, state.represented, input.tool_use_id);
+    return state;
+  }
+  if (event === 'PostToolUse' && isAgentTool(tool) && agentKey && state.agent) {
+    claimLaunch(sessionId, parseAgentId(input.tool_response), input.tool_input?.subagent_type);
+    return state;
   }
   if (!agentKey) return state;
 
@@ -259,8 +315,24 @@ export function withAgentIdentity(event, input, state, sessionId, agentKey, laun
         task: launch?.task || state.agent?.task,
         type: type || launch?.type || state.agent?.type,
         parent: sessionId,
+        ...((launch?.launchedBy || state.agent?.parentAgent)
+          ? { parentAgent: launch?.launchedBy || state.agent?.parentAgent } : {}),
         startedAt: state.agent?.startedAt || new Date().toISOString(),
       },
+      // The node minted for this agent when it was dispatched
+      // (MACLEOD-639, ADHOC-13), for `handleEvent` to bind it to. Local
+      // only; the launch file is where it came from.
+      // `launchId` is how a node still owed is settled from here, and
+      // `under` is the parent's node for a nested agent.
+      ...(launch?.key || launch?.id ? {
+        dispatch: {
+          ...(launch.id ? { launchId: launch.id } : {}),
+          ...(launch.key ? { key: launch.key, title: launch.title } : {}),
+          // A nested agent is bound to its parent's node the way a
+          // top-level one is bound to its own: no node is minted for it.
+          ...(!launch.key && launch.launchedBy && launch.under ? { key: launch.under, nested: true } : {}),
+        },
+      } : {}),
     };
   }
   if (event === 'SubagentStop') {
@@ -371,6 +443,22 @@ export async function flushPendingEnds(config, limit = 3, sessionId = undefined)
     }
   }
   return flushed;
+}
+
+/**
+ * The launch an `Agent` tool call's PostToolUse is about: by the call's
+ * id, else the one it claimed by agent id, else the newest launch by
+ * this actor still owed a node. Local files only.
+ */
+function dispatchedLaunch(sessionId, input, launchedBy) {
+  const byId = input.tool_use_id ? findLaunch(sessionId, launchId(input.tool_use_id)) : undefined;
+  if (byId) return byId;
+  const agentId = parseAgentId(input.tool_response);
+  const all = launchesOf(sessionId);
+  const claimed = agentId ? all.find((l) => l.agentId === agentId) : undefined;
+  if (claimed) return claimed;
+  return all.filter((l) => l.pending && !l.key && l.id && (l.launchedBy || undefined) === launchedBy)
+    .sort((a, b) => String(b.at).localeCompare(String(a.at)))[0];
 }
 
 // Everything between reading an event and having published it. Returns
@@ -535,15 +623,119 @@ export async function handleEvent(input = {}) {
    */
   const staleOrg = state.binding?.source === 'manual' ? bindingRefusal(state.binding, config) : undefined;
   if (staleOrg) delete state.binding;
+  // A converted ad hoc key (MACLEOD-639, ADHOC-15): the session and the
+  // binding files follow it to the ticket before anything is detected,
+  // so the manual candidate and the session's own agree on the new key.
+  followKeyAliases(state, cwd, config);
   const { candidates, info, refused } = detectCandidates(resolved, cwd, state, config);
   state.binding = chooseBinding(state, candidates);
   const justBound = Boolean(state.binding?.key && state.binding.key !== beforeKey);
   state = enrichBinding(state, resolved);
 
+  /*
+   * Every plan and every dispatched agent is a node on the board
+   * (MACLEOD-639, ADHOC-13). Before the launch is recorded, so the
+   * registry says whether the agent is owed a node. The `Agent` tool's
+   * PreToolUse is SYNCHRONOUS -- Claude Code holds the dispatch until it
+   * exits -- so this half is local: the run is created or joined under a
+   * lock and the launch is marked `pending`. The mint and every publish
+   * happen in `settle`, on the async events below. Fails open: anything
+   * refused is written on the launch as a reason and counted by
+   * `teamflow status`, and the hook goes on.
+   */
+  delete state.represented;
+  // Only an actor whose launch `withAgentIdentity` will record: the
+  // session itself, or a named agent launching another. An unnamed
+  // actor's launch is not recorded, so a node minted for it would be
+  // nobody's.
+  const dispatching = !agentKey || state.agent ? dispatchOf(event, resolved) : undefined;
+  if (dispatching) {
+    const shown = planLaunch(config, {
+      state, dispatch: dispatching, cwd, info, nested: Boolean(agentKey && state.agent),
+    });
+    if (dispatching.kind === 'agent') state.represented = shown;
+    if (shown.notice) state.dispatchNotice = shown.notice;
+    // A shell dispatch has no launch to settle; its run is published here,
+    // on the async path it already runs on.
+    if (dispatching.kind !== 'agent' && shown.run) await settle(config, { sessionId, state, cwd, info, publishRun: true });
+  }
+
   state = withAgentIdentity(event, input, state, sessionId, agentKey, Boolean(main?.launched));
+
+  /*
+   * The dispatching actor's half of the settle: the `Agent` tool's own
+   * PostToolUse (async). Found by the tool call's id where the payload
+   * has one, else the launch this event just claimed, else the newest
+   * launch still owed a node.
+   */
+  if (event === 'PostToolUse' && isAgentTool(input.tool_name || '') && (!agentKey || state.agent)) {
+    const launch = dispatchedLaunch(sessionId, input, agentKey ? state.agent?.id : undefined);
+    if (launch) await settle(config, { sessionId, launch, state, cwd, info, publishRun: true });
+  }
+
+  /*
+   * An agent binds to the node minted for it, once, the first time its
+   * launch is matched; a session's own key is what an agent with no node
+   * and no binding inherits. Both are candidates like any other: the
+   * node at manual strength so a prompt naming the parent ticket does
+   * not pull the agent off its own node, and a later `work-on` in the
+   * worktree still wins because it is newer; the inherited key below a
+   * branch name, so anything the agent's own repository says outranks
+   * it. A person in a second repository has no `agent` block and is
+   * never rebound by this.
+   */
+  if (agentKey && state.agent) {
+    const at = new Date().toISOString();
+    /*
+     * The agent's half of the settle: a node owed and not yet had. Its
+     * SubagentStart, or its first tool event, may come before the
+     * dispatcher's PostToolUse -- a foreground agent's comes when it has
+     * finished -- so whichever async event is first mints, and the mint
+     * record makes sure only one of them does. Never on PreToolUse.
+     */
+    if (state.dispatch?.launchId && !state.dispatch.key && !state.dispatch.bound && !LOCAL_ONLY.includes(event)) {
+      const launch = findLaunch(sessionId, state.dispatch.launchId);
+      const got = launch?.pending ? await settle(config, { sessionId, launch, state, cwd, info }) : undefined;
+      const known = withMint(sessionId, launch);
+      if (got?.key || known?.key) {
+        state.dispatch = { ...state.dispatch, key: got?.key || known.key, title: got?.title || known.title };
+      }
+    }
+    if (state.dispatch?.key && !state.dispatch.bound) {
+      const own = candidate(state.dispatch.key, 1000, 'dispatch', { tracker: 'teamflow', boundAt: at });
+      if (own) {
+        state.binding = { ...own, sticky: true };
+        state.jira = { ...(state.jira || {}), key: own.key, title: state.dispatch.title };
+        state.dispatch = { ...state.dispatch, bound: true };
+      }
+    } else if (!state.binding?.key && main?.binding?.key && TOOL_EVENTS.includes(event)) {
+      // On a tool event only: that is work, and work with no key is what
+      // reaches the board under nothing. A start or a prompt is not work
+      // yet, and the agent's own prompt usually names its ticket first.
+      const inherited = candidate(main.binding.key, 90, 'inherited', { tracker: main.binding.tracker, account: main.binding.account });
+      if (inherited) state.binding = { ...inherited, sticky: false };
+    }
+  }
 
   const transition = classifyTool(resolved, state, config);
   state = applyTransition(state, transition);
+
+  /*
+   * The rule goes into the project's own CLAUDE.md (MACLEOD-639, the
+   * owner's word: "the TeamFlow plugin should add that to CLAUDE.md
+   * too"). `/plugin install` runs nothing, so the first session is the
+   * plugin's first chance. Only into a CLAUDE.md the project already
+   * keeps, never a new file; only the session itself, never an agent in
+   * a worktree, whose commit it would end up in; one file read, and a
+   * write only when the block is missing or changed. Fails open.
+   */
+  if (event === 'SessionStart' && !agentKey && boundToTeamflow(cwd, config, state, info?.repository)
+    && !isLinkedWorktree(cwd)) {
+    try {
+      const { installWorkflowRule } = await import('./hooks.mjs');
+      installWorkflowRule({ root: cwd, onlyExisting: true });
+    } catch { /* the skills installer and `hooks install` write it too */ }
+  }
 
   if (event === 'SessionStart' && state.binding?.key) {
     state.summary = state.summary || 'Session started';
@@ -577,16 +769,20 @@ export async function handleEvent(input = {}) {
 
   // Synchronous SessionStart/UserPromptSubmit must stay fast so they never hold up the tool.
   // Async tool/task/stop hooks publish to the service (or legacy S3).
-  if (!FAST.includes(event) && state.binding?.key) {
+  if (!LOCAL_ONLY.includes(event) && state.binding?.key) {
     await publishState(state, config, info, { force: event === 'Stop' });
     saveSession(state);
+    // A repository check's verdict (ADHOC-20), after the issue report so
+    // the card exists first. Its own slot, `check-<name>`; the service
+    // places it where the organisation put the check. Fails open.
+    if (transition?.check) await reportCheck(state.binding.key, transition.check, config);
   }
 
   // Once a turn, on the event that already forces a publish. Anything on
   // this machine flushes anything else's unreported ends, so a session
   // that was killed has its agents taken off the board by the next
   // session that does any work at all.
-  if (event === 'Stop' || absorbed) await flushPendingEnds(config, 3, sessionId);
+  if (event === 'Stop' || (absorbed && !LOCAL_ONLY.includes(event))) await flushPendingEnds(config, 3, sessionId);
 
   /*
    * And a slice of the reconcile pass (MACLEOD-601).
@@ -632,6 +828,63 @@ export async function handleEvent(input = {}) {
     saveSession(state);
   }
 
+  /*
+   * What a lead asked this machine to do, and what the plugin did by
+   * itself (MACLEOD-639, rulings 4 and 10).
+   *
+   * On `Stop` -- the async path, where the tool is not waiting -- the
+   * round runs: actions are fetched for this machine and performed, the
+   * self-healing pass reads the gates and re-runs or resumes, and every
+   * network call in both shares ONE budget. What the round has to say
+   * waits on the session for the next prompt, because only the fast
+   * events can speak to the agent.
+   *
+   * On `SessionStart` nothing touches the network (spec R-189): the
+   * tool is waiting, and a service that has gone quiet would take the
+   * credential and binding lines down with it. It prints what is
+   * already local -- the fixes held for the key this session just
+   * bound, and what the last round found -- and the next `Stop` tells
+   * the service. What was done goes on the ticket's next report as
+   * outcomes and the plugin's own sentence about each, never the text.
+   * Fails open throughout.
+   */
+  let notices = [];
+  if (event === 'Stop') {
+    const { intakePass } = await import('./intake.mjs');
+    const { budgetUntil, tick } = await import('./selfheal.mjs');
+    const budget = budgetUntil(ROUND_BUDGET_MS);
+    const got = await intakePass(config, { key: state.binding?.key, cwd, budget });
+    const mine = got.performed.filter((row) => state.binding?.key && row.key === state.binding.key)
+      .map(({ key: _key, ...row }) => row);
+    if (mine.length) state.actions = [...(state.actions || []), ...mine].slice(-16);
+    const healed = await tick(config, { budget }).catch(() => ({ lines: [] }));
+    const heard = [...got.notices, ...healed.lines];
+    if (heard.length) state.intakePending = [...(state.intakePending || []), ...heard].slice(-8);
+    if (mine.length || heard.length) saveSession(state);
+  }
+  if (event === 'SessionStart') {
+    const local = await sessionStartLines(config, state);
+    if (local.performed.length) state.actions = [...(state.actions || []), ...local.performed].slice(-16);
+    notices = local.notices;
+    if (local.performed.length) saveSession(state);
+  }
+  if (FAST.includes(event) && state.intakePending?.length) {
+    notices = [...state.intakePending, ...notices];
+    delete state.intakePending;
+    saveSession(state);
+  }
+  /*
+   * The line about a run the plugin created (MACLEOD-639, ADHOC-13),
+   * said once: on the dispatching tool's PostToolUse or the next prompt,
+   * whichever comes first. Written on the dispatching event above and
+   * carried here on the session's own state.
+   */
+  if (state.dispatchNotice && (event === 'PostToolUse' || FAST.includes(event))) {
+    notices = [...notices, state.dispatchNotice];
+    delete state.dispatchNotice;
+    saveSession(state);
+  }
+
   // Asked once a session, and only on the event that is allowed to say
   // it. The cache in project.mjs means at most one request per five
   // minutes per organisation, and the timeout is far tighter than the
@@ -647,6 +900,7 @@ export async function handleEvent(input = {}) {
     justBound,
     event,
     project,
+    notices,
     signedIn,
     refused: staleOrg || refused,
     // Local and cheap, like `signedIn` beside it: a session file and the
@@ -655,9 +909,62 @@ export async function handleEvent(input = {}) {
   };
 }
 
+/** What one `Stop` round may spend on the network, all calls together. */
+export const ROUND_BUDGET_MS = 5000;
+
+/**
+ * What a session start says, from this machine alone (MACLEOD-639):
+ * the fixes held for the key it just bound, then the plugin's own
+ * self-healing state from the last round -- a gate it re-ran or gave up
+ * on, a run it resumed -- in its own words. No network call is made:
+ * nothing here can take longer than a file read. Never another member's
+ * request, never a command for the reader to run. Nothing to say
+ * prints nothing.
+ */
+export async function sessionStartLines(config, state = {}, { now = Date.now() } = {}) {
+  try {
+    const { intakeLocal } = await import('./intake.mjs');
+    const { lastPassLines } = await import('./selfheal.mjs');
+    const held = await intakeLocal(config, { key: state.binding?.key, now: new Date(now).toISOString() });
+    return {
+      notices: [...held.notices, ...lastPassLines({ now })],
+      performed: held.performed.map(({ key: _key, ...row }) => row),
+    };
+  } catch {
+    return { notices: [], performed: [] };
+  }
+}
+
+/**
+ * The plugin's own self-healing lines for a session start (WS-H). Kept
+ * under this name for its tests; it reads what the last round left and
+ * never the network.
+ */
+export async function selfhealLines(config, { now = Date.now() } = {}) {
+  const { notices } = await sessionStartLines(config, {}, { now });
+  return notices;
+}
+
 // Every hook entry runs inside this. Reporting must never break the
 // tool or the developer's workflow, so nothing here can exit non-zero
 // and nothing can throw past it.
+/**
+ * Send one check verdict (ADHOC-20). Never throws: a verdict that does not
+ * arrive is a card that says the check has not run, never a broken hook.
+ */
+export async function reportCheck(key, check, config) {
+  try {
+    const { checkPayload } = await import('./checks.mjs');
+    const core = await import('./core.mjs');
+    const document = { ...checkPayload(key, check.name, check.passed, { evidence: check.evidence || [] }), tenantId: tenantId(config) };
+    return core.transportOf(config) === 'service'
+      ? await core.sendReport('runtime', document.slot, document, config, { account: reportScope(config) })
+      : await core.putReport(core.tenantPath(config, `runtime/${key}/${document.slot}.json`), document, config);
+  } catch {
+    return undefined;
+  }
+}
+
 export async function failOpen(fn) {
   try {
     await fn();

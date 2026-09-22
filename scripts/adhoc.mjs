@@ -33,12 +33,15 @@ import {
   credential,
   credentialKind,
   dataDirWritable,
+  followKeyAliases,
   isAdHocKey,
   issuePayload,
   latestSessionForCwd,
   localBindingPath,
   organisationScope,
   publishState,
+  readWorkflows,
+  recordKeyAlias,
   reportScope,
   readJson,
   readUserBinding,
@@ -52,6 +55,7 @@ import {
   userBindingPaths,
   writeJson,
   writeLocalBinding,
+  writeWorkflows,
 } from './core.mjs';
 import { refusalOf } from './refusal.mjs';
 
@@ -86,7 +90,19 @@ export const USAGE = `teamflow adhoc — work that arrived without a ticket
 
   teamflow adhoc done [--summary <what was delivered>]
       Mark the bound ad hoc item done and unbind. An ad hoc item never
-      reopens; the next request is a new item.`;
+      reopens; the next request is a new item.
+
+  teamflow adhoc convert [<ADHOC-n>] --project <project>
+      Turn the item (the bound one when none is named) into a ticket in
+      the organisation's tracker, in the state its gate maps to. The
+      card becomes the ticket everywhere, with its history, and later
+      reports from this project land on the ticket.
+
+  teamflow adhoc convert [<ADHOC-n>] --to <KEY> [--merge]
+      Link the item to a ticket created elsewhere (a tracker MCP, by
+      hand) and do the same, without creating anything. A ticket that
+      already has its own history on the board, or that another ad hoc
+      item became, is refused unless --merge says to combine them.`;
 
 /**
  * The derived title, or a refusal.
@@ -298,6 +314,79 @@ export async function done(cwd, config = {}, info = {}, { summary, status = 'suc
 }
 
 /**
+ * One call to the service as the signed-in member. `{ ok, status, body }`
+ * or `{ ok: false, reason }`; never throws, never invents an answer.
+ */
+async function member(method, route, config = {}, body = undefined) {
+  if (!credentialKind(config)) return { ok: false, reason: 'no service credential configured; run `teamflow login`' };
+  const cred = await credential(config);
+  if (!cred) return { ok: false, reason: 'no service credential available; run `teamflow login`' };
+  try {
+    const response = await fetch(`${serviceUrl(config)}${route}`, {
+      method,
+      headers: { [cred.header]: cred.value, 'content-type': 'application/json' },
+      ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+      redirect: 'error',
+      signal: AbortSignal.timeout(Number(config.serviceTimeoutMs || 20000)),
+    });
+    let answer;
+    try { answer = await response.json(); } catch { answer = undefined; }
+    if (!response.ok) return { ok: false, status: response.status, ...refusalOf(answer, `service returned ${response.status}`) };
+    return { ok: true, status: response.status, body: answer };
+  } catch (error) {
+    return { ok: false, reason: `service unreachable: ${error instanceof Error ? error.message : String(error)}` };
+  }
+}
+
+const PROJECT_ID = /^prj-[0-9a-f]{8}$/;
+
+/** A project id, from an id or a project's name as the members page shows it. */
+export async function projectId(wanted, config = {}) {
+  const value = String(wanted ?? '').trim();
+  if (!value) return undefined;
+  if (PROJECT_ID.test(value)) return value;
+  const listed = await member('GET', '/v1/members/projects', config);
+  if (!listed.ok) throw new Error(`TeamFlow could not list this organisation's projects: ${listed.reason}`);
+  const found = (listed.body?.projects || []).find((p) => String(p.name || '').trim().toLowerCase() === value.toLowerCase());
+  if (!found) {
+    const names = (listed.body?.projects || []).map((p) => p.name).join(', ') || 'none';
+    throw new Error(`No project called "${value}" on this organisation. Its projects: ${names}.`);
+  }
+  return found.id;
+}
+
+/**
+ * The ad hoc item becomes a ticket (MACLEOD-639, ADHOC-15).
+ *
+ * `--project` asks the service to create the ticket in the org's tracker;
+ * `--to` links one created elsewhere (a tracker MCP, by hand) and creates
+ * nothing. Either way the service moves the card, renames it in every
+ * stored workflow and keeps the ADHOC key as an alias. Here, on this
+ * machine: the alias is remembered, this directory's binding follows it,
+ * and the local workflow copies are rewritten with the node renamed.
+ */
+export async function convertItem(key, { project, to, merge = false } = {}, cwd = process.cwd(), config = {}) {
+  const bound = boundAdHoc(cwd, config);
+  const wanted = String(key || bound?.jiraKey || '').trim().toUpperCase();
+  if (!isAdHocKey(wanted)) {
+    throw new Error('Usage: teamflow adhoc convert [<ADHOC-n>] --project <project> | --to <KEY>. '
+      + 'Nothing ad hoc is bound here, so name the item.');
+  }
+  if (!project && !to) throw new Error('Say where the ticket goes: --project <project>, or --to <KEY> for one created elsewhere.');
+  const body = to ? { to: String(to).trim(), ...(merge ? { merge: true } : {}) } : { project: await projectId(project, config) };
+  const sent = await member('POST', `/v1/members/cards/${encodeURIComponent(wanted)}/convert`, config, body);
+  if (!sent.ok) throw new Error(`TeamFlow did not convert ${wanted}: ${sent.reason}`);
+  const answer = sent.body || {};
+  recordKeyAlias(wanted, answer.key, config, { tracker: answer.provider });
+  const state = { binding: bound ? { key: bound.jiraKey } : undefined };
+  followKeyAliases(state, cwd, config);
+  // Read applies the alias; writing persists it, so the file itself no
+  // longer holds the ADHOC node for any older plugin to publish.
+  try { writeWorkflows(readWorkflows(config), config); } catch { /* the next read renames it anyway */ }
+  return { from: wanted, ...answer };
+}
+
+/**
  * Forget the ad hoc key, on disk and on the session.
  *
  * Synchronous and local, because the one other caller is the `Stop`
@@ -348,6 +437,18 @@ export async function main(args = [], ctx = {}) {
   if (sub === 'done') {
     const finished = await done(cwd, config, info, { summary: flagValue('summary') });
     print(`${finished.key} is done and unbound. ${sentLine(finished.sent)}`);
+    return 0;
+  }
+
+  if (sub === 'convert') {
+    // Flag values are not positional: `--project Core` names a project.
+    const values = new Set(['--project', '--to'].filter((f) => rest.includes(f)).map((f) => rest[rest.indexOf(f) + 1]));
+    const named = rest.find((a) => !a.startsWith('--') && !values.has(a));
+    const done = await convertItem(named, { project: flagValue('project'), to: flagValue('to'), merge: rest.includes('--merge') }, cwd, config);
+    const how = done.already ? 'was already' : done.created ? 'is now' : 'is linked to';
+    print(`${done.from} ${how} ${done.key}${done.url ? ` (${done.url})` : ''}.`
+      + (done.state ? ` Status: ${done.state}.` : ''));
+    print('The card, its history and every plan that held it follow the ticket; later reports land on it.');
     return 0;
   }
 

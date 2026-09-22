@@ -1,6 +1,7 @@
 // `teamflow admin ...`: the superadmin commands.
 //
-// Two of them. `code` issues invite codes; `launch` ends demo mode.
+// Three of them. `code` issues invite codes; `comp` gives an existing
+// account complimentary time; `launch` ends demo mode.
 //
 // An invite code lets an organisation sign up without paying: the
 // holder opens /signup/?code=TF-XXXX-XXXX, names the org, and the
@@ -22,11 +23,20 @@ const USAGE = `teamflow admin \u2014 operator commands, for superadmins
   teamflow admin code create --email owner@acme.com --seats 5 --days 365 [--note "Acme pilot"]
   teamflow admin code list
   teamflow admin code revoke TF-XXXX-XXXX
+  teamflow admin comp <account-id> [--days N] [--plan growth_monthly]
   teamflow admin launch [--confirm]
 
 --email is the organisation's admin. The service emails them the code and its
 redeem link, and locks the code to that address: anyone else redeeming it is
 turned away. --note is a reminder for the list, never shown to the recipient.
+
+comp gives an account that already exists complimentary time: N days from
+now (default: the service's complimentary period, at most 730). A demo account
+that is comped is no longer in demo mode, so launch passes it by. Running it
+again sets the expiry again; it never adds credits twice. An account with a
+paid subscription is refused. --plan also puts the account on that plan for
+free, after the free time is set. Use it to give a plan that is not on sale
+yet, such as growth_monthly.
 
 launch ends demo mode: every demo account loses its free credits, moves onto
 the team plan and must subscribe to carry on. Nothing else is touched -- the
@@ -236,6 +246,46 @@ async function revoke(config, code) {
   return EXIT_OK;
 }
 
+// `teamflow admin comp <account> [--days N] [--plan ID]`. Set, not
+// added: the service moves the expiry to now + days, so running it
+// twice is safe. --plan is a second call, to TeamFlow's own
+// `/plan` route (ADHOC-21): the kit's comp keeps the plan it finds, and
+// a superadmin giving an organisation Growth before Growth is on sale
+// needs the plan to change as well.
+async function comp(config, account, flags) {
+  if (!account) { fail(`Give the account id to comp.\n\n${USAGE}`); return EXIT_REFUSED; }
+  const unknown = Object.keys(flags).filter((name) => name !== 'days' && name !== 'plan');
+  if (unknown.length) { fail(`comp takes --days and --plan and nothing else\n\n${USAGE}`); return EXIT_REFUSED; }
+  if (flags.plan !== undefined && !/^[a-z0-9_]{1,64}$/.test(flags.plan)) {
+    fail('--plan takes a plan id, such as growth_monthly.');
+    return EXIT_REFUSED;
+  }
+  const payload = {};
+  if (flags.days !== undefined) {
+    const days = positiveInteger(flags.days, 'days');
+    if (days.error) { fail(days.error); return EXIT_REFUSED; }
+    payload.days = days.value;
+  }
+  const result = await adminCall(config, 'POST', `/v1/admin/accounts/${encodeURIComponent(account)}/complimentary`, payload);
+  if (!result.ok) return report(result);
+  const body = result.body;
+  line('account', body.id || account);
+  line('kind', body.plan_kind);
+  line('expires', body.expires_at_iso || (body.expires_at ? new Date(body.expires_at * 1000).toISOString() : '-'));
+  if (body.previous_plan_kind) line('was', body.previous_plan_kind);
+  if (flags.plan !== undefined) {
+    const planned = await adminCall(config, 'POST', `/v1/admin/accounts/${encodeURIComponent(account)}/plan`, { plan: flags.plan });
+    if (!planned.ok) {
+      // The free time above is already set; say both halves.
+      return report(planned.signedOut ? planned
+        : { ...planned, reason: `Free time was set. The plan was not changed: ${planned.reason}` });
+    }
+    line('plan', planned.body.plan || flags.plan);
+    if (planned.body.seats) line('seats', planned.body.seats);
+  }
+  return EXIT_OK;
+}
+
 // `teamflow admin launch`. The only command here that destroys
 // anything, so it is a dry run unless it is told otherwise: typing it
 // to see what it would do must not be the thing that does it.
@@ -268,7 +318,7 @@ export async function main(args, config = {}) {
     out(USAGE);
     return EXIT_OK;
   }
-  if (group !== 'code' && group !== 'launch') {
+  if (group !== 'code' && group !== 'launch' && group !== 'comp') {
     fail(`Unknown admin command: ${[group, action].filter(Boolean).join(' ') || '(none)'}\n\n${USAGE}`);
     return EXIT_REFUSED;
   }
@@ -282,6 +332,12 @@ export async function main(args, config = {}) {
       return EXIT_REFUSED;
     }
     return launch(config, { confirm: words.length > 0 });
+  }
+  if (group === 'comp') {
+    const parsed = parseFlags([action, ...rest].filter((word) => word !== undefined));
+    if (parsed.error) { fail(`${parsed.error}\n\n${USAGE}`); return EXIT_REFUSED; }
+    if (parsed.positional.length > 1) { fail(`comp takes one account id\n\n${USAGE}`); return EXIT_REFUSED; }
+    return comp(config, parsed.positional[0], parsed.flags);
   }
   const parsed = parseFlags(rest);
   if (parsed.error) { fail(`${parsed.error}\n\n${USAGE}`); return EXIT_REFUSED; }

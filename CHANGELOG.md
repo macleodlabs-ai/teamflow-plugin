@@ -3,6 +3,96 @@
 What changed in each published version of the TeamFlow plugin, newest first.
 Only what a person using it would notice.
 
+## 0.3.27
+
+- **Every problem on the board arrives with its fix, and the fix goes to
+  the developer.** An Attention row, the card's hover and its dialog offer
+  the one action the data supports — mark a gate done, send a fix, bump a
+  retry, re-run or skip a gate, resume a plan, snooze, ping or escalate —
+  and the service does it on your authority or hands it to the developer's
+  own plugin, which performs it and reports back. Escalate always goes to
+  the developer first; a viewer's escalate only pings them. Notes on a
+  ticket (Team plan and up) stay inside your organisation and never leave
+  in a report. Nightly at 03:00 UTC the sweep closes gates nobody answered
+  for, marks stalled plans and tidies retired stages, and every one of its
+  writes is a row in Recent Activity you can read.
+- **Every agent you dispatch is on the board, whether or not you planned a
+  run.** When a session starts an agent or a team and there is no run, the
+  plugin creates one for you — named after your ticket, marked as
+  auto-created — mints an ad hoc node for each agent sent to a worktree
+  (titled from the agent's name and one-line task; its prompt never leaves
+  the machine), binds the agent to it, and tells you once, right after the
+  dispatch: `TeamFlow created run "…"; plan it with teamflow workflow
+  depends`. `teamflow status` and `doctor` now print `N agents dispatched,
+  M unrepresented`, and M is 0. The rule is also written into your project's
+  `CLAUDE.md` between marked lines on the first session (only in a
+  repository bound to TeamFlow, only when the file already exists, and never
+  inside a git worktree), by `teamflow skills install` and by `teamflow
+  hooks install --git` (which creates `AGENTS.md` when the repository has
+  neither file). Dispatching an agent is never held up by the network: the
+  hook Claude Code waits on is local and times out at 2 s, and the node is
+  minted afterwards. Nodes are minted only in a bound repository, at most 50
+  a session, and never for an agent started by an agent.
+- **A gate cannot run for ever, and the plugin re-runs one that fails or
+  goes quiet.** A test, audit or deploy gate now carries when it started and
+  when it ended, and a link to the run. One that has had no verdict past
+  twice its deadline (deploy 30 min, CI and tests 2 h, audits 1 h; your
+  organisation can change them) is closed as "no verdict for N" instead of
+  reading "running" for days. Before that, the plugin retries it: a failed
+  gate is fixed and re-run, a silent one is started again after its
+  deadline, three attempts by default, and each attempt is on the board.
+  When the attempts are spent the gate reads delayed with the reason, the
+  plan shows `stalled` on that gate, and you are told — in the plugin's own
+  words, at the start of your next session and in `teamflow status`. A
+  plan waiting on a gate that later answers picks itself back up. Nothing
+  is ever queued for you to run.
+- **`teamflow ci start|end|fail <gate>`** is the two lines a CI workflow
+  writes to report a gate's start and finish, with the run's own link;
+  **`teamflow ci run <gate> -- <command>`** runs the command for you with
+  the same retries. `runtime-report.mjs` takes `--started`, `--ended` and
+  `--url` (https only).
+- **A lead can send your session a fix from the board.** It arrives as
+  `Fix from <name>, <time>: …` at the start of a session or in `teamflow
+  status`, as their message and never as a command; they can also bump a
+  stalled gate, re-run a gate this machine has a command for, resume a
+  plan or pass a gate with their reason. What the board records is what
+  the plugin did about each, never the text. `teamflow config set intake
+  off` turns it off for this machine.
+- **A plan is drawn as a plan, not as a person named after it.**
+- **Audited tickets no longer sit in Local Audit for days, and a card's loop
+  count means something.** `git push` of your branch and `gh pr create` now
+  move the ticket to Review saying "in review"; `git merge <branch>` from
+  another session moves the ticket the branch is named for, not the one the
+  merging session is bound to; and a bare `npm audit` no longer counts as
+  the audit gate (`npm run audit:local` and `make audit` still do). Each
+  time a gate fails the card now records which gate, when and one line
+  about why, and when it passes again the entry is marked cleared rather
+  than forgotten. The loop count is the number of loops in the current plan
+  cycle and starts again when the ticket is verified or a new build picks it
+  up, instead of climbing for ever. Every stage change is written down with
+  who made it, and an agent launched by another agent says which one.
+- **The board's columns are now a pipeline you can shape.** The ten
+  columns are gates in a pipeline: your organisation has one, every
+  project inherits it until an admin edits that project's copy, and
+  deleting the copy goes back to inheriting. Solo and Team can reorder
+  and rename the gates; Growth and above can add and remove them and
+  make an external system a gate. SonarQube is the first: connect it
+  as a webhook, and its quality gate verdict — pass, or fail with the
+  conditions that failed — appears on the ticket the analysed branch
+  belongs to. Nothing changes on a board nobody has edited.
+- **Leave a one-line note on a plan ticket.** `teamflow workflow ticket
+  <KEY> --note "audit: 1 high, fixed before merge"` puts your sentence
+  beside the ticket on the dashboard's Status view. It is one line of at
+  most 120 characters and only what you typed after `--note`;
+  `--note ""` clears it.
+- **Turn ad hoc work into a real ticket.** `teamflow adhoc convert
+  --project <project>` creates the ticket in your tracker (Linear, or GitHub
+  when the TeamFlow App may write issues), in the status the card's gate
+  maps to, and the ADHOC card becomes that ticket everywhere: its history,
+  its place in every plan and its edges come with it, and the old key still
+  finds it. `--to <KEY>` links a ticket you created elsewhere instead. A
+  session bound to the ad hoc item follows the ticket on its next hook.
+
 ## 0.3.26
 
 - **TeamFlow shows up in `/mcp`, like Linear.** The plugin now brings

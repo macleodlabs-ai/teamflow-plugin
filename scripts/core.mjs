@@ -7,6 +7,11 @@ import { spawnSync } from 'node:child_process';
 import * as auth from './auth.mjs';
 import { refusalOf } from './refusal.mjs';
 import { TOOL_CAPABILITIES } from './tools.mjs';
+import { checkNameFor, checkNames, readChecks } from './checks.mjs';
+import { advance as advancePoints, stableId } from './points.mjs';
+import {
+  countedByFile, pointFamily, readFailingTests, runnerFamily, testFile, testScope, withFamily,
+} from './failing-tests.mjs';
 
 // Jira and Linear share this key shape; the configured tracker decides how it is labelled and linked.
 // The upper bound is adapters/teamflow/schema.py's `_JIRA_KEY`, so a key the
@@ -79,7 +84,19 @@ const DEPLOY_RE = /\b(?:cdk|terraform)\s+(?:deploy|apply)\b|\b(?:mcpkit|sam)\s+d
 // reporter or by one of the deploy commands above, and by nothing a developer
 // runs to compile.
 const BUILD_RE = /\b(?:npm|pnpm|yarn|bun)\s+(?:run\s+)?build\b|\btsc\s+-b\b/i;
-const LOCAL_AUDIT_RE = /\b(?:npm|pnpm|yarn|bun)\s+(?:run\s+)?audit(?:[-_:]local)?\b|\b(?:make|just)\s+audit\b/i;
+// Never a bare `npm audit` / `npm audit fix` (MACLEOD-639): that is a
+// dependency vulnerability scan a package manager runs, not the local
+// audit gate, and matching it moved tickets into LOCAL_AUDIT that no
+// audit had been run on. The gate is the repository's own script —
+// `npm run audit:local`, `make audit` — or the command `.teamflow.json`
+// names as `localAuditPattern`.
+const LOCAL_AUDIT_RE = /\b(?:npm|pnpm|yarn|bun)\s+run\s+audit(?:[-_:]local)?\b|\b(?:make|just)\s+audit\b/i;
+// A push of the branch being worked. `git push origin main` after a
+// merge is not one, and neither is a push of somebody else's branch.
+const GIT_PUSH_RE = /\bgit\s+push\b/i;
+// The stages a push or a pull request opening moves out of. A ticket
+// already in review or beyond is not sent back to review by a second push.
+const PRE_REVIEW_STAGES = new Set(['LOCAL_DEV', 'LOCAL_TEST', 'LOCAL_AUDIT']);
 const DEV_AUDIT_RE = /\baudit[-_: ]?(?:dev|staging)\b|\b(?:dev|staging)[-_: ]?audit\b/i;
 
 /*
@@ -925,7 +942,151 @@ export function adoptWorkflow(id, config = {}, { from } = {}) {
 export function readWorkflows(config = {}) {
   const all = readJson(workflowsPath(), {}) || {};
   const mine = all[workflowScope(config)] || {};
-  return { current: mine.current || null, workflows: mine.workflows || {} };
+  const workflows = mine.workflows || {};
+  // A converted ad hoc item (MACLEOD-639, ADHOC-15) is renamed on every
+  // read, so a local copy can never publish the ADHOC node back.
+  const aliases = readKeyAliases(config);
+  if (Object.keys(aliases).length) {
+    for (const workflow of Object.values(workflows)) applyKeyAliases(workflow, aliases);
+  }
+  return { current: mine.current || null, workflows };
+}
+
+// --- converted ad hoc items (MACLEOD-639, ADHOC-15) -------------------
+//
+// `teamflow adhoc convert` turns `ADHOC-<n>` into a tracker ticket; the
+// service records the alias and moves the card. This machine keeps its
+// own copy of what each ad hoc key became -- written by the convert
+// command, and by any report the service answered with `converted_to`
+// -- so the session binding, the binding files and the local workflow
+// copies follow it without asking the service again. Keyed by the
+// organisation like workflows.json, for the same reason.
+
+export function keyAliasesPath() {
+  return path.join(dataDir(), 'aliases.json');
+}
+
+/** `{ 'ADHOC-3': { to, tracker, at } }` for this organisation. */
+export function readKeyAliases(config = {}) {
+  const all = readJson(keyAliasesPath(), {}) || {};
+  const mine = all[workflowScope(config)];
+  return mine && typeof mine === 'object' ? mine : {};
+}
+
+export function recordKeyAlias(from, to, config = {}, { tracker } = {}) {
+  if (!isAdHocKey(from) || !to || isAdHocKey(to)) return false;
+  const all = readJson(keyAliasesPath(), {}) || {};
+  const scope = workflowScope(config);
+  all[scope] = {
+    ...(all[scope] || {}),
+    [String(from).toUpperCase()]: { to: String(to), ...(tracker ? { tracker } : {}), at: new Date().toISOString() },
+  };
+  try {
+    fs.mkdirSync(path.dirname(keyAliasesPath()), { recursive: true });
+    writeJson(keyAliasesPath(), all);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Rename `from` to `to` in one workflow, in place. True when anything moved.
+ *
+ * The mirror of `rename_workflow` in adapters/teamflow/convert.py: the
+ * node keeps its phase, rank, state, cycle and note and says it was
+ * converted; every edge is repointed both ways with its reason kept; a
+ * node or edge that would duplicate one already there is dropped.
+ */
+export function renameWorkflowKey(workflow, from, to) {
+  if (!workflow || !from || !to) return false;
+  let changed = false;
+  const tickets = Array.isArray(workflow.tickets) ? workflow.tickets : [];
+  const held = new Set(tickets.map((t) => t.key));
+  const out = [];
+  for (const t of tickets) {
+    if (t.key === from) {
+      changed = true;
+      if (!held.has(to)) out.push({ ...t, key: to, addedBy: 'converted' });
+      continue;
+    }
+    out.push(t);
+  }
+  if (changed) workflow.tickets = out;
+  if (Array.isArray(workflow.dependencies)) {
+    const seen = new Set();
+    const deps = [];
+    for (const d of workflow.dependencies) {
+      const e = { ...d };
+      if (e.from === from) { e.from = to; changed = true; }
+      if (e.on === from) { e.on = to; changed = true; }
+      const pair = `${e.from}\u0000${e.on}`;
+      if (e.from === e.on || seen.has(pair)) { changed = true; continue; }
+      seen.add(pair);
+      deps.push(e);
+    }
+    workflow.dependencies = deps;
+  }
+  for (const phase of workflow.phases || []) {
+    if (!(phase.tickets || []).includes(from)) continue;
+    changed = true;
+    phase.tickets = [...new Set(phase.tickets.map((k) => (k === from ? to : k)))];
+  }
+  if (workflow.stalledOn?.key === from) {
+    workflow.stalledOn = { ...workflow.stalledOn, key: to };
+    changed = true;
+  }
+  return changed;
+}
+
+export function applyKeyAliases(workflow, aliases = {}) {
+  let changed = false;
+  for (const [from, alias] of Object.entries(aliases)) {
+    if (alias?.to && renameWorkflowKey(workflow, from, alias.to)) changed = true;
+  }
+  return changed;
+}
+
+/**
+ * The session and this directory's binding files follow a converted key.
+ *
+ * Called on every hook before the binding is chosen, and after a report
+ * the service answered with `converted_to`. One file read when nothing
+ * was ever converted. True when anything was rebound.
+ */
+export function followKeyAliases(state, cwd, config = {}) {
+  const aliases = readKeyAliases(config);
+  if (!Object.keys(aliases).length) return false;
+  const hop = (key) => (isAdHocKey(key) ? aliases[String(key).toUpperCase()] : undefined);
+  let moved = false;
+  const bound = state?.binding && hop(state.binding.key);
+  if (bound) {
+    state.binding = { ...state.binding, key: bound.to, ...(bound.tracker ? { tracker: bound.tracker } : {}) };
+    moved = true;
+  }
+  const named = state?.jira && hop(state.jira.key);
+  if (named) state.jira = { ...state.jira, key: named.to };
+  /*
+   * The history belongs to the work, and the work kept going under a new
+   * name. `withHistory` starts both lists again when the bound key and
+   * `historyKey` differ -- right for a session rebound to another ticket,
+   * wrong here -- so the history's key follows the alias too, and the
+   * next report carries the transitions and rework it had.
+   */
+  const kept = state && hop(state.historyKey);
+  if (kept) state.historyKey = kept.to;
+  if (cwd) {
+    for (const file of [localBindingPath(cwd), ...userBindingPaths(cwd, config)]) {
+      const held = readJson(file);
+      const alias = held && hop(held.jiraKey);
+      if (!alias) continue;
+      const record = { ...held, jiraKey: alias.to, convertedFrom: held.jiraKey };
+      if (alias.tracker) record.tracker = alias.tracker;
+      delete record.adhoc;
+      try { writeJson(file, record); moved = true; } catch { /* the session binding still moved */ }
+    }
+  }
+  return moved;
 }
 
 /**
@@ -1520,17 +1681,52 @@ export function isAgentTool(tool) {
  * brief, model- and user-written, and `docs/REPORTING_CONTRACT.md` has
  * always said a prompt stays on the machine.
  */
-export function recordLaunch(sessionId, toolInput = {}) {
+export function recordLaunch(sessionId, toolInput = {}, launchedBy = undefined, represented = {}, toolUseId = undefined) {
   const name = agentLabel(toolInput.name, 64);
   const task = agentLabel(toolInput.description, 80);
   const type = agentLabel(toolInput.subagent_type, 40);
   if (!name && !task && !type) return undefined;
-  const launch = { name, task, type, at: new Date().toISOString() };
-  // A file nobody else writes, named for nothing but chance, so five of
-  // these at once are five files rather than four lost updates.
-  writeJson(path.join(launchesPath(sessionId), `${crypto.randomUUID()}.json`), launch);
+  // Named for the tool call when the payload carries its id (MACLEOD-639
+  // audit): a hook re-entered for the same call finds its launch and
+  // records nothing twice, and the call's PostToolUse finds it by name.
+  const id = launchId(toolUseId);
+  if (toolUseId) {
+    const held = findLaunch(sessionId, id);
+    if (held) return held;
+  }
+  const launch = { id, name, task, type, at: new Date().toISOString() };
+  // A node still to be minted, on the async path (MACLEOD-639 audit):
+  // PreToolUse is synchronous and spends nothing on the network.
+  if (represented.pending) launch.pending = true;
+  // How the board represents this agent (MACLEOD-639, ADHOC-13): the ad
+  // hoc key minted for it and its derived title, or the session's own
+  // key it will report under, or why neither could be had. Local, and
+  // what `teamflow status` counts; the agent's first hook reads `key`.
+  for (const field of ['key', 'title', 'under', 'reason']) {
+    if (represented[field]) launch[field] = String(represented[field]).slice(0, 180);
+  }
+  // The agent that launched this one, when it was an agent (MACLEOD-639):
+  // its capped id, which becomes `agent.parentAgent` on the launched
+  // one's rows so the board can nest them.
+  if (launchedBy) launch.launchedBy = String(launchedBy).slice(0, 80);
+  // A file nobody else writes, named for its tool call or for nothing but
+  // chance, so five of these at once are five files rather than four
+  // lost updates.
+  writeJson(path.join(launchesPath(sessionId), `${id}.json`), launch);
   pruneLaunches(sessionId);
   return launch;
+}
+
+/** A launch's id: the tool call's id when it is a safe file name, else a fresh one. */
+export function launchId(toolUseId) {
+  return typeof toolUseId === 'string' && /^[A-Za-z0-9_-]{1,80}$/.test(toolUseId) ? toolUseId : crypto.randomUUID();
+}
+
+/** One launch by id, claimed or not. Local files only. */
+export function findLaunch(sessionId, id) {
+  if (!sessionId || !id) return undefined;
+  const entry = launchFiles(sessionId).find((one) => one.name === `${id}.json` || one.name.startsWith(`${id}${CLAIMED}`));
+  return entry ? { id, ...entry.launch } : undefined;
 }
 
 /**
@@ -1661,6 +1857,11 @@ export const UNTRUSTED_PROJECT_KEYS = Object.freeze({
   // the plugin itself.
   trustedOrigins: undefined,
   accessTokenOrigin: undefined,
+  // What the plugin runs and when it gives up (MACLEOD-639): the gate
+  // commands `rerun_gate` executes, the deadlines, the retry policy. A
+  // file inside a clone may not choose a command this machine runs on a
+  // lead's say-so, so the whole block is the user's own file only.
+  delivery: undefined,
 });
 
 // --- whose home this is (MACLEOD-623) --------------------------------
@@ -1782,7 +1983,7 @@ export function ignoredProjectLine(keys = []) {
 export function loadConfig(cwd) {
   const globalConfig = readJson(globalConfigPath(), {});
   const projectConfig = projectFacts(readJson(path.join(cwd, '.teamflow.json'), {})).facts;
-  return mergeConfig(globalConfig, projectConfig, {
+  const merged = mergeConfig(globalConfig, projectConfig, {
     serviceUrl: process.env.TEAMFLOW_SERVICE_URL || undefined,
     apiKey: process.env.TEAMFLOW_API_KEY || undefined,
     authIssuer: process.env.TEAMFLOW_AUTH_ISSUER || undefined,
@@ -1802,6 +2003,11 @@ export function loadConfig(cwd) {
     // instead of remembering `--no-browser` on every sign-in.
     noBrowser: process.env.TEAMFLOW_NO_BROWSER === '1' || undefined,
   });
+  // The repository's own checks (ADHOC-20), from `.teamflow/checks.json`.
+  // Read to classify a run of exactly one of those commands and to name
+  // them on the report; never to run one (checks.mjs).
+  merged.checks = readChecks(cwd);
+  return merged;
 }
 
 export function tenantId(config) {
@@ -1821,6 +2027,21 @@ export function tenantPath(config, relativePath) {
 // without a test having to build a repository in that state.
 function git(cwd, args) {
   return safeExec(process.env.TEAMFLOW_GIT_BIN || 'git', ['-C', cwd, ...args], { cwd, timeout: 2000 });
+}
+
+/**
+ * True inside a linked git worktree (`git worktree add`, `claude -w`),
+ * false in a repository's main checkout and outside any repository.
+ * A linked worktree's git dir is `<common>/worktrees/<name>`, so the two
+ * answers differ there and nowhere else (MACLEOD-639 audit).
+ */
+export function isLinkedWorktree(cwd) {
+  const answer = git(cwd, ['rev-parse', '--git-dir', '--git-common-dir']);
+  if (!answer.ok) return false;
+  const [gitDir, common] = answer.stdout.split('\n').map((line) => path.resolve(cwd, line.trim()));
+  if (!gitDir || !common) return false;
+  const real = (dir) => { try { return fs.realpathSync(dir); } catch { return dir; } };
+  return real(gitDir) !== real(common);
 }
 
 // Where the work actually lives, whatever directory an event names.
@@ -1971,6 +2192,93 @@ export function isMergeGate(command, cwd = undefined, config = {}) {
   // rare, and only ever of the local repository.
   if (cwd) trunks.add(defaultBranchName(cwd, config));
   return !sources.every((ref) => isTrunkRef(ref, trunks));
+}
+
+/**
+ * The issue key a `git merge <branch>` names, read from the merged
+ * branch (MACLEOD-639).
+ *
+ * The flow that left our own audited cards in LOCAL_AUDIT for days has
+ * no pull request in it: agents work in worktrees on branches named for
+ * their tickets, and the main session — bound to a different ticket —
+ * merges them with `git merge`. The merge was classified, but it landed
+ * on the main session's key, and the merged ticket never heard. The
+ * branch name is already the documented fallback for attribution, so
+ * the key is read from there. Undefined when no source carries one, or
+ * when two sources name two different keys and nobody can say which.
+ */
+export function mergedBranchKey(command) {
+  const keys = new Set();
+  let branch;
+  for (const ref of mergeSources(command)) {
+    const key = extractJiraKey(ref);
+    if (!key) continue;
+    keys.add(key);
+    branch = ref;
+  }
+  if (keys.size !== 1) return undefined;
+  return { key: [...keys][0], branch: String(branch).slice(0, 200) };
+}
+
+/**
+ * The branch a `git push` sends, when the command names one. `git push`,
+ * `git push -u origin HEAD` and `git push --force-with-lease` name
+ * none, which means the current branch.
+ */
+export function pushedBranch(command) {
+  const found = /\bgit\s+push\b([^;&|]*)/i.exec(String(command));
+  if (!found) return undefined;
+  const takesValue = new Set(['-o', '--push-option', '--receive-pack', '--exec', '--repo']);
+  const words = [];
+  const tokens = found[1].trim().split(/\s+/).filter(Boolean);
+  for (let i = 0; i < tokens.length; i += 1) {
+    const token = tokens[i];
+    if (token === '--') continue;
+    if (token.startsWith('-')) {
+      if (takesValue.has(token)) i += 1;
+      continue;
+    }
+    words.push(token);
+  }
+  // `git push <remote> <refspec>`: the refspec is the second word, and
+  // `src:dst` pushes `src` to `dst`. `HEAD` is the current branch.
+  const refspec = words[1];
+  if (!refspec || refspec === 'HEAD') return undefined;
+  const src = refspec.replace(/^\+/, '').split(':')[0].replace(/^refs\/heads\//, '');
+  return src === 'HEAD' ? undefined : src;
+}
+
+/** Where a `git push` sends it, when the refspec names a destination other than the source. */
+export function pushedDestination(command) {
+  const found = /\bgit\s+push\b([^;&|]*)/i.exec(String(command));
+  if (!found) return undefined;
+  const refspec = found[1].trim().split(/\s+/).filter((t) => t && !t.startsWith('-'))[1];
+  if (!refspec || !refspec.includes(':')) return undefined;
+  return refspec.replace(/^\+/, '').split(':')[1].replace(/^refs\/heads\//, '') || undefined;
+}
+
+/**
+ * Whether a push is of the branch this session's ticket is on
+ * (MACLEOD-639): the branch it names carries the bound key, or is the
+ * branch the session's last git snapshot saw, or is unnamed and the
+ * current branch is not the trunk. A push of the trunk is never it.
+ */
+function pushesBoundBranch(command, state, config = {}) {
+  const key = state.binding?.key;
+  if (!key) return false;
+  const trunks = new Set(TRUNK_NAMES);
+  if (config.defaultBranch) trunks.add(String(config.defaultBranch));
+  // `git push origin HEAD:main` from a feature branch lands on the
+  // trunk: that is the merge, not the ticket going out for review.
+  const destination = pushedDestination(command);
+  if (destination && isTrunkRef(destination, trunks)) return false;
+  const named = pushedBranch(command);
+  const branch = named || state.git?.branch;
+  if (!branch) return true;
+  if (isTrunkRef(branch, trunks)) return false;
+  if (!named) return true;
+  if (extractJiraKey(named) === key) return true;
+  return Boolean(state.git?.branch) && named === state.git.branch;
 }
 
 /** The remotes whose `<remote>/main` means the same branch as `main`. */
@@ -2677,9 +2985,41 @@ export function extractTestEvidence(value) {
   return evidence.slice(0, 4);
 }
 
+/*
+ * A test run's failure points (ADHOC-19). A failed run whose failing tests
+ * the output does not name judged nothing about points, so it carries
+ * none. A run cut at the name cap did not name every failure, and a
+ * partial run (a directory, a filter word, a name filter) did not run
+ * every test in its files, so neither checks anything off.
+ *
+ * Test names do not leave the machine (the owner declined, 2026-09-22):
+ * each failing file is one counted point. The switch stays off.
+ */
+function testRun(input, command, failed, config = {}) {
+  const { files, partial } = testScope(command);
+  // Which runner ran: a pytest run judges Python tests and nothing else.
+  const family = runnerFamily(command);
+  if (!failed) return { testRun: { failing: [], files, family, complete: !partial && Boolean(family) } };
+  const { names, capped } = readFailingTests(input.tool_response || input.error);
+  if (!names.length) return {};
+  const failing = (config?.reporting?.failingTests === true
+    ? names.map((name) => ({ text: name }))
+    : countedByFile(names)).map((one) => withFamily(one, family));
+  return { testRun: { failing, files, family, complete: !partial && !capped && Boolean(family) } };
+}
+
 function commandOf(input) {
   return typeof input.tool_input?.command === 'string' ? input.tool_input.command : '';
 }
+
+/*
+ * The exit a ticket takes off a machine (MACLEOD-639). `waitingOn` names
+ * what the ticket waits for, so a card that sits says why. A merged pull
+ * request stays MERGE success here: the pull request sidecar is what
+ * sees the merge land and what says CI is next.
+ */
+const IN_REVIEW = Object.freeze({ stage: 'MERGE', status: 'waiting', summary: 'in review', waitingOn: 'review', sticky: true });
+const MERGED = Object.freeze({ stage: 'MERGE', status: 'success', summary: 'Merged', sticky: true, clearRework: true });
 
 export function classifyTool(input, state, config) {
   const event = input.hook_event_name;
@@ -2721,10 +3061,26 @@ export function classifyTool(input, state, config) {
   if (/github/i.test(tool) && /merge/i.test(tool)) {
     return failed
       ? { stage: 'LOCAL_REWORK', status: 'failed', summary: 'Merge failed', incrementLoop: true, reworkFrom: 'MERGE', sticky: true }
-      : { stage: 'MERGE', status: 'success', summary: 'Merged', sticky: true, clearRework: true };
+      : MERGED;
   }
 
   if (tool !== 'Bash') return undefined;
+
+  /*
+   * A check the repository declares (ADHOC-20): a run of exactly its
+   * command is that check's pass or fail and nothing else, so one run
+   * never passes two gates. The stage does not move here: the verdict is
+   * reported against the check's own gate, which the organisation placed.
+   */
+  // Only once the run has finished: a verdict needs an exit status.
+  const check = (event === 'PostToolUse' || failed) ? checkNameFor(command, config.checks) : undefined;
+  if (check) {
+    return {
+      check: { name: check, passed: !failed, evidence: extractTestEvidence(failed ? (input.tool_response || input.error) : input.tool_response) },
+      summary: failed ? `The ${check} check failed` : `The ${check} check passed`,
+      heartbeat: true,
+    };
+  }
 
   if (isDevAudit) {
     return failed
@@ -2740,8 +3096,8 @@ export function classifyTool(input, state, config) {
 
   if (isDevTest) {
     return failed
-      ? { stage: 'DEV_REWORK', status: 'failed', summary: 'Dev tests failed', incrementLoop: true, reworkFrom: 'DEV_TEST', evidence: extractTestEvidence(input.tool_response || input.error), sticky: true }
-      : { stage: 'DEV_TEST', status: 'success', summary: 'Dev tests passed; awaiting audit', evidence: extractTestEvidence(input.tool_response), sticky: true, clearRework: true };
+      ? { stage: 'DEV_REWORK', status: 'failed', summary: 'Dev tests failed', incrementLoop: true, reworkFrom: 'DEV_TEST', evidence: extractTestEvidence(input.tool_response || input.error), sticky: true, ...testRun(input, command, true, config) }
+      : { stage: 'DEV_TEST', status: 'success', summary: 'Dev tests passed; awaiting audit', evidence: extractTestEvidence(input.tool_response), sticky: true, clearRework: true, ...testRun(input, command, false, config) };
   }
 
   if (DEPLOY_RE.test(command)) {
@@ -2754,19 +3110,59 @@ export function classifyTool(input, state, config) {
   // inside a work branch, `git merge --abort` — falls through rather
   // than returning: it is a sync, it is not sticky, and it moves nothing.
   if (MERGE_RE.test(command) && isMergeGate(command, input.cwd, config)) {
-    return failed
-      ? { stage: 'LOCAL_REWORK', status: 'failed', summary: 'Merge failed', incrementLoop: true, reworkFrom: 'MERGE', sticky: true }
-      : { stage: 'MERGE', status: 'success', summary: 'Merged', sticky: true, clearRework: true };
+    if (failed) {
+      return { stage: 'LOCAL_REWORK', status: 'failed', summary: 'Merge failed', incrementLoop: true, reworkFrom: 'MERGE', sticky: true };
+    }
+    // A pull request names no branch on the command line, so its merge
+    // is the bound ticket's own (MACLEOD-639).
+    if (PR_MERGE_RE.test(command)) return MERGED;
+    const merged = mergedBranchKey(command);
+    /*
+     * The merged branch names another ticket: that ticket is the one
+     * merged, not the one this session is bound to. The transition is
+     * addressed to it (`forKey`) and moves this session's own ticket
+     * nowhere; publishState carries it separately. A branch with no key
+     * is the bound ticket's own merge, as MACLEOD-574 left it.
+     */
+    if (merged && state.binding?.key && merged.key !== state.binding.key) {
+      /*
+       * Only a key of the bound ticket's own project. Any `WORD-1` in a
+       * branch name is a key by shape — `git merge hotfix-3` would
+       * otherwise put a HOTFIX-3 card on the board that no tracker
+       * holds — and a GitHub tenant's keys are `repo#N`, which a branch
+       * name never carries, so nothing is attributed there rather than
+       * a ghost.
+       */
+      const tracker = state.binding.tracker || trackerOf(config);
+      const same = tracker !== 'github'
+        && issueProject(merged.key, tracker) === issueProject(state.binding.key, tracker);
+      if (same) return { stage: 'MERGE', status: 'success', summary: 'Merged', forKey: merged.key, forBranch: merged.branch };
+    }
+    return MERGED;
   }
 
   if (PR_RE.test(command)) {
-    return { stage: 'MERGE', status: failed ? 'failed' : 'waiting', summary: failed ? 'PR operation failed' : 'PR ready for merge', sticky: true, reworkFrom: failed ? 'MERGE' : undefined };
+    return failed
+      ? { stage: 'MERGE', status: 'failed', summary: 'PR operation failed', sticky: true, reworkFrom: 'MERGE' }
+      : IN_REVIEW;
+  }
+
+  /*
+   * A push of the bound branch is the ticket leaving the machine for
+   * review (MACLEOD-639). Only out of the three local stages — a second
+   * push of a ticket already in review, or one whose CI is running,
+   * moves it nowhere — and only forwards: a failed push is a network
+   * error, not rework.
+   */
+  if (GIT_PUSH_RE.test(command)) {
+    if (failed || !PRE_REVIEW_STAGES.has(state.stage) || !pushesBoundBranch(command, state, config)) return undefined;
+    return IN_REVIEW;
   }
 
   if (isLocalTest) {
     return failed
-      ? { stage: 'LOCAL_REWORK', status: 'failed', summary: 'Local tests failed', incrementLoop: true, reworkFrom: 'LOCAL_TEST', evidence: extractTestEvidence(input.tool_response || input.error), sticky: true }
-      : { stage: 'LOCAL_TEST', status: 'success', summary: 'Local tests passed; awaiting audit', evidence: extractTestEvidence(input.tool_response), sticky: true, clearRework: true };
+      ? { stage: 'LOCAL_REWORK', status: 'failed', summary: 'Local tests failed', incrementLoop: true, reworkFrom: 'LOCAL_TEST', evidence: extractTestEvidence(input.tool_response || input.error), sticky: true, ...testRun(input, command, true, config) }
+      : { stage: 'LOCAL_TEST', status: 'success', summary: 'Local tests passed; awaiting audit', evidence: extractTestEvidence(input.tool_response), sticky: true, clearRework: true, ...testRun(input, command, false, config) };
   }
 
   if (BUILD_RE.test(command)) {
@@ -2790,17 +3186,174 @@ function clearsRework(state, transition) {
   return stageRank(transition.stage) >= stageRank(state.reworkFrom);
 }
 
+/*
+ * What a waiting ticket waits on (MACLEOD-639). The five words the
+ * contract allows; anything else a transition says is dropped.
+ */
+const WAITING_ON = new Set(['review', 'ci', 'deploy', 'human', 'dependency']);
+const REWORK_MAX = 16;
+const REWORK_SUMMARY_MAX = 120;
+const TRANSITIONS_MAX = 32;
+const ATTRIBUTIONS_MAX = 8;
+// After either of these a ticket's loops are over: the next failure
+// starts a new cycle and counts from one.
+const CYCLE_CLOSING_STAGES = new Set(['DEV_VERIFIED', 'DONE']);
+
+/** Who a row is attributed to: the agent's name, else the tool, else Claude Code. */
+export function actedBy(state = {}) {
+  return agentLabel(state.agent?.name, 64) || agentLabel(state.reporter?.tool, 64) || 'Claude Code';
+}
+
+/**
+ * The rework history and the stage history, kept per ticket
+ * (MACLEOD-639).
+ *
+ * `loopCount` used to be a counter that went up on every failed command
+ * for the life of the binding and never came down, which is how a card
+ * came to read "x69 loops" with no gate, no reason and no arrow. It is
+ * now derived: the number of `rework[]` entries in this plan cycle. A
+ * cycle closes when the ticket is verified or done, and the next
+ * failure opens a new one. Clearing a loop stamps `clearedAt` rather
+ * than erasing the entry, so the history stays readable.
+ *
+ * Both lists belong to the ticket the session is bound to. A session
+ * rebound to another key starts both again: another ticket's failures
+ * are not this one's.
+ */
+function withHistory(state, transition, updatedAt, cleared) {
+  const key = state.binding?.key;
+  const fresh = Boolean(state.historyKey && key && state.historyKey !== key);
+  let log = fresh ? [] : (state.reworkLog || []);
+  let transitions = fresh ? [] : (state.transitions || []);
+  // Loops this cycle. A counter rather than a timestamp comparison,
+  // because two failures a millisecond apart are still two.
+  let cycleLoops = fresh || state.cycleClosed ? 0 : (state.cycleLoops || 0);
+  let cycleClosed = fresh ? false : Boolean(state.cycleClosed);
+  let lastFailure = fresh ? undefined : state.lastFailure;
+  let testPoints = fresh ? [] : (state.testPoints || []);
+  let testRound = fresh ? 0 : (state.testRound || 0);
+  const by = actedBy(state);
+
+  // A test run checks its points off in turn (ADHOC-19): a test that
+  // fails again stays open, a new failure is a new point, and a test the
+  // run covered and passed is fixed. A run of one file covers that file.
+  if (transition.testRun) {
+    testRound += 1;
+    const files = transition.testRun.files || [];
+    testPoints = advancePoints(testPoints, {
+      gate: 'test',
+      round: testRound,
+      at: updatedAt,
+      failing: transition.testRun.failing,
+      judgedAll: transition.testRun.complete === true,
+      // Only its own runner's points, and of a run of named files exactly
+      // those files' points.
+      judges: (point) => pointFamily(point) === transition.testRun.family
+        && (!files.length || files.includes(testFile(point.key || point.text))),
+      idFor: (point) => stableId('T', 'test', point.key),
+    }).points;
+  }
+
+  if (transition.incrementLoop && transition.reworkFrom) {
+    cycleClosed = false;
+    cycleLoops += 1;
+    const summary = agentLabel(transition.summary, REWORK_SUMMARY_MAX) || `${GATE_LABELS[transition.reworkFrom] || transition.reworkFrom} failed`;
+    log = [...log, { gate: transition.reworkFrom, at: updatedAt, summary, by }].slice(-REWORK_MAX);
+    lastFailure = { stage: transition.reworkFrom, at: updatedAt, summary };
+  }
+  if (cleared) log = log.map((entry) => (entry.clearedAt ? entry : { ...entry, clearedAt: updatedAt }));
+  if (transition.stage && CYCLE_CLOSING_STAGES.has(transition.stage)) cycleClosed = true;
+  if (transition.stage && transition.stage !== state.stage) {
+    transitions = [...transitions, { stage: transition.stage, at: updatedAt, by }].slice(-TRANSITIONS_MAX);
+  }
+  return {
+    reworkLog: log,
+    transitions,
+    cycleLoops,
+    cycleClosed,
+    lastFailure,
+    loopCount: cycleClosed ? 0 : cycleLoops,
+    historyKey: key || state.historyKey,
+    testPoints,
+    testRound,
+  };
+}
+
+/**
+ * A new plan cycle resets the loop count (MACLEOD-639). Called where the
+ * configuration is to hand, before the payload is built: a ticket picked
+ * up by a new `/teamflow:build` run starts counting from nought, and its
+ * history keeps the earlier entries with their `clearedAt`.
+ */
+export function refreshReworkCycle(state, config = {}) {
+  const key = state.binding?.key;
+  if (!key) return state;
+  const run = workflowRef(key, config)?.id;
+  if (!run) return state;
+  if (state.reworkRun && state.reworkRun !== run && !state.cycleClosed) {
+    /*
+     * This runs after the transition that carried the run's first event
+     * has been applied. When that event was itself a failure, the entry
+     * it appended belongs to the new run — it is the open one stamped
+     * with this very `updatedAt` — so the new cycle starts at one, not
+     * at nought with an open loop it cannot count.
+     */
+    const log = state.reworkLog || [];
+    const last = log[log.length - 1];
+    const opened = Boolean(last && !last.clearedAt && last.at === state.updatedAt && state.reworkFrom);
+    state.cycleClosed = !opened;
+    state.cycleLoops = opened ? 1 : 0;
+    state.loopCount = state.cycleLoops;
+    // The earlier run's loops are over with it: stamped closed at the
+    // moment the new run took the ticket, so the open entries in the
+    // list are the loops the count says.
+    const now = state.updatedAt || new Date().toISOString();
+    state.reworkLog = log.map((entry, i) => (
+      entry.clearedAt || (opened && i === log.length - 1) ? entry : { ...entry, clearedAt: now }
+    ));
+  }
+  state.reworkRun = run;
+  return state;
+}
+
 export function applyTransition(state, transition) {
   if (!transition) return state;
-  const cleared = clearsRework(state, transition);
   const updatedAt = new Date().toISOString();
+  /*
+   * Addressed to another ticket (MACLEOD-639): a `git merge` of a branch
+   * named for a key this session is not bound to. This session's own
+   * ticket moves nowhere; the merged ticket's report is carried by the
+   * next publish. One entry per key, newest wins.
+   */
+  if (transition.forKey) {
+    const others = (state.attributions || []).filter((one) => one.key !== transition.forKey);
+    return {
+      ...state,
+      attributions: [...others, {
+        key: transition.forKey,
+        branch: transition.forBranch,
+        stage: transition.stage,
+        status: transition.status,
+        summary: transition.summary,
+        at: updatedAt,
+        by: actedBy(state),
+      }].slice(-ATTRIBUTIONS_MAX),
+    };
+  }
+  const cleared = clearsRework(state, transition);
   const evidence = transition.evidence?.length ? transition.evidence : state.evidence;
+  const history = withHistory(state, transition, updatedAt, cleared);
   return {
     ...state,
     stage: transition.stage || state.stage,
     status: transition.status || state.status,
     summary: transition.summary || state.summary,
-    loopCount: (state.loopCount || 0) + (transition.incrementLoop ? 1 : 0),
+    ...history,
+    // Only a transition that moves the ticket says what it waits on; a
+    // heartbeat keeps whatever was there.
+    waitingOn: transition.stage
+      ? (WAITING_ON.has(transition.waitingOn) ? transition.waitingOn : undefined)
+      : state.waitingOn,
     evidence,
     reworkFrom: cleared ? undefined : (transition.reworkFrom || state.reworkFrom),
     /*
@@ -3011,6 +3564,11 @@ export function agentBlock(state = {}) {
    * hashed precisely to avoid carrying it (audit finding 7).
    */
   if (agent.parent) block.parent = digest(agent.parent);
+  // The agent that launched this one, when it was an agent and not the
+  // session (MACLEOD-639), as the same capped id `id` carries. Absent
+  // on an agent the session launched, so the board nests only what
+  // actually nested.
+  if (agent.parentAgent) block.parentAgent = String(agent.parentAgent).slice(0, 80);
   if (agent.startedAt) block.startedAt = agent.startedAt;
   if (agent.endedAt) block.endedAt = agent.endedAt;
   return block;
@@ -3078,6 +3636,19 @@ export function issuePayload(state, config, info) {
     updatedAt: state.updatedAt || new Date().toISOString(),
     loopCount: state.loopCount || 0,
     reworkFrom: state.reworkFrom,
+    // ADHOC-20: the names of the checks this repository declares, never
+    // their commands, so a card can say a check is not set up here.
+    checks: checkNames(config.checks),
+    // MACLEOD-639. What a waiting ticket waits on; the loops it has been
+    // round, each a gate, a time and one derived line; the last failure;
+    // and when it changed stage. Absent rather than empty when there is
+    // nothing to say, so an older document is not rewritten with lists.
+    ...(state.waitingOn ? { waitingOn: state.waitingOn } : {}),
+    ...(state.reworkLog?.length ? { rework: state.reworkLog.slice(-REWORK_MAX) } : {}),
+    ...(state.lastFailure ? { lastFailure: state.lastFailure } : {}),
+    ...(state.transitions?.length ? { transitions: state.transitions.slice(-TRANSITIONS_MAX) } : {}),
+    // ADHOC-19: the failing tests this session has seen, as failure points.
+    ...(state.testPoints?.length ? { points: state.testPoints.slice(-50) } : {}),
     // MACLEOD-510. Set by refreshDelivery, and absent rather than empty
     // outside a repository or when the branch has no pull request.
     git: state.git,
@@ -3085,6 +3656,10 @@ export function issuePayload(state, config, info) {
     // MACLEOD-532. Absent on a session that never named a tool, which is
     // what the dashboard reads as "connected, version unknown".
     reporter: state.reporter,
+    // MACLEOD-639 (ruling 10): what a lead asked this machine to do about
+    // the ticket and what came of it. Outcomes and the plugin's own
+    // sentence about each, never the action's text.
+    ...(Array.isArray(state.actions) && state.actions.length ? { actions: state.actions.slice(-16) } : {}),
     // Filled here rather than by whoever is driving, so a report is
     // attributed whether it came from the build skill, a teammate or
     // somebody working the ticket by hand.
@@ -3150,7 +3725,7 @@ export function issuePayload(state, config, info) {
   };
 }
 
-export function sanitizePayload(value) {
+export function sanitizePayload(value, { kind = 'issue' } = {}) {
   const allowed = new Set([
     'tracker','jiraKey','jiraUrl','title','jiraStatus','parentKeys','project','actor','repository','branch',
     'tenantId','stage','status','summary','updatedAt','loopCount','reworkFrom','evidence','executions',
@@ -3172,7 +3747,25 @@ export function sanitizePayload(value) {
     // happened, so a run's activity can be read from the reports the
     // service already receives instead of from a second log.
     'workflow','phase',
+    // MACLEOD-639: what a waiting ticket waits on, and the three history
+    // blocks whose own fields are scoped below, so `at` and `by` are
+    // allowed inside them and nowhere else on the flat payload.
+    'waitingOn','rework','lastFailure','transitions',
+    // ADHOC-19: a gate's verdicts on the ticket it judged, scoped below.
+    'verdicts', 'points',
   ]);
+  /*
+   * MACLEOD-639: what only one document kind may carry at its root. A
+   * runtime sidecar is a flat execution -- there is no `executions[]`
+   * to carry its clocks, its session block or its retry state in -- so
+   * `startedAt`, `endedAt`, `session`, `attempts`, `retry` and
+   * `supersededBy` are allowed at ITS root and nowhere else; on an issue
+   * document the same names stay where MACLEOD-574 and MACLEOD-601 put
+   * them, inside `executions[]`. `actions` -- what a lead asked and what
+   * came of it -- is the issue document's alone.
+   */
+  const runtimeRoot = new Set(['startedAt', 'endedAt', 'session', 'attempts', 'retry', 'supersededBy', 'gate', 'failedSteps']);
+  const issueRoot = new Set(['actions']);
   /*
    * MACLEOD-548: the one event shape. `at` is when the event happened and
    * `source` is who says so — the two fields that replace `updatedAt` on an
@@ -3199,12 +3792,41 @@ export function sanitizePayload(value) {
    * the payload they are dropped, `prompt` and `last_assistant_message`
    * among them, because neither is in either set.
    */
-  const agentOnly = new Set(['id', 'name', 'task', 'type', 'parent', 'startedAt', 'endedAt']);
+  const agentOnly = new Set(['id', 'name', 'task', 'type', 'parent', 'parentAgent', 'startedAt', 'endedAt']);
   // Which session a run happened in. `repository` and `branch` are in the
   // flat set already; the rest are here and nowhere else, so a transcript
   // path or a raw session id has no field to arrive on.
-  const sessionOnly = new Set(['id', 'tool', 'startedAt', 'endedAt', 'repository', 'branch']);
-  const nested = { agent: agentOnly, session: sessionOnly };
+  // `label` is the plan's name on a `kind: plan` row (MACLEOD-639).
+  const sessionOnly = new Set(['id', 'tool', 'startedAt', 'endedAt', 'repository', 'branch', 'label']);
+  // MACLEOD-639. A loop is a gate, two clocks, one derived line and a
+  // name; a failure is a stage, a clock and that line; a transition is a
+  // stage, a clock and a name. `summary` is the only prose and it is the
+  // classifier's own sentence, never a command or its output.
+  const reworkOnly = new Set(['gate', 'at', 'clearedAt', 'summary', 'by']);
+  const failureOnly = new Set(['stage', 'at', 'summary']);
+  const transitionOnly = new Set(['stage', 'at', 'by']);
+  // One try of a gate the plugin ran, and why it is still going
+  // (MACLEOD-639). `reason` is the runner's sentence, never output.
+  const attemptOnly = new Set(['at', 'status', 'reason']);
+  const retryOnly = new Set(['attempt', 'of', 'nextAt', 'status', 'reason', 'notifiedAt']);
+  const supersededOnly = new Set(['slot', 'at']);
+  // What a lead asked and what came of it (ruling 10): six short fields,
+  // and `reason` is the plugin's sentence, never the action's text.
+  const actionOnly = new Set(['id', 'kind', 'by', 'at', 'outcome', 'reason']);
+  // A gate's verdict (ADHOC-19): which gate, pass or fail, the round, a
+  // clock, who, and the words the orchestrator deliberately wrote.
+  const verdictOnly = new Set(['round', 'gate', 'verdict', 'at', 'by', 'summary', 'raised', 'fixed', 'open', 'notAdded']);
+  // A failure point (points.mjs): its id, the gate, the one line, the rounds
+  // it failed in, and when it was fixed. Never output, a message or a log.
+  const pointOnly = new Set(['id', 'gate', 'key', 'text', 'from', 'rounds', 'lastRound', 'state', 'at', 'by',
+    'doneAt', 'doneRound', 'doneBy']);
+  const nested = {
+    agent: agentOnly, session: sessionOnly,
+    rework: reworkOnly, lastFailure: failureOnly, transitions: transitionOnly,
+    attempts: attemptOnly, retry: retryOnly, supersededBy: supersededOnly, actions: actionOnly,
+    verdicts: verdictOnly, points: pointOnly,
+  };
+  const rootOnly = kind === 'runtime' ? runtimeRoot : issueRoot;
   function walk(v, scope) {
     if (Array.isArray(v)) return v.slice(0, 50).map((item) => walk(item, scope));
     if (!v || typeof v !== 'object') {
@@ -3214,7 +3836,7 @@ export function sanitizePayload(value) {
     for (const [key, item] of Object.entries(v)) {
       const ok = nested[scope]
         ? nested[scope].has(key)
-        : allowed.has(key) || (scope === 'event' && eventOnly.has(key));
+        : allowed.has(key) || (scope === 'event' && eventOnly.has(key)) || (scope === 'root' && rootOnly.has(key));
       if (!ok) continue;
       const next = nested[scope] ? scope
         : nested[key] ? key
@@ -3968,7 +4590,7 @@ function serviceDocument(payload, kind) {
   // is allowed inside a dependency and nowhere else -- and the
   // service's WORKFLOW tables are the second line as always.
   if (kind === 'workflow') return payload;
-  const clean = sanitizePayload(payload);
+  const clean = sanitizePayload(payload, { kind });
   delete clean.tenantId;
   delete clean.slot;
   return clean;
@@ -4328,6 +4950,11 @@ async function postEnvelope(endpoint, envelope, idempotencyKey, config, account 
     status,
     replay: Boolean(body?.replay),
     droppedFields: Array.isArray(body?.dropped_fields) ? body.dropped_fields : [],
+    // The key this report was sent under became a ticket (ADHOC-15):
+    // the service wrote it under `convertedTo`, and the session follows.
+    ...(isAdHocKey(body?.converted_from) && typeof body?.converted_to === 'string'
+      ? { convertedFrom: String(body.converted_from).toUpperCase(), convertedTo: body.converted_to, convertedTracker: body.converted_tracker }
+      : {}),
   });
 }
 
@@ -4724,7 +5351,7 @@ export async function putReport(relativePath, payload, config) {
   if (!config.dataUri) return { ok: false, skipped: true, reason: 'TEAMFLOW_DATA_URI not configured' };
   const base = String(config.dataUri).replace(/\/$/, '');
   const uri = `${base}/${relativePath.replace(/^\//, '')}`;
-  const clean = sanitizePayload(payload);
+  const clean = sanitizePayload(payload, { kind: /(^|\/)runtime\//.test(relativePath) ? 'runtime' : 'issue' });
   const result = s3Put(uri, clean, config);
   if (!result.ok) {
     queueOutbox({ uri, payload: clean });
@@ -4876,6 +5503,60 @@ export function aggregateActor(config, info) {
   };
 }
 
+/**
+ * The report a merge of somebody else's branch makes for THEIR ticket
+ * (MACLEOD-639): MERGE success on the key the branch name carries,
+ * from the session that ran the merge. Everything this session knows
+ * about its own ticket — its loops, its stage history, its git
+ * snapshot, its pull request, its title — is left off, because none of
+ * it is true of the merged one. The execution id is this actor's, which
+ * is right: the row on the merged ticket says who merged it.
+ */
+export function attributedPayload(state, attribution, config, info = {}) {
+  const ghost = {
+    ...state,
+    binding: { ...(state.binding || {}), key: attribution.key, source: 'branch', sticky: false },
+    stage: attribution.stage,
+    status: attribution.status,
+    summary: attribution.summary,
+    updatedAt: attribution.at,
+    loopCount: 0,
+    reworkFrom: undefined,
+    rework: undefined,
+    reworkLog: undefined,
+    lastFailure: undefined,
+    testPoints: undefined,
+    testRound: undefined,
+    waitingOn: undefined,
+    transitions: [{ stage: attribution.stage, at: attribution.at, by: attribution.by }],
+    evidence: [],
+    git: undefined,
+    pr: undefined,
+    jira: undefined,
+  };
+  return issuePayload(ghost, config, { ...info, branch: attribution.branch || info.branch });
+}
+
+async function publishAttributions(state, config, info) {
+  const pending = state.attributions || [];
+  if (!pending.length) return;
+  state.attributions = [];
+  const transport = transportOf(config);
+  for (const attribution of pending) {
+    const payload = attributedPayload(state, attribution, config, info);
+    if (!payload) continue;
+    // A network failure is queued by the sender and retried from the
+    // outbox; a refusal is the service's answer and is not re-asked.
+    if (transport === 'service') {
+      await sendReport('issue', undefined, payload, config, {
+        account: state.binding?.account || state.account || reportScope(config),
+      });
+    } else {
+      await putReport(tenantPath(config, `issues/${payload.jiraKey}.json`), payload, config);
+    }
+  }
+}
+
 export async function publishState(state, config, info, { force = false, keepTenant = false, skipGit = false } = {}) {
   /*
    * `keepTenant` is for flushing an end somebody else's session left
@@ -4894,6 +5575,10 @@ export async function publishState(state, config, info, { force = false, keepTen
   // forced publish — Stop, or /teamflow:sync — always carries the
   // current answer (MACLEOD-510).
   refreshDelivery(state, config, info, { force, skipGit });
+  // Reports addressed to other tickets go first (MACLEOD-639): they are
+  // not this ticket's, so this ticket's coalescing must not swallow them.
+  await publishAttributions(state, config, info);
+  refreshReworkCycle(state, config);
   const payload = issuePayload(state, config, info);
   if (!payload) return { ok: false, skipped: true, reason: 'No issue bound' };
   /*
@@ -4955,6 +5640,12 @@ export async function publishState(state, config, info, { force = false, keepTen
    * existing anywhere — the board never had it and this machine has
    * stopped intending to send it.
    */
+  // The service answered that this ad hoc key is a ticket now (ADHOC-15):
+  // remember it and rebind, so the next report is sent under the ticket.
+  if (issueResult.convertedTo) {
+    recordKeyAlias(issueResult.convertedFrom, issueResult.convertedTo, config, { tracker: issueResult.convertedTracker });
+    followKeyAliases(state, state.cwd, config);
+  }
   if (issueResult.ok || issueResult.queued) {
     state.lastPublishHash = hash;
     state.lastPublishedAt = now;

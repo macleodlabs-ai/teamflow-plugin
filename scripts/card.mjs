@@ -33,6 +33,7 @@
 // nothing queued behind them. A hook that waits on one is a hook
 // standing between a ticket and its own report.
 
+import crypto from 'node:crypto';
 import {
   actor,
   fetchState,
@@ -159,6 +160,25 @@ export function cardFor(ticket = {}) {
 // --- the report ------------------------------------------------------
 
 /**
+ * The plan's own session block, on every row the plan writes.
+ *
+ * A run is not a person, and the board had been drawing one as an
+ * agent named after the plan (MACLEOD-639). `session.id` on the wire is
+ * a hex digest, so the workflow id travels without its `wf-` prefix --
+ * the reader puts it back -- and `tool` says what wrote it in words.
+ * `teamflow workflow`'s gate verdicts carry the same block.
+ */
+export function planSession(workflow) {
+  const id = String(workflow?.id || '');
+  const hex = /^wf-([0-9a-f]{8,32})$/.exec(id);
+  return {
+    id: hex ? hex[1] : crypto.createHash('sha256').update(id).digest('hex').slice(0, 12),
+    tool: 'teamflow workflow',
+    label: String(workflow?.name || 'Workflow').slice(0, 80),
+  };
+}
+
+/**
  * One execution id per run per ticket.
  *
  * The run's own row on the card, so a later pass rewrites it rather
@@ -202,7 +222,15 @@ export function cardPayload(key, card, { workflow, config = {}, info = {}, at } 
       id: cardExecutionId(workflow?.id || 'run', key),
       at: when,
       source: 'plugin',
-      kind: 'claude',
+      /*
+       * A plan, not a person (MACLEOD-639). This row was `kind: claude`,
+       * and the board reads a claude row with no agent block as a
+       * person's own work -- so every run was drawn as an agent named
+       * after the plan. `plan` says what it is, and the session block
+       * says which plan, so a reader never has to guess from the id.
+       */
+      kind: 'plan',
+      session: planSession(workflow || { id: 'run', name: 'Workflow' }),
       // Named for the run rather than for whoever typed the command:
       // the fact being published is the RUN's verdict, and a board that
       // attributed it to the orchestrator's laptop would be answering a
@@ -221,6 +249,26 @@ export function cardPayload(key, card, { workflow, config = {}, info = {}, at } 
     payload.workflow = ticket?.phase !== undefined
       ? { id: workflow.id, phase: ticket.phase }
       : { id: workflow.id };
+  }
+  /*
+   * The gates' verdicts on THIS ticket (MACLEOD-639, ADHOC-19): every
+   * audit pass and every round a gate sent it back, the orchestrator's own
+   * words, on the card that was judged. Keyed by `key`, never by the
+   * session's binding, so an orchestrator bound to a parent issue writes
+   * the child's history and leaves its own card alone.
+   */
+  const judged = (workflow?.tickets || []).find((one) => one.key === key);
+  const fields = (source, names) => Object.fromEntries(names
+    .filter((name) => source[name] !== undefined && source[name] !== null)
+    .map((name) => [name, source[name]]));
+  if (Array.isArray(judged?.verdicts) && judged.verdicts.length) {
+    payload.verdicts = judged.verdicts.slice(-20).map((one) => fields(one,
+      ['round', 'gate', 'verdict', 'at', 'by', 'summary', 'raised', 'fixed', 'open', 'notAdded']));
+  }
+  // The failure points those rounds raised: the checklist the next team works from.
+  if (Array.isArray(judged?.points) && judged.points.length) {
+    payload.points = judged.points.slice(-50).map((one) => fields(one,
+      ['id', 'gate', 'key', 'text', 'from', 'rounds', 'lastRound', 'state', 'at', 'by', 'doneAt', 'doneRound', 'doneBy']));
   }
   return payload;
 }

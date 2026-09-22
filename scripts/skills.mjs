@@ -16,7 +16,10 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { credentialNotice, installHooks, removalReport, uninstallHooks } from './hooks.mjs';
+import {
+  credentialNotice, installHooks, installWorkflowRule, removalReport, uninstallHooks, uninstallWorkflowRule,
+  WORKFLOW_RULE,
+} from './hooks.mjs';
 import { capability } from './tools.mjs';
 import {
   mergeJson, removeBlock, removeEmptyDir, removeFile, unmergeJson, writeBlock, writeFile,
@@ -160,6 +163,8 @@ card already says adds nothing to the board, and a stage you guessed at
 makes it wrong. On HTTP 402 stop reporting and hand your human what the
 service said, with the link it gave: a seat is theirs to add and not
 yours. Never let a reporting failure interrupt the work.
+
+${WORKFLOW_RULE}
 
 ## The other TeamFlow commands
 
@@ -396,6 +401,16 @@ export function install(tool, { root = process.cwd(), scope = 'project', dryRun 
     }
   }
 
+  // Claude Code has nothing else to install, and it is the one tool whose
+  // instructions file is not written above (MACLEOD-639): the rule that
+  // every plan and every dispatched agent is on the board goes into the
+  // project's CLAUDE.md, between its own markers.
+  if (tool === 'claude-code') {
+    const file = path.join(root, 'CLAUDE.md');
+    if (dryRun) plan(file);
+    else installWorkflowRule({ root, file, written });
+  }
+
   if (spec.mcp) {
     const target = spec.mcp(root);
     if (dryRun) plan(target.file);
@@ -457,6 +472,12 @@ export function uninstall(tool, { root = process.cwd(), scope = 'project', dryRu
     if (dryRun) plan(file);
     else if (ownedByTeamflow(file)) removeFile(file, written, { marker: 'TeamFlow' });
     else removeBlock(file, written);
+  }
+
+  if (tool === 'claude-code') {
+    const file = path.join(root, 'CLAUDE.md');
+    if (dryRun) plan(file);
+    else uninstallWorkflowRule({ root, file, written });
   }
 
   if (spec.mcp) {

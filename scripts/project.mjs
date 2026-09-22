@@ -156,6 +156,6 @@ export async function resolveProject(repository, config = {}, options = {}) {
   }
   if (!listed.ok) return { known: false, line: UNKNOWN_PROJECT, reason: listed.reason };
   const found = projectFor(repository, listed.projects);
-  if (found) return { known: true, name: found.name, line: found.name };
+  if (found) return { known: true, id: found.id, name: found.name, line: found.name };
   return { known: true, none: true, line: NO_PROJECT };
 }

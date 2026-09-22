@@ -22,11 +22,18 @@
 // The skill reads the sentence and calls this with flags.
 
 import crypto from 'node:crypto';
+import fs from 'node:fs';
 import {
-  actorsForKey, adoptWorkflow, readWorkflows, reportScope, resolveGithubRepo, saveSession,
+  actor, actorsForKey, adoptWorkflow, fetchState, readWorkflows, reportScope, resolveGithubRepo, saveSession,
   sendReport, trackerOf, unclaimedWorkflows, workflowsPath, writeWorkflows,
 } from './core.mjs';
-import { cardFor, cardLine, publishCard, readTracker, readWriteBack } from './card.mjs';
+import {
+  POINT_TEXT_MAX, POINTS_MAX, POINTS_PER_ROUND_MAX, advance, pointLine,
+} from './points.mjs';
+import { cardFor, cardLine, planSession, publishCard, readTracker, readWriteBack } from './card.mjs';
+
+// The plan's session block lives beside the card it is stamped on.
+export { planSession };
 
 // Mirrors adapters/teamflow/schema.py. The service is the enforcement;
 // these exist so a typo is a message here rather than a 400 there.
@@ -36,7 +43,13 @@ export const TRACKERS = ['jira', 'linear', 'github'];
 // (MACLEOD-601): `teamflow tidy` writes it on an empty planning run
 // nobody ever filled. Not `cancelled`, which says somebody decided
 // against work they meant to do.
-export const STATUSES = ['planning', 'running', 'blocked', 'done', 'cancelled', 'archived'];
+// `stalled` is a running run whose ticket stands at a gate that has had
+// no verdict past twice its deadline (MACLEOD-639): the deploy gate on
+// one live ticket said "running" for 41 hours because nothing ever aged
+// it. The run is not blocked -- nobody decided anything -- and it is not
+// done; it is waiting on a gate that will never answer by itself, and
+// `stalledOn` names which. There is no `finished`: `done` is that.
+export const STATUSES = ['planning', 'running', 'blocked', 'done', 'cancelled', 'archived', 'stalled'];
 export const TICKET_STATES = ['waiting', 'running', 'done', 'blocked', 'skipped', 'rework'];
 // Where a ticket is in the cycle. Coarser than the stage the hooks
 // report, on purpose: the board draws the stage from what it observed,
@@ -73,7 +86,9 @@ export const USAGE = `teamflow workflow — the pool of tickets a run works thro
       exactly where it is.
 
   teamflow workflow status <planning|running|blocked|done|cancelled> [--to <name>]
-      Move the whole workflow.
+      Move the whole workflow. \`stalled\` is written by the plugin itself
+      when a ticket's gate has had no verdict past twice its deadline,
+      and cleared when that gate moves.
 
   teamflow workflow plan [--keys A,B,C] [--to <name>]
       Fill the pool. --keys is the selection in tracker priority order,
@@ -95,12 +110,34 @@ export const USAGE = `teamflow workflow — the pool of tickets a run works thro
   teamflow workflow ready [--to <name>]
       What the current phase has open. This is what a run starts next.
 
-  teamflow workflow ticket <KEY> [--state <s>] [--cycle <c>] [--reason <why>] [--to <name>]
+  teamflow workflow ticket <KEY> [--state <s>] [--cycle <c>] [--reason <why>] [--note <text>]
+      [--findings <text>] [--finding <text>]... [--findings-file <path>] [--rechecked] [--done <ID>]... [--reopen <ID>]... [--to <name>]
       Move one ticket through the cycle. States: waiting, running, done,
       blocked, skipped, rework. Cycle: build, test, audit, status,
       deploy, verified, rework. Publishes the ticket's own card as well
       as the run's record, and prints what the card AND the tracker now
-      say.
+      say. --note is one sentence you wrote for the Status view (one
+      line, at most 120 characters); --note "" clears it.
+      Audit results go on the card for <KEY> and in its History. They
+      never replace earlier ones.
+      --findings is a short summary. With --state rework, it is a failed
+      round. With another state and --cycle audit, it is a pass.
+      --finding is one problem the audit found. Give it once for each
+      problem, with --state rework. Each one becomes a failure point on
+      the card (F1, F2, ...). The next build, test and audit work from
+      these points.
+      Nothing is marked fixed because it was left out. A report in two
+      parts is two calls: the second adds its points to the same round.
+      Points close in two ways only:
+        --done F2 marks one point as fixed.
+        --rechecked says the audit checked everything again. Then every
+        open audit point it does not list is marked fixed. A pass with
+        --rechecked marks them all fixed. A pass without it closes nothing.
+      --findings-file reads one problem from each line of a file.
+      --reopen F2 opens a fixed point again.
+      A rework with no text still counts as a round. Each line is at
+      most 280 characters. Write for a layman: short sentences, common
+      words, no internal names. TeamFlow does not change your words.
 
   teamflow workflow reconcile [--dry-run]
       Every divergence between the runs, the cards, the executions and
@@ -150,6 +187,227 @@ export function find(state, wanted) {
 // repository selects several hundred tickets, so a cap set for an
 // issue report's evidence list would silently lose most of a pool.
 export const CAPS = { tickets: 1000, dependencies: 2000, phases: 200 };
+
+/** The longest note `teamflow workflow ticket --note` keeps; `WORKFLOW_NOTE_MAX` in schema.py. */
+export const NOTE_MAX = 120;
+
+/**
+ * A ticket's note (MACLEOD-639, ADHOC-14): the sentence the command line
+ * passed and nothing else, as one line with every control character gone
+ * and whitespace collapsed, capped like a rework summary. It is shown on
+ * the Status view, so an escape sequence in it would be somebody's text
+ * drawing on a reader's screen.
+ */
+export function noteLine(text, cap = NOTE_MAX) {
+  return String(text ?? '')
+    .replace(/[\r\n\t\v\f\u2028\u2029]+/g, ' ')
+    // eslint-disable-next-line no-control-regex
+    .replace(/[\u0000-\u001f\u007f-\u009f]/g, '')
+    .replace(/\s{2,}/g, ' ')
+    .trim()
+    .slice(0, cap)
+    .trim();
+}
+
+/**
+ * A gate's verdicts on the ticket it judged, and the failure points they
+ * raise (MACLEOD-639, ADHOC-19).
+ *
+ * The owner, verbatim: "audit failures should add their summary to the
+ * ticket when they send it back to be reworked each time"; "audit
+ * summaries should get added to the card they audited. and add to its
+ * history"; "if an audit fails - the reasons must get added to the card
+ * history - as a list"; and "Each card that fails a gate ... should get
+ * sent back with a reason and failure points. Each subsequent
+ * rebuild/retest checks those points off in turn."
+ *
+ * So a verdict is appended per round and never rewritten, and each reason
+ * a failed round gives becomes a point on the card (`F1`, `F2`, ... for a
+ * point a person wrote), kept by points.mjs's one rule: a point failed
+ * again stays open and counts another round, the next audit that lists its
+ * findings checks off the rest, `--done` checks one off by hand and
+ * `--reopen` opens it again. Points are never deleted. The caps mirror
+ * schema.py.
+ */
+export const VERDICTS_MAX = 20;
+export const VERDICT_SUMMARY_MAX = POINT_TEXT_MAX;
+export const ITEMS_MAX = POINTS_MAX;
+
+const who = (by) => (by ? String(by).slice(0, 64) : undefined);
+const pointId = (id) => String(id ?? '').trim().toUpperCase();
+
+/** The latest round recorded at a gate, or 0. */
+function lastRound(ticket, gate) {
+  return (ticket.verdicts || []).filter((v) => v.gate === gate)
+    .reduce((most, v) => Math.max(most, Number(v.round) || 0), 0);
+}
+
+/**
+ * Check points off by hand, or open them again. `doneRound` is the round
+ * the fix answers: the latest round at the point's gate. An id the card
+ * does not have is an error, never a silent no-op.
+ */
+export function markPoints(ticket, { done = [], reopen = [], by, at = new Date().toISOString() } = {}) {
+  const points = ticket.points || [];
+  const doneIds = new Set(done.map(pointId).filter(Boolean));
+  const reopenIds = new Set(reopen.map(pointId).filter(Boolean));
+  const unknown = [...doneIds, ...reopenIds].filter((id) => !points.some((point) => point.id === id));
+  if (unknown.length) throw new Error(`${ticket.key} has no point ${unknown.join(', ')}`);
+  for (const point of points) {
+    if (doneIds.has(point.id) && point.state !== 'done') {
+      point.state = 'done';
+      point.doneAt = at;
+      point.doneRound = lastRound(ticket, point.gate) || point.from;
+      if (who(by)) point.doneBy = who(by);
+    }
+    if (reopenIds.has(point.id) && point.state === 'done') {
+      point.state = 'open';
+      delete point.doneAt;
+      delete point.doneRound;
+      delete point.doneBy;
+    }
+  }
+}
+
+const sameIds = (a = [], b = []) => a.length === b.length && a.every((id, i) => id === b[i]);
+
+/** What the last recorded verdict said, for the command to print. Never saved. */
+const verdictNotes = new WeakMap();
+
+/** The sentence about the verdict this ticket's last move recorded, or nothing. */
+export function verdictNote(ticket) {
+  return verdictNotes.get(ticket);
+}
+
+const GATE_WORDS = { audit: 'Audit', test: 'Tests', deploy: 'Deploy', build: 'Build', status: 'Merge', verified: 'Check on dev', rework: 'Rework' };
+const pointsWord = (n) => `${n} ${n === 1 ? 'point' : 'points'}`;
+
+/**
+ * Record the verdict this move makes, and the points it raises, or nothing.
+ *
+ * Nothing is ever closed by omission (the owner's dogfood, ADHOC-20: an
+ * audit report that arrived in two parts marked the first part's points
+ * fixed). So:
+ *
+ *  - a failed round with `--finding` only ADDS points; open points it does
+ *    not list stay open;
+ *  - a second call at the same gate with no new rework in between belongs
+ *    to the same round: its findings are appended to that round;
+ *  - points close only by `--done <ID>`, or when the audit says it checked
+ *    everything again with `--rechecked` -- a failed re-audit, whose
+ *    unlisted open points are fixed, or a pass, which fixes them all;
+ *  - a pass without `--rechecked` closes nothing and says how many points
+ *    are still open.
+ *
+ * The round is the attempt at that gate: the fails recorded there, plus
+ * one for a new round. The same words said twice are one verdict.
+ */
+function recordVerdict(ticket, {
+  entering, state, summaryText, findings = [], gate, by, at, rechecked = false,
+}) {
+  const failed = state === 'rework';
+  if (!failed && summaryText === undefined && !rechecked) return undefined;
+  if (!gate) return undefined;
+  const verdict = failed ? 'fail' : 'pass';
+  const summary = pointLine(summaryText, VERDICT_SUMMARY_MAX);
+  const list = ticket.verdicts || [];
+  const last = list[list.length - 1];
+  const previous = [...list].reverse().find((one) => one.gate === gate);
+  const points = ticket.points || [];
+  const next = points.reduce((most, point) => Math.max(most, Number(/^F(\d+)$/.exec(point.id)?.[1]) || 0), 0) + 1;
+  const run = (round) => advance(points, {
+    gate,
+    round,
+    at,
+    by: who(by),
+    failing: failed ? findings.map((text) => ({ text })) : [],
+    judgedAll: rechecked,
+    idFor: (_point, i) => `F${next + i}`,
+  });
+  const fixedBy = (ran) => [...new Set([
+    ...(previous?.open || []).filter((id) => ran.points.find((point) => point.id === id)?.state === 'done'),
+    ...ran.fixed,
+  ])];
+  const unchanged = (ran) => ran.points.length === points.length
+    && ran.points.every((point, i) => point.rounds === points[i]?.rounds && point.state === points[i]?.state);
+  const name = GATE_WORDS[gate] || 'Check';
+
+  // The same round, a second batch: appended, never a new round.
+  if (failed && !entering && last && last.gate === gate && last.verdict === 'fail') {
+    const ran = run(last.round);
+    if (!ran.raised.length && unchanged(ran) && (!summary || summary === (last.summary || ''))) return undefined;
+    ticket.points = ran.points;
+    const into = { ...last };
+    if (summary) into.summary = summary;
+    if (ran.raised.length) into.raised = [...(last.raised || []), ...ran.raised];
+    const fixed = [...new Set([...(last.fixed || []), ...fixedBy(ran)])];
+    if (fixed.length) into.fixed = fixed;
+    if (ran.open.length) into.open = ran.open;
+    else delete into.open;
+    if (ran.notAdded) into.notAdded = (last.notAdded || 0) + ran.notAdded;
+    ticket.verdicts = [...list.slice(0, -1), into];
+    verdictNotes.set(ticket, `Added ${pointsWord(ran.raised.length)} to round ${last.round}.`
+      + (ran.fixed.length ? ` Marked ${pointsWord(ran.fixed.length)} fixed.` : ''));
+    return into;
+  }
+
+  const fails = list.filter((one) => one.gate === gate && one.verdict === 'fail')
+    .reduce((most, one) => Math.max(most, Number(one.round) || 0), 0);
+  const round = fails + 1;
+  // A pass said twice is one pass.
+  if (!failed && last && last.gate === gate && last.verdict === 'pass' && (last.summary || '') === summary) {
+    const replay = run(last.round);
+    if (!replay.raised.length && unchanged(replay)) return undefined;
+  }
+  const ran = run(round);
+  const fixed = fixedBy(ran);
+  ticket.points = ran.points;
+  const out = { gate, verdict, round, at };
+  if (who(by)) out.by = who(by);
+  if (summary) out.summary = summary;
+  if (ran.raised.length) out.raised = ran.raised;
+  if (fixed.length) out.fixed = fixed;
+  if (ran.open.length) out.open = ran.open;
+  // Failures not added because the card already holds 50 open points.
+  if (ran.notAdded) out.notAdded = ran.notAdded;
+  ticket.verdicts = [...list, out].slice(-VERDICTS_MAX);
+  const still = ran.open.length;
+  verdictNotes.set(ticket, failed
+    ? `${name} sent ${ticket.key} back for rework (round ${round}). Added ${pointsWord(ran.raised.length)}.`
+      + (ran.fixed.length ? ` Marked ${pointsWord(ran.fixed.length)} fixed.` : '')
+    : `${name} passed.${still ? ` ${still === 1 ? '1 point is' : `${still} points are`} still open.` : ''}`
+      + (ran.fixed.length ? ` Marked ${pointsWord(ran.fixed.length)} fixed.` : ''));
+  return out;
+}
+
+/**
+ * The open failure points on a card, in plain words, for whoever picks it
+ * up (`teamflow status`, `teamflow workflow show <KEY>`). Empty when there
+ * are none.
+ */
+export function pointLines(ticket) {
+  const points = ticket?.points || [];
+  if (!points.length) return [];
+  const open = points.filter((point) => point.state === 'open');
+  const done = points.length - open.length;
+  if (!open.length) return [`${ticket.key}: all ${points.length} failure points are fixed.`];
+  return [
+    `${ticket.key}: ${open.length} failure ${open.length === 1 ? 'point is' : 'points are'} open. ${done} of ${points.length} fixed.`,
+    ...open.map((point) => `  [ ] ${point.id} ${point.text}${point.rounds > 1 ? ` (failed ${point.rounds} times)` : ''}`),
+    `When you fix one, mark it done: teamflow workflow ticket ${ticket.key} --done <ID>`,
+  ];
+}
+
+/** The open points for a key, from every run this organisation holds on this machine. */
+export function openPointLines(config, key) {
+  const wanted = String(key || '').trim();
+  if (!wanted) return [];
+  const runs = Object.values(load(config).workflows || {});
+  const ticket = runs.flatMap((run) => run.tickets || [])
+    .filter((one) => one.key === wanted && (one.points || []).length)
+    .sort((a, b) => String(b.updatedAt || '').localeCompare(String(a.updatedAt || '')))[0];
+  return ticket ? pointLines(ticket) : [];
+}
 
 function pick(source, names) {
   const out = {};
@@ -214,7 +472,7 @@ export function published(workflow) {
     name: workflow.name,
     status: workflow.status,
     tickets: (workflow.tickets || []).slice(0, CAPS.tickets).map(
-      (t) => pick(t, ['key', 'rank', 'phase', 'state', 'cycle', 'addedBy', 'updatedAt'])),
+      (t) => pick(t, ['key', 'rank', 'phase', 'state', 'cycle', 'addedBy', 'updatedAt', 'note'])),
     dependencies: (workflow.dependencies || []).slice(0, CAPS.dependencies).map(
       (d) => pick(d, ['from', 'on', 'reason', 'found'])),
     phases: (workflow.phases || []).slice(0, CAPS.phases).map((phase) => ({
@@ -236,6 +494,20 @@ export function published(workflow) {
    */
   const owner = ownerFields(workflow.actor);
   if (owner) out.actor = owner;
+  // Which gate the run is waiting on, and since when (MACLEOD-639).
+  // Only while stalled: a run that moved on has nothing to say here.
+  if (workflow.status === 'stalled' && workflow.stalledOn?.key) {
+    out.stalledAt = workflow.stalledAt;
+    out.stalledOn = { key: workflow.stalledOn.key, gate: String(workflow.stalledOn.gate).slice(0, 40) };
+  }
+  // What the plugin did to the run by itself (WS-H): resumed, and why.
+  if (Array.isArray(workflow.hygiene) && workflow.hygiene.length) {
+    out.hygiene = workflow.hygiene.slice(-20).map((row) => pick(row, ['at', 'action', 'by', 'reason']));
+  }
+  // A run the plugin created because a session dispatched work without
+  // one (MACLEOD-639). The board draws it as unplanned -- a run with
+  // nodes and no edges -- rather than as a plan somebody wrote.
+  if (workflow.origin === 'auto') out.origin = 'auto';
   const filter = pick(workflow.filter, ['tracker', 'project', 'state', 'label', 'order']);
   if (Object.keys(filter).length) out.filter = filter;
   if (workflow.scope) out.scope = pick(workflow.scope, ['deploy']);
@@ -258,6 +530,24 @@ export async function publish(workflow, config, { flush = true } = {}) {
 
 function now() {
   return new Date().toISOString();
+}
+
+/** Every value of a flag that may be given more than once. */
+function flags(args, name) {
+  const out = [];
+  args.forEach((arg, i) => {
+    if (arg !== `--${name}`) return;
+    const value = args[i + 1];
+    if (value === undefined || value.startsWith('--')) throw new Error(`--${name} needs a value`);
+    out.push(value);
+  });
+  return out;
+}
+
+/** One finding per non-empty line of a file, for a long list (ADHOC-19). */
+function findingsFile(file) {
+  if (file === undefined) return [];
+  return fs.readFileSync(file, 'utf8').split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
 }
 
 function flag(args, name) {
@@ -302,7 +592,8 @@ export function buildFilter(args) {
 export function own(workflow, config, info) {
   if (!workflow) return workflow;
   if (ownerFields(workflow.actor)) return workflow;
-  if (workflow.status !== 'running') return workflow;
+  // A stalled run is a running run waiting on a gate; it is still live.
+  if (workflow.status !== 'running' && workflow.status !== 'stalled') return workflow;
   const owner = stated(config || {}, info || {});
   if (owner) workflow.actor = owner;
   return workflow;
@@ -364,13 +655,28 @@ export function add(workflow, key) {
  * run knows whether that was this ticket's test gate or a team checking
  * something on the way past.
  */
-export function move(workflow, key, { state, cycle } = {}) {
+export function move(workflow, key, {
+  state, cycle, note, findings, finding = [], done = [], reopen = [], by, rechecked = false,
+} = {}) {
   const ticket = (workflow.tickets || []).find((t) => t.key === String(key || '').trim());
   if (!ticket) throw new Error(`${key} is not in "${workflow.name}"`);
+  if (finding.length && state !== 'rework') {
+    throw new Error('--finding goes with --state rework. Use --findings for a pass.');
+  }
+  // One round holds 20 findings. More is refused out loud, never cut.
+  const given = new Set(finding.map((one) => pointLine(one)).filter(Boolean)).size;
+  if (given > POINTS_PER_ROUND_MAX) {
+    throw new Error(`You gave ${given} findings. One round holds ${POINTS_PER_ROUND_MAX}. Split them or merge some.`);
+  }
+  const entering = state === 'rework' && ticket.state !== 'rework';
   if (state !== undefined) {
     if (!TICKET_STATES.includes(state)) {
       throw new Error(`A ticket state is one of ${TICKET_STATES.join(', ')}`);
     }
+    // Each time a ticket is sent back is one failure, counted so the
+    // retry policy (selfheal.mjs) answers each failure once, however
+    // many commands ask about it. Local; never published.
+    if (state === 'rework' && ticket.state !== 'rework') ticket.failures = (ticket.failures || 0) + 1;
     ticket.state = state;
   }
   if (cycle !== undefined) {
@@ -378,6 +684,44 @@ export function move(workflow, key, { state, cycle } = {}) {
       throw new Error(`A cycle step is one of ${CYCLES.join(', ')}`);
     }
     ticket.cycle = cycle;
+  }
+  // Only what `--note` passed. An empty note clears the old one.
+  if (note !== undefined) {
+    const line = noteLine(note);
+    if (line) ticket.note = line;
+    else delete ticket.note;
+  }
+  /*
+   * The gate's verdict and its items, on this ticket and no other
+   * (ADHOC-19). Items are checked off first, so a round recorded by the
+   * same command already sees them done.
+   */
+  const at = new Date().toISOString();
+  verdictNotes.delete(ticket);
+  if (done.length || reopen.length) markPoints(ticket, { done, reopen, by, at });
+  recordVerdict(ticket, {
+    entering,
+    state,
+    summaryText: findings !== undefined ? findings : (state === 'rework' ? note : undefined),
+    findings: finding,
+    gate: ticket.cycle || (ticket.state === 'rework' ? 'rework' : undefined),
+    by,
+    at,
+    rechecked,
+  });
+  /*
+   * Naming a gate again restarts it (MACLEOD-639). A gate that was closed
+   * as `idle` -- no verdict past twice its deadline -- is derived idle
+   * for as long as the ticket stands there, so `--state running --cycle
+   * deploy` on a ticket already running at deploy is the one way to say
+   * "run it again": the old clock is dropped and the next report starts
+   * a new one. Anything short of naming the gate leaves it closed.
+   */
+  if (state === 'running' && cycle !== undefined && (ticket.gates?.[cycle] === 'idle' || ticket.skipped?.[cycle])) {
+    if (ticket.gates) delete ticket.gates[cycle];
+    if (ticket.gateClock) delete ticket.gateClock[cycle];
+    // A gate a person skipped is a gate again once somebody runs it.
+    if (ticket.skipped) delete ticket.skipped[cycle];
   }
   ticket.updatedAt = new Date().toISOString();
   // Phase states are derived from their tickets, so moving one ticket
@@ -416,8 +760,103 @@ const GATES = {
   deploy: { slot: 'deploy', kind: 'deploy', stage: 'DEPLOY_DEV', label: 'Deploy gate' },
 };
 
+/** Cycle → the sidecar slot its gate is written to. What selfheal.mjs reads. */
+export const GATE_SLOTS = Object.freeze(Object.fromEntries(Object.entries(GATES).map(([cycle, gate]) => [cycle, gate.slot])));
+
 /** Cycles in the order a ticket passes through them. */
 const CYCLE_ORDER = ['build', 'test', 'audit', 'status', 'deploy', 'verified'];
+
+// --- how long a gate may run before nobody believes it (MACLEOD-639) --
+//
+// The owner's rule 4, verbatim: a started gate with no finish past its
+// deadline is "no verdict", never "running forever". The board draws a
+// running gate as doubtful at 1x its deadline; this side, the writer,
+// closes it at 2x, so a deploy that takes 45 minutes is amber at 30 and
+// nothing is WRITTEN until 60. The two numbers are one table so the
+// derivation and the revisit cannot disagree about when.
+//
+// Minutes, keyed by slot, with a family fallback so a gate id the
+// pipeline invents (`sonar`, `smoke-eu`) still has a deadline: anything
+// naming an audit or a security check is an audit, `deploy` is a
+// deploy, and everything else is a build or a test. An organisation
+// overrides any of them under `delivery.gate_deadlines`, which the
+// service serves in the bundle and a plugin config may spell locally.
+
+/** The defaults, in minutes: deploy 30, ci/test 2 h, audit 1 h. */
+export const GATE_DEADLINE_MIN = Object.freeze({ deploy: 30, ci: 120, audit: 60 });
+
+/**
+ * The organisation's overrides, as the plugin config spells them:
+ * `delivery.gate_deadlines`, minutes by slot or family. The same key the
+ * service serves in the bundle as `deadlines`; a caller that has read
+ * the bundle passes that object straight through instead.
+ */
+export function gateDeadlinesOf(config = {}) {
+  const delivery = config?.delivery;
+  const given = delivery?.gate_deadlines ?? delivery?.gateDeadlines;
+  return given && typeof given === 'object' ? given : {};
+}
+
+/**
+ * What the plugin, or a person through it, did to the run by itself
+ * (MACLEOD-639): `resumed`, `skipped`. The same row shape the service's
+ * hygiene sidecar keeps, on the run, capped, published with it.
+ */
+export function hygieneRow(workflow, action, by, reason, at = now()) {
+  const row = { at, action: String(action).slice(0, 40), by: String(by || 'plugin').slice(0, 80), reason: String(reason).slice(0, 120) };
+  workflow.hygiene = [...(workflow.hygiene || []), row].slice(-20);
+  return row;
+}
+
+/** The retry policy as the plugin config spells it (`delivery.retry`); selfheal.mjs reads the numbers. */
+function policyFor(config = {}) {
+  const given = config?.delivery?.retry;
+  const attempts = Number(given?.attempts);
+  return {
+    attempts: Number.isInteger(attempts) && attempts > 0 ? Math.min(attempts, 20) : 3,
+    reworkCap: Number.isInteger(Number(given?.reworkCap)) && Number(given?.reworkCap) > 0 ? Number(given.reworkCap) : 16,
+  };
+}
+
+/** Which default a gate id falls back to. Any string; nothing is enumerated. */
+export function gateFamily(slot) {
+  const id = String(slot || '').toLowerCase();
+  if (id === 'deploy' || /\bdeploy/.test(id)) return 'deploy';
+  if (/audit|security|scan|sonar/.test(id)) return 'audit';
+  return 'ci';
+}
+
+/**
+ * A gate's deadline in milliseconds: the org's number for this slot, or
+ * for its family (`test` is read as `ci`, as the spec spells it), or the
+ * default. A value that is not a positive number is ignored rather than
+ * turned into "no deadline", because no deadline is the bug.
+ */
+export function gateDeadlineMs(slot, deadlines = {}) {
+  const family = gateFamily(slot);
+  const given = deadlines && typeof deadlines === 'object' ? deadlines : {};
+  const candidates = [given[slot], given[family], family === 'ci' ? given.test : undefined];
+  const minutes = candidates.map(Number).find((n) => Number.isFinite(n) && n > 0);
+  return (minutes || GATE_DEADLINE_MIN[family]) * 60 * 1000;
+}
+
+/** How far past 2x a gate's clock has run: positive when it is overdue. */
+function overdueMs(startedAt, slot, now, deadlines) {
+  const started = Date.parse(startedAt || '');
+  if (!Number.isFinite(started)) return -Infinity;
+  const at = typeof now === 'string' ? Date.parse(now) : Number(now);
+  if (!Number.isFinite(at)) return -Infinity;
+  return (at - started) - 2 * gateDeadlineMs(slot, deadlines);
+}
+
+/** `41 h`, `3 d`, `50 min`: the age a summary prints. */
+function ageWords(ms) {
+  const minutes = Math.max(1, Math.round(ms / 60000));
+  if (minutes < 90) return `${minutes} min`;
+  const hours = Math.round(minutes / 60);
+  if (hours < 48) return `${hours} h`;
+  return `${Math.round(hours / 24)} d`;
+}
 
 /**
  * What each gate's verdict IS, read off the ticket as it stands now.
@@ -436,17 +875,33 @@ const CYCLE_ORDER = ['build', 'test', 'audit', 'status', 'deploy', 'verified'];
  * passed it, one sent back at it has failed it, one standing at it is
  * running it, and one that has not reached it has no verdict at all. No
  * local state is consulted, so no local state can be lost.
+ *
+ * With one clock (MACLEOD-639). "Running" is believed for twice the
+ * gate's deadline from when it was first said, and after that the same
+ * derivation answers `idle`: no verdict. The clock is the only local
+ * thing read here, and losing it costs nothing worse than a restarted
+ * clock -- which is conservative, never an aged one. The deadline sits
+ * INSIDE the derivation rather than in a separate revisit so that the
+ * two cannot flap: whatever asks, at whatever time, gets one answer.
  */
-function gateStatuses(ticket) {
+export function gateStatuses(ticket, { now = Date.now(), deadlines } = {}) {
   const at = CYCLE_ORDER.indexOf(ticket.cycle);
   const out = {};
   for (const cycle of Object.keys(GATES)) {
     const index = CYCLE_ORDER.indexOf(cycle);
+    // A gate a person passed the ticket over (`skip_gate`, MACLEOD-639)
+    // has no verdict and never gains one from the ticket moving on: it
+    // reads `idle` with the person's reason, not `success`, for as long
+    // as nobody runs it. Only once the ticket is at or past it.
+    if (ticket.skipped?.[cycle] && (ticket.state === 'done' || (at >= 0 && at >= index))) out[cycle] = 'idle';
     // `done` is past every gate, whatever cycle it stopped at: a ticket
     // cannot be finished with a gate still to pass.
-    if (ticket.state === 'done' || (at >= 0 && at > index)) out[cycle] = 'success';
+    else if (ticket.state === 'done' || (at >= 0 && at > index)) out[cycle] = 'success';
     else if (at === index && ticket.state === 'rework') out[cycle] = 'failed';
-    else if (at === index && ticket.state === 'running') out[cycle] = 'running';
+    else if (at === index && ticket.state === 'running') {
+      const started = ticket.gateClock?.[cycle]?.startedAt;
+      out[cycle] = overdueMs(started, GATES[cycle].slot, now, deadlines) > 0 ? 'idle' : 'running';
+    }
   }
   return out;
 }
@@ -464,42 +919,75 @@ function gateStatuses(ticket) {
  * A gate the ticket has not reached is left alone rather than cleared:
  * `wanted` says nothing about it, and a verdict already on the board
  * (a ticket sent back from audit all the way to build) is still true.
+ *
+ * All or nothing (MACLEOD-639). When any verdict changes, every gate
+ * that HAS a verdict is written in the same command, not only the one
+ * that moved. One live ticket showed its test gate `running` under a
+ * deploy gate that had passed, because the earlier write was lost and
+ * the later one had no reason to say it again; three sidecars written
+ * together cannot be produced in that order. A command that changes
+ * nothing still writes nothing.
  */
-export function gateReports(workflow, ticket, { reason, at = now() } = {}) {
+export function gateReports(workflow, ticket, { reason, at = now(), deadlines } = {}) {
   const told = (ticket.gates && typeof ticket.gates === 'object') ? ticket.gates : {};
-  const wanted = gateStatuses(ticket);
+  const clocks = (ticket.gateClock && typeof ticket.gateClock === 'object') ? ticket.gateClock : {};
+  const wanted = gateStatuses(ticket, { now: at, deadlines });
+  if (!Object.entries(wanted).some(([cycle, status]) => told[cycle] !== status)) return [];
+  const session = planSession(workflow);
   const out = [];
 
   for (const [cycle, status] of Object.entries(wanted)) {
-    if (told[cycle] === status) continue;
     const gate = GATES[cycle];
     const was = told[cycle];
+    const clock = clocks[cycle] || {};
+    /*
+     * The clock. A gate that is still the same run keeps the moment it
+     * started, whatever `updatedAt` the rewrite carries; anything that
+     * has ended keeps both ends. A gate starting now -- first time, or
+     * again after a refusal or a close -- starts a new one.
+     */
+    const continuing = was === 'running' && clock.startedAt && !clock.endedAt;
+    const startedAt = status === 'running' ? (continuing ? clock.startedAt : at) : clock.startedAt;
+    const endedAt = status === 'running' ? undefined : (clock.endedAt || at);
     const summary = status === 'failed'
-      ? (reason || `${gate.label} sent this back`)
+      ? (reason || ticket.lastFailure || `${gate.label} sent this back`)
       : status === 'running'
         ? (was === 'failed'
           ? `Back at the ${gate.label.toLowerCase()} after rework`
           : `${gate.label} running`)
-        : `${gate.label} passed${was === 'failed' ? ' on the way back' : ''}`;
-    out.push({
+        : status === 'idle'
+          ? (ticket.skipped?.[cycle]
+            ? `skipped by ${ticket.skipped[cycle].by}: ${ticket.skipped[cycle].reason}`
+            : `No verdict from the ${gate.label.toLowerCase()} for ${ageWords(Date.parse(at) - Date.parse(startedAt || at))}`)
+          : `${gate.label} passed${was === 'failed' ? ' on the way back' : ''}`;
+    const payload = {
+      jiraKey: ticket.key,
       slot: gate.slot,
-      cycle,
-      payload: {
-        jiraKey: ticket.key,
-        slot: gate.slot,
-        // One id per gate per workflow, so a pass replaces the refusal it
-        // answers instead of sitting beside it. A sidecar lives at
-        // `runtime/<key>/<slot>.json`, so two tickets sharing an id are
-        // two separate files and neither stands on the other.
-        id: `${workflow.id}-${gate.slot}`.slice(0, 120),
-        kind: gate.kind,
-        label: gate.label,
-        stage: gate.stage,
-        status,
-        summary: String(summary).slice(0, 180),
-        updatedAt: at,
-      },
-    });
+      // One id per gate per workflow, so a pass replaces the refusal it
+      // answers instead of sitting beside it. A sidecar lives at
+      // `runtime/<key>/<slot>.json`, so two tickets sharing an id are
+      // two separate files and neither stands on the other.
+      id: `${workflow.id}-${gate.slot}`.slice(0, 120),
+      kind: gate.kind,
+      label: gate.label,
+      // The plan's, not a person's: a gate verdict is the run's word.
+      session,
+      stage: gate.stage,
+      status,
+      summary: String(summary).slice(0, 180),
+      updatedAt: at,
+    };
+    if (startedAt) payload.startedAt = startedAt;
+    if (endedAt) payload.endedAt = endedAt;
+    // The plugin's own retry policy on this gate (selfheal.mjs): which
+    // attempt a re-run is, or that the attempts are spent and why. Not
+    // on a pass: a gate that passed has nothing left to retry.
+    const retry = ticket.gateRetry?.[cycle];
+    if (retry && status !== 'success') {
+      const { failure: _local, ...block } = retry;
+      payload.retry = block;
+    }
+    out.push({ slot: gate.slot, cycle, payload });
   }
 
   return out;
@@ -517,6 +1005,95 @@ export function gateReports(workflow, ticket, { reason, at = now() } = {}) {
  */
 export function gateSaid(ticket, verdict) {
   ticket.gates = { ...(ticket.gates || {}), [verdict.cycle]: verdict.payload.status };
+  // And the clock the board was told, so the next rewrite carries it
+  // forward instead of starting the gate again (MACLEOD-639).
+  const clock = { saidAt: verdict.payload.updatedAt };
+  if (verdict.payload.startedAt) clock.startedAt = verdict.payload.startedAt;
+  if (verdict.payload.endedAt) clock.endedAt = verdict.payload.endedAt;
+  ticket.gateClock = { ...(ticket.gateClock || {}), [verdict.cycle]: clock };
+  // A pass ends the retry loop on that gate.
+  if (verdict.payload.status === 'success' && ticket.gateRetry) delete ticket.gateRetry[verdict.cycle];
+}
+
+/**
+ * The service closed a gate this plan still believes is running.
+ *
+ * The nightly sweep writes `idle` from its own clock, and a plugin whose
+ * clock is younger -- restarted after a lost hint, say -- would write
+ * `running` straight back over it, and the two would take turns for
+ * ever (MACLEOD-639). So a service-written `idle` newer than anything
+ * this plan said is taken as SAID: the hint records it, and the clock
+ * takes the sidecar's own start, backdated past 2x when the sidecar
+ * carries none, so the derivation agrees with the hint rather than
+ * arguing with it. Naming the gate again (`move`) is what reopens it.
+ *
+ * Returns whether anything was adopted. Pure: the sidecar is passed in.
+ */
+export function toldByService(ticket, cycle, sidecar, { deadlines } = {}) {
+  const gate = GATES[cycle];
+  if (!gate || !sidecar || sidecar.status !== 'idle') return false;
+  const said = ticket.gateClock?.[cycle]?.saidAt;
+  const theirs = Date.parse(sidecar.updatedAt || '');
+  if (!Number.isFinite(theirs)) return false;
+  if (said && Date.parse(said) >= theirs) return false;
+  const startedAt = sidecar.startedAt
+    || new Date(theirs - 2 * gateDeadlineMs(gate.slot, deadlines) - 60 * 1000).toISOString();
+  ticket.gates = { ...(ticket.gates || {}), [cycle]: 'idle' };
+  ticket.gateClock = {
+    ...(ticket.gateClock || {}),
+    [cycle]: { startedAt, endedAt: sidecar.endedAt || sidecar.updatedAt, saidAt: sidecar.updatedAt },
+  };
+  return true;
+}
+
+// --- the run, waiting on a gate (MACLEOD-639) -------------------------
+
+/**
+ * Which ticket's gate, if any, has had no verdict past twice its
+ * deadline. The first one in rank order; a run is stalled once.
+ */
+export function stalledGate(workflow, { now = Date.now(), deadlines } = {}) {
+  for (const ticket of workflow.tickets || []) {
+    if (ticket.state !== 'running') continue;
+    for (const [cycle, status] of Object.entries(gateStatuses(ticket, { now, deadlines }))) {
+      if (status === 'idle') return { key: ticket.key, gate: GATES[cycle].slot };
+    }
+  }
+  return undefined;
+}
+
+/**
+ * Move the run between `running` and `stalled` from what its gates say.
+ *
+ * Written by the plugin itself, on every command that touches the run,
+ * because the orchestrator is the one thing that cannot be relied on to
+ * notice: the deploy that stalled the live run happened in the main
+ * session under another key. `stalledAt` is the first moment the run
+ * was found stalled ON THIS GATE and is kept while it stays so; a run
+ * stalled on a second gate later is stalled again, from then. Only a
+ * running or stalled run is touched -- `blocked`, `cancelled`, `done`
+ * are somebody's decision.
+ */
+export function restall(workflow, { now = Date.now(), deadlines } = {}) {
+  if (!workflow || !['running', 'stalled'].includes(workflow.status)) return false;
+  const at = new Date(typeof now === 'string' ? Date.parse(now) : now).toISOString();
+  const on = stalledGate(workflow, { now, deadlines });
+  if (on) {
+    const same = workflow.status === 'stalled'
+      && workflow.stalledOn?.key === on.key && workflow.stalledOn?.gate === on.gate;
+    if (same) return false;
+    workflow.status = 'stalled';
+    workflow.stalledOn = on;
+    workflow.stalledAt = at;
+    workflow.updatedAt = at;
+    return true;
+  }
+  if (workflow.status !== 'stalled') return false;
+  workflow.status = 'running';
+  delete workflow.stalledOn;
+  delete workflow.stalledAt;
+  workflow.updatedAt = at;
+  return true;
 }
 
 // --- the ticket's own card, and the end of the run --------------------
@@ -616,7 +1193,8 @@ function line(ticket, workflow) {
     .map((d) => d.on);
   const where = ticket.cycle ? `${ticket.state}/${ticket.cycle}` : ticket.state;
   const on = waits.length ? `  waits on ${waits.join(', ')}` : '';
-  return `    ${String(ticket.rank).padStart(3)}. ${ticket.key}  ${where}${on}`;
+  const how = ticket.addedBy === 'dispatch' ? '  (dispatched)' : '';
+  return `    ${String(ticket.rank).padStart(3)}. ${ticket.key}  ${where}${on}${how}`;
 }
 
 export function render(workflow, state) {
@@ -625,6 +1203,10 @@ export function render(workflow, state) {
   const filter = Object.entries(workflow.filter || {})
     .map(([k, v]) => `${k}=${v}`).join(' ') || 'none';
   out.push(`${workflow.name} (${workflow.id}) — ${workflow.status}`);
+  if (workflow.origin === 'auto') {
+    out.push('  created by TeamFlow when this session dispatched work without a run.'
+      + ' Its edges are unknown: `teamflow workflow depends` draws the phases.');
+  }
   out.push(`  filter: ${filter}`);
   out.push(`  deploy in scope: ${workflow.scope?.deploy ? 'yes' : 'no'}`);
   if (workflow.order) out.push(`  asked for: ${workflow.order}   (stays on this machine)`);
@@ -915,9 +1497,44 @@ export async function main(args, {
   if (sub === 'ticket') {
     const key = rest.filter((a) => !a.startsWith('--'))[0];
     const ticket = move(target, key, {
-      state: flag(rest, 'state'), cycle: flag(rest, 'cycle'),
+      state: flag(rest, 'state'), cycle: flag(rest, 'cycle'), note: flag(rest, 'note'),
+      findings: flag(rest, 'findings'),
+      finding: [...flags(rest, 'finding'), ...findingsFile(flag(rest, 'findings-file'))],
+      done: flags(rest, 'done'),
+      reopen: flags(rest, 'reopen'),
+      // Only an audit that checked everything again closes what it omits.
+      rechecked: rest.includes('--rechecked'),
+      // The orchestrating person, as a report names them (`actor`).
+      by: actor(config, info).displayName,
     });
-    const said = gateReports(target, ticket, { reason: flag(rest, 'reason') });
+    if (verdictNote(ticket)) print(verdictNote(ticket));
+    const deadlines = gateDeadlinesOf(config);
+    const at = now();
+    /*
+     * What the service already closed (MACLEOD-639). One read, for the
+     * one gate this ticket stands at, before deciding what to say about
+     * it: a sweep that wrote `idle` over a gate this plan still believes
+     * is running is taken as said, not argued with. Never fatal, and
+     * skipped for a ticket standing at no gate.
+     */
+    const standing = Object.entries(gateStatuses(ticket, { now: at, deadlines }))
+      .find(([, status]) => status === 'running');
+    if (standing) {
+      const [cycle] = standing;
+      const read = await fetchState(`issues/${encodeURIComponent(ticket.key)}/${GATES[cycle].slot}.json`, config)
+        .catch(() => ({ ok: false }));
+      if (read.ok && read.document) toldByService(ticket, cycle, read.document, { deadlines });
+    }
+    /*
+     * The one place the orchestrator consults the retry policy (WS-H):
+     * after the move and before the gates are said, so the verdicts
+     * written below carry the attempt they are, or the delay they have
+     * become. What it prints is the plugin's own state.
+     */
+    const { healRun, settle } = await import('./selfheal.mjs');
+    const healed = healRun(target, { now: at, deadlines, policy: policyFor(config) });
+    for (const line of healed.lines) print(`TeamFlow: ${line}`);
+    const said = gateReports(target, ticket, { reason: flag(rest, 'reason'), at, deadlines });
     /*
      * And every OTHER ticket in the pool (MACLEOD-593). This is the
      * revisiting: a gate chip is only ever as true as the last write,
@@ -927,10 +1544,15 @@ export async function main(args, {
      * the board already says what the ticket says -- in the ordinary
      * case this loop sends nothing at all -- and it is what repairs a
      * board after a marker was lost, without anybody noticing it was.
+     * Including, now, a gate that has run past twice its deadline on a
+     * ticket this command did not touch: that is the one that stalled
+     * the live run for 41 hours (MACLEOD-639).
      */
     const repaired = (target.tickets || [])
       .filter((t) => t !== ticket)
-      .flatMap((t) => gateReports(target, t).map((verdict) => ({ on: t, verdict })));
+      .flatMap((t) => gateReports(target, t, { at, deadlines }).map((verdict) => ({ on: t, verdict })));
+    // The run's own word about itself: stalled on a gate, or not.
+    settle(target, { now: at, deadlines });
     save(state, config);
     await publish(target, config);
     // After the workflow, so a board that draws the loop already knows
@@ -1039,7 +1661,22 @@ export async function main(args, {
   }
 
   if (sub === 'show') {
-    const named = find(state, rest.filter((a) => !a.startsWith('--'))[0]) || target;
+    const wanted = rest.filter((a) => !a.startsWith('--'))[0];
+    // A card's key, not a run's name: that card and its failure points (ADHOC-19).
+    const card = !find(state, wanted) && wanted
+      ? (target.tickets || []).find((t) => t.key === String(wanted).trim())
+      : undefined;
+    if (card) {
+      print(`${card.key} is ${card.state}${card.cycle ? ` at ${card.cycle}` : ''}.`);
+      const lines = pointLines(card);
+      print(lines.length ? lines.join('\n') : `${card.key} has no failure points.`);
+      if (lines.length) {
+        print('A point closes only when you mark it done, or when an audit checks everything again '
+          + `and says so: teamflow workflow ticket ${card.key} --cycle audit --rechecked.`);
+      }
+      return 0;
+    }
+    const named = find(state, wanted) || target;
     print(render(named, state));
     return 0;
   }
@@ -1255,4 +1892,58 @@ export function dependsBatch(workflow, entries, { found } = {}) {
   const edges = wanted.map((edge) => recordEdge(workflow, edge.from, edge.on, edge));
   relevel(workflow);
   return edges;
+}
+
+// --- a run the plugin makes for itself (MACLEOD-639, ADHOC-13) --------
+//
+// Every plan and every dispatched agent is a node on the board, and the
+// tool guarantees it rather than the orchestrator remembering. These
+// three are what dispatch.mjs calls from a hook: they touch the state
+// in place, and the caller saves and publishes once.
+
+/**
+ * The run a dispatch joins: the current one when it is live, else the
+ * newest live one. Live is anything not over -- `planning`, `running`,
+ * `blocked` and `stalled` -- because a plan somebody is still writing is
+ * still the plan this work belongs to.
+ */
+export function liveRun(state = {}) {
+  const live = (w) => w && !['done', 'cancelled', 'archived'].includes(w.status);
+  const current = state.workflows?.[state.current];
+  if (live(current)) return current;
+  return Object.values(state.workflows || {})
+    .filter(live)
+    .sort((a, b) => String(b.createdAt || '').localeCompare(String(a.createdAt || '')))[0] || null;
+}
+
+/**
+ * A run nobody asked for, created because work was dispatched and there
+ * was none. `origin: auto` is what the board reads as "unplanned"; the
+ * name is derived from the bound ticket or the date, never from a
+ * prompt, and there is no `--order-text` because nothing was asked.
+ * Running from the start: the agents it holds are working now.
+ */
+export function autoCreate(state, name, owner) {
+  let clean = String(name || '').trim().slice(0, NAME_MAX) || 'Unplanned run';
+  if (find(state, clean)) clean = `${clean} ${new Date().toISOString().slice(11, 16)}`.slice(0, NAME_MAX);
+  const workflow = create(clean, [], state, owner);
+  workflow.origin = 'auto';
+  workflow.status = 'running';
+  return workflow;
+}
+
+/**
+ * A node the plugin put in the pool because an agent was sent to work
+ * on it. `addedBy: dispatch` is the difference from `manual`: nobody
+ * chose it, the hooks saw it. Running at build from its first hook,
+ * because the agent is already working; levelled so the run has phases
+ * -- one, until edges are drawn.
+ */
+export function addDispatched(workflow, key) {
+  const ticket = add(workflow, key);
+  ticket.addedBy = 'dispatch';
+  ticket.state = 'running';
+  ticket.cycle = 'build';
+  relevel(workflow);
+  return ticket;
 }

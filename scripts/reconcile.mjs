@@ -80,6 +80,21 @@ import { cardOwed, cardSaid, openTickets, publish } from './workflow.mjs';
 export const IDLE_MS = 30 * 60 * 1000;
 
 /**
+ * The one idle clock (MACLEOD-639). The service serves the organisation's
+ * `idle_after` in the bundle as `idleAfter` (minutes), and the sweep, the
+ * board's freshness band and this pass must all read the same number or
+ * a run is ended by one and drawn live by another. A caller that has read
+ * the bundle passes it as `served`; a plugin config may spell it under
+ * `delivery.idle_after`; otherwise `IDLE_MS` stands. A value that is not
+ * a positive number is ignored, because "no idle clock" is the bug.
+ */
+export function idleClock({ served, config } = {}) {
+  const minutes = [served?.idleAfter, served?.idle_after, config?.delivery?.idle_after, config?.delivery?.idleAfter]
+    .map(Number).find((n) => Number.isFinite(n) && n > 0);
+  return minutes ? minutes * 60 * 1000 : IDLE_MS;
+}
+
+/**
  * How long an empty planning run waits before `teamflow tidy` offers to
  * retire it.
  *
@@ -488,7 +503,7 @@ export function trackerAgrees(tracker, ticket) {
  */
 export async function reconcile(config = {}, {
   limit = LIMIT, now = Date.now(), dryRun = false, deep = false, exceptSession,
-  at = new Date().toISOString(), announce,
+  at = new Date().toISOString(), announce, served, idleMs = idleClock({ served, config }),
 } = {}) {
   const state = readWorkflows(config);
   /*
@@ -517,6 +532,7 @@ export async function reconcile(config = {}, {
     actors: ownActors(config),
     bindings: deep ? ownBindings(config) : [],
     now,
+    idleMs,
     deep,
     exceptSession,
   });
@@ -754,7 +770,7 @@ export async function reconcileOnHook(config = {}, { network = true, limit = 2, 
       if (!fs.existsSync(dir)) return 0;
       const now = Date.now();
       const at = new Date().toISOString();
-      const repairs = planSilentActors(ownActors(config), { now, exceptSession: sessionId })
+      const repairs = planSilentActors(ownActors(config), { now, idleMs: idleClock({ config }), exceptSession: sessionId })
         .slice(0, limit)
         .map((one) => ({ ...one, id: `execution:${one.sessionId}:${one.agentKey || ''}` }));
       if (!repairs.length) return 0;

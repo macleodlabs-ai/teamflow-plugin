@@ -26,6 +26,19 @@
         ]
       }
     ],
+    "PreToolUse": [
+      {
+        "matcher": "Agent|Task",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node",
+            "args": ["${CLAUDE_PLUGIN_ROOT}/scripts/hook.mjs"],
+            "timeout": 2
+          }
+        ]
+      }
+    ],
     "PostToolUse": [
       {
         "matcher": "*",

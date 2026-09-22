@@ -70,6 +70,7 @@ const USAGE = `teamflow \u2014 delivery reporting for TeamFlow
   teamflow logout                  remove the session
   teamflow org [switch <id>]       which organisation this session syncs under
   teamflow status                  who is signed in, what is bound, what was sent
+  teamflow gates                   the checks your organisation added that this card must still pass
   teamflow bind <issue> [--local] | unbind
                                    name the ticket by hand, or stop; --local writes
                                    the binding inside the repository, for a worktree
@@ -86,11 +87,18 @@ const USAGE = `teamflow \u2014 delivery reporting for TeamFlow
   teamflow tidy [--dry-run]        repair every divergence between the runs, the
                                    cards, the executions and the trackers
   teamflow doctor                  transport, account, tracker MCP and connections
+  teamflow config set intake on|off
+                                   whether this machine shows fixes a lead writes
+                                   on your ticket (on by default)
+  teamflow ci start|end|fail|run <gate> [--url <https>] [-- <command>]
+                                   report a CI gate's start and finish; \`run\`
+                                   runs the command and retries it for you
   teamflow trackers [list]         the issue trackers this org has connected
   teamflow trackers connect <tracker> [--projects a,b] [--filter <team>]
                                    authorise a tracker; prints the URL to open
   teamflow repos [list|add]        register a repository for CI OIDC
   teamflow admin code [create|list|revoke]  invite codes, for superadmins
+  teamflow admin comp <account> [--days N]  complimentary time for an existing account
   teamflow admin launch [--confirm]         end demo mode; run once, on the day
   teamflow report --issue ... --stage ...   report one stage transition
   teamflow skills install --for <tool>      install these skills into another tool
@@ -148,6 +156,55 @@ async function trackerConnections(config) {
   } catch (error) {
     return { ok: false, reason: error instanceof Error ? error.message : String(error) };
   }
+}
+
+/**
+ * The pipeline this repository's project draws (ADHOC-20), as
+ * `GET /v1/members/pipeline?project=<id>` resolves it: the project's own
+ * copy, else the organisation's, else the default. Undefined when it
+ * cannot be asked; a person is then told nothing rather than something
+ * wrong.
+ */
+async function fetchPipeline(config, projectId) {
+  const cred = await credential(config);
+  if (!cred) return undefined;
+  try {
+    const query = projectId ? `?project=${encodeURIComponent(projectId)}` : '';
+    const response = await fetch(`${serviceUrl(config)}/v1/members/pipeline${query}`, {
+      headers: { [cred.header]: cred.value },
+      redirect: 'error',
+      signal: AbortSignal.timeout(Number(config.serviceTimeoutMs || 5000)),
+    });
+    if (!response.ok) return undefined;
+    const body = await response.json();
+    return Array.isArray(body?.pipeline?.gates) ? body.pipeline : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/** The custom gates this card still has to pass, in plain words. */
+async function gatesToPass(state, project) {
+  const pipeline = await fetchPipeline(config, project?.id);
+  if (!pipeline) return undefined;
+  const { gateLines } = await import('./checks.mjs');
+  return gateLines(pipeline, config.checks || {}, state?.stage || 'BACKLOG');
+}
+
+async function gates() {
+  const state = latestSessionForCwd(cwd, config);
+  const project = await resolveProject(info.repository, config);
+  const lines = await gatesToPass(state, project);
+  if (!lines) {
+    print('TeamFlow could not read your organisation\'s columns. Sign in with /teamflow:login and try again.');
+    return;
+  }
+  if (!lines.length) {
+    print(`No extra checks stand between ${state?.binding?.key || 'this card'} and Done.`);
+    return;
+  }
+  print(`Before ${state?.binding?.key || 'this card'} can go on, it must pass these checks:`);
+  for (const line of lines) print(`- ${line}`);
 }
 
 // One connection, on one line: which tracker, what it is filtered to, which
@@ -213,6 +270,9 @@ async function status() {
   // the checkout it was made from, and a session outside git gets the
   // organisation's default rather than an error.
   const project = await resolveProject(info.repository, config);
+  // What the card still has to pass on the organisation's columns
+  // (ADHOC-20), so a person or an agent puts them in the plan.
+  const toPass = credentialKind(config) ? await gatesToPass(state, project) : undefined;
   const stale = staleBuild();
   // What has not reached the service, and what a flush threw away and
   // why. A hook cannot say either — it exits 0 and prints nothing — so
@@ -234,6 +294,30 @@ async function status() {
   // TeamFlow's own entry in /mcp (MACLEOD-637), from local state only.
   const { mcpReadinessLine } = await import('./mcp.mjs');
   const teamflowMcp = await mcpReadinessLine(config);
+  // Every agent this session dispatched, and how each is on the board
+  // (MACLEOD-639, ADHOC-13). Printed always, so "0 unrepresented" is a
+  // fact somebody checked and not a line that was never there.
+  const { dispatchLine, dispatchSummary } = await import('./dispatch.mjs');
+  const dispatched = dispatchLine(dispatchSummary(state?.sessionId));
+  /*
+   * Fixes from a lead, first (MACLEOD-639, ruling 10). `status` is the
+   * first thing somebody runs when a ticket has stopped, and a lead may
+   * already have written down why and what to do: it is printed before
+   * the report, in that person's name, and the service is told it was
+   * seen. Guidance for the reader, never something this command runs.
+   */
+  const { intakePass } = await import('./intake.mjs');
+  const asked = await intakePass(config, { key: state?.binding?.key, cwd });
+  for (const line of asked.notices) print(`TeamFlow: ${line}`);
+  for (const row of asked.performed) print(`TeamFlow ${row.outcome} ${row.kind} on ${row.key}${row.reason ? `: ${row.reason}` : ''}`);
+  // The open failure points on the bound card (ADHOC-19): the checklist a
+  // team picking the card up works from, so nobody has to ask what is left.
+  const { openPointLines } = await import('./workflow.mjs');
+  for (const line of openPointLines(config, state?.binding?.key)) print(line);
+  // And the plugin's own retries, delays and resumes (WS-H): its state,
+  // its words, nothing for the reader to run.
+  const { tick } = await import('./selfheal.mjs');
+  for (const line of (await tick(config, { note: false })).lines) print(line);
   print({
     tenantId: tenantId(config),
     pluginVersion: pluginVersion() || 'unknown',
@@ -266,6 +350,8 @@ async function status() {
     status: state?.status,
     summary: state?.summary,
     loopCount: state?.loopCount || 0,
+    ...(toPass?.length ? { checksToPass: toPass } : {}),
+    dispatched,
     lastPublishResult: state?.lastPublishResult,
     // Machine-wide, and until a report is accepted again (MACLEOD-620).
     ...(readSoftRefusal(reportScope(config)) ? { reportingPaused: readSoftRefusal(reportScope(config)).reason } : {}),
@@ -447,6 +533,10 @@ async function doctor() {
   // the /mcp helper would print, then asked for its tools.
   const { mcpStatus, mcpStatusLine } = await import('./mcp.mjs');
   const teamflowMcp = mcpStatusLine(await mcpStatus(config));
+  // Dispatched agents and their representation (MACLEOD-639, ADHOC-13):
+  // a finding when the last number is not 0, and proof when it is.
+  const { dispatchLine, dispatchSummary } = await import('./dispatch.mjs');
+  const dispatched = dispatchLine(dispatchSummary(latestSessionForCwd(cwd, config)?.sessionId));
   const report = {
     claudeProbe: claudeBin ? 'ran' : `skipped: ${claudeSkipped}`,
     pluginVersion: pluginVersion() || 'unknown',
@@ -460,6 +550,7 @@ async function doctor() {
       ? { outbox: outboxLine(outbox) }
       : {}),
     reconcile: tidied || 'no pass recorded yet; run `teamflow tidy`',
+    dispatched,
     transport,
     serviceUrl: serviceUrl(config),
     // Findings, not trivia (MACLEOD-616). Either one means reports are
@@ -923,6 +1014,7 @@ try {
     const { main } = await import('./hooks.mjs');
     process.exit(await main(args, { cwd, config }));
   } else if (command === 'status') await status();
+  else if (command === 'gates') await gates();
   else if (command === 'bind') await bind();
   else if (command === 'work-on') await workOn();
   else if (command === 'next') {
@@ -934,6 +1026,12 @@ try {
   else if (command === 'workflow') {
     const { main } = await import('./workflow.mjs');
     process.exit(await main(args, { cwd, config, info }));
+  }
+  else if (command === 'ci') {
+    // Owns its exit code: the reporter always exits 0 -- reporting never
+    // fails a build -- and `run` exits with the command's own code.
+    const { ciMain } = await import('./runtime-report.mjs');
+    process.exit(await ciMain(args, { cwd, config }));
   }
   else if (command === 'adhoc') {
     const { main } = await import('./adhoc.mjs');
@@ -957,6 +1055,18 @@ try {
       // (MACLEOD-603), so this end only prints them.
       announce: (lines) => { for (const line of lines) print(line); },
     })));
+  }
+  else if (command === 'config') {
+    // `teamflow config set intake on|off`: whether this machine takes
+    // fixes a lead writes on a ticket (MACLEOD-639, ruling 10). On by
+    // default; off fetches nothing and tells the service nothing.
+    const [verb, name, value] = args;
+    if (verb !== 'set' || name !== 'intake') throw new Error('Usage: teamflow config set intake on|off');
+    const { setIntake } = await import('./intake.mjs');
+    const on = setIntake(value);
+    print(on
+      ? 'TeamFlow will show fixes a lead writes on your ticket at the start of a session and in `teamflow status`.'
+      : 'TeamFlow will not fetch fixes written on your tickets for this machine. `teamflow config set intake on` turns it back on.');
   }
   else if (command === 'doctor') await doctor();
   else if (command === 'login') await login();
