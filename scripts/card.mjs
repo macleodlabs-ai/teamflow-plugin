@@ -74,8 +74,8 @@ const LOCAL_GATES = new Set(['build', 'test', 'audit', 'status', 'rework']);
 /** What each cycle is called in a sentence. Mirrors GATES in workflow.mjs. */
 const CYCLE_WORDS = {
   build: 'build',
-  test: 'test gate',
-  audit: 'audit gate',
+  test: 'test check',
+  audit: 'audit check',
   status: 'merge',
   deploy: 'deploy',
   verified: 'verification',

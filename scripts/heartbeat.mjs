@@ -25,6 +25,7 @@ import { execFile, execFileSync, spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
 import * as core from './core.mjs';
+import { sentence } from './words.mjs';
 
 export const BEAT_MS = 120_000;
 // How often the process looks at the session and the stop mark between
@@ -177,7 +178,7 @@ export function pauseOf(sessionId, now = Date.now()) {
  */
 export function notifyDesktop(key, { platform = process.platform, run = execFile } = {}) {
   const who = keyOf(key) ? `${key} is waiting` : 'Claude Code is waiting';
-  const text = `${who}. The usage limit has reset. Type continue in Claude Code.`;
+  const text = [who, 'The usage limit has reset', 'Type continue in Claude Code'].map(sentence).join(' ');
   const args = platform === 'darwin'
     ? ['osascript', ['-e', `display notification "${text}" with title "TeamFlow"`]]
     : platform === 'linux' ? ['notify-send', ['TeamFlow', text]] : undefined;
@@ -308,7 +309,8 @@ export function sessionLines(sessionId, cwd, { alive = isAlive } = {}) {
     });
     if (shared) {
       folder = true;
-      lines.push('Another Claude Code session is working in this folder. Use a worktree so your changes do not collide.');
+      lines.push('Another Claude Code session is working in this folder. '
+        + 'Work in a separate copy (`git worktree add`) so your changes do not collide.');
     }
   }
   if (lines.length) core.writeJson(saidPath(sessionId), { told: [...told].slice(-50), folder });

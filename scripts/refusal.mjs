@@ -43,7 +43,7 @@ export const REFUSAL_REASONS = Object.assign(Object.create(null), {
   // above it lifts by itself — the moment somebody subscribes — and the
   // board they left is the board they get back, so the sentence says so.
   trial_ended: 'Your TeamFlow trial has ended. Subscribe to keep your board updating: '
-    + 'https://codercat.io/app/#organisation — the board stays readable and nothing was deleted.',
+    + 'https://codercat.io/app/#organisation — the board stays readable and TeamFlow deleted nothing.',
   // MACLEOD-620's two soft refusals: the owner's exact sentences, each with
   // its remedy, and the fair use guide as a line of its own after them.
   usage_exceeds_plan: 'Usage on the credential exceeds the plan. Contact us to discuss Enterprise plans.'

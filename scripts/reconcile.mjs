@@ -463,7 +463,7 @@ export function trackerAgrees(tracker, ticket) {
   if (!tracker.connected) return { ok: true };
   if (FINISHED.has(tracker.event)) return { ok: true };
   if (tracker.event === 'reopened') {
-    return { ok: false, why: `${tracker.provider || 'the tracker'} says it was reopened` };
+    return { ok: false, why: `${tracker.provider || 'the tracker'} says somebody reopened it` };
   }
   /*
    * Parsed, never compared as text. `occurredAt` comes through the
@@ -479,7 +479,7 @@ export function trackerAgrees(tracker, ticket) {
   if (Number.isFinite(spoke) && Number.isFinite(verdict) && spoke > verdict) {
     return {
       ok: false,
-      why: `${tracker.provider || 'the tracker'} has said something about it since the run's verdict`,
+      why: `${tracker.provider || 'the tracker'} has said something about it since the run's result`,
     };
   }
   return { ok: true };
@@ -798,7 +798,7 @@ export function renderPass(pass) {
   const reports = pass.repairs.filter((one) => one.kind !== 'execution').length;
   out.push(pass.dryRun
     ? `${pass.repairs.length} divergence${pass.repairs.length === 1 ? '' : 's'}, `
-      + `${reports} report${reports === 1 ? '' : 's'} to send, and nothing was changed:`
+      + `${reports} report${reports === 1 ? '' : 's'} to send, and TeamFlow changed nothing:`
     : `${pass.repairs.length} divergence${pass.repairs.length === 1 ? '' : 's'}:`);
   /*
    * Matched by id and never by the sentence (audit finding 6). Two

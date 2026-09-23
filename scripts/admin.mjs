@@ -231,7 +231,7 @@ async function list(config) {
   if (!result.ok) return report(result);
   const rows = rowsOf(result.body);
   if (!rows.length) {
-    out('No invite codes have been issued.');
+    out('Nobody has issued an invite code yet.');
     return EXIT_OK;
   }
   out(renderTable(rows));
@@ -278,7 +278,7 @@ async function comp(config, account, flags) {
     if (!planned.ok) {
       // The free time above is already set; say both halves.
       return report(planned.signedOut ? planned
-        : { ...planned, reason: `Free time was set. The plan was not changed: ${planned.reason}` });
+        : { ...planned, reason: `TeamFlow set the free time. It did not change the plan: ${planned.reason}` });
     }
     line('plan', planned.body.plan || flags.plan);
     if (planned.body.seats) line('seats', planned.body.seats);

@@ -9,6 +9,7 @@ import { refusalOf } from './refusal.mjs';
 import { TOOL_CAPABILITIES } from './tools.mjs';
 import { checkNameFor, checkNames, readChecks } from './checks.mjs';
 import { advance as advancePoints, stableId } from './points.mjs';
+import { title as plainTitle } from './words.mjs';
 import {
   countedByFile, pointFamily, readFailingTests, runnerFamily, testFile, testScope, withFamily,
 } from './failing-tests.mjs';
@@ -3345,8 +3346,8 @@ export function classifyTool(input, state, config) {
   const isLocalTest = TEST_RE.test(command)
     || Boolean(config.testCommand && command.includes(String(config.testCommand).trim()));
 
-  if (event === 'SubagentStart') return { summary: 'Subagent started', heartbeat: true };
-  if (event === 'SubagentStop') return { summary: 'Subagent finished', heartbeat: true };
+  if (event === 'SubagentStart') return { summary: 'Agent started', heartbeat: true };
+  if (event === 'SubagentStop') return { summary: 'Agent finished', heartbeat: true };
   if (event === 'TaskCompleted') return { summary: state.summary || 'Task completed', heartbeat: true };
 
   if (tool === 'Edit' || tool === 'Write' || tool === 'MultiEdit' || tool === 'NotebookEdit') {
@@ -3545,6 +3546,7 @@ function withHistory(state, transition, updatedAt, cleared) {
   let lastFailure = fresh ? undefined : state.lastFailure;
   let testPoints = fresh ? [] : (state.testPoints || []);
   let testRound = fresh ? 0 : (state.testRound || 0);
+  let testsPassed = fresh ? undefined : state.testsPassed;
   const by = actedBy(state);
 
   // A test run checks its points off in turn (ADHOC-19): a test that
@@ -3566,6 +3568,7 @@ function withHistory(state, transition, updatedAt, cleared) {
       idFor: (point) => stableId('T', 'test', point.key),
     }).points;
   }
+  testsPassed = passedRun(transition, updatedAt, testsPassed);
 
   if (transition.incrementLoop && transition.reworkFrom) {
     cycleClosed = false;
@@ -3589,7 +3592,27 @@ function withHistory(state, transition, updatedAt, cleared) {
     historyKey: key || state.historyKey,
     testPoints,
     testRound,
+    testsPassed,
   };
+}
+
+/*
+ * What the newest passing test run covered (MACLEOD-646): its runner's
+ * family, whether it ran that whole family, and the test files its
+ * command named. File paths only -- the identifier a failure point's key
+ * already carries -- never a test's name or output. The service ticks an
+ * acceptance criterion linked to one of these files. Any failed test run
+ * clears it, so a pass is never read after a later failure.
+ */
+export function passedRun(transition, at, held) {
+  if (transition.incrementLoop && ['LOCAL_TEST', 'DEV_TEST'].includes(transition.reworkFrom)) return undefined;
+  const run = transition.testRun;
+  if (!run || run.failing.length || !run.family) return held;
+  const files = (run.files || []).slice(0, 20).map((file) => String(file).slice(0, 160));
+  // `complete` is true for a run of named files in full too; `all` is the
+  // whole family, which only a run that named no file is.
+  const all = run.complete === true && !(run.files || []).length;
+  return { family: run.family, all, ...(files.length ? { files } : {}), at };
 }
 
 /**
@@ -3941,6 +3964,20 @@ export function sessionBlock(state = {}, info = {}) {
   return block;
 }
 
+/**
+ * An ad hoc card's title (MACLEOD-646): the `adhoc start` line, else the
+ * dispatched agent's name and one-line task, through the writer. Never
+ * the prompt, which no state holds. Undefined when nothing better than
+ * "Agent work" is known, so the service keeps the title it already has.
+ */
+export function adHocTitle(state = {}) {
+  const agent = state.agent || {};
+  const raw = state.jira?.title || state.binding?.title || state.dispatch?.title
+    || [agentLabel(agent.name, 64), agentLabel(agent.task, 80)].filter(Boolean).join(': ');
+  const plain = raw ? plainTitle(raw) : undefined;
+  return plain && plain !== 'Agent work' ? plain : undefined;
+}
+
 export function issuePayload(state, config, info) {
   if (!state.binding?.key) return undefined;
   const key = state.binding.key;
@@ -3952,7 +3989,8 @@ export function issuePayload(state, config, info) {
     tracker,
     jiraKey: key,
     jiraUrl,
-    title: state.jira?.title,
+    // Every ad hoc card carries a readable title (MACLEOD-646).
+    title: isAdHocKey(key) ? adHocTitle(state) : state.jira?.title,
     jiraStatus: state.jira?.status,
     parentKeys: state.jira?.parentKeys,
     project: issueProject(key, tracker),
@@ -3978,6 +4016,8 @@ export function issuePayload(state, config, info) {
     ...(state.transitions?.length ? { transitions: state.transitions.slice(-TRANSITIONS_MAX) } : {}),
     // ADHOC-19: the failing tests this session has seen, as failure points.
     ...(state.testPoints?.length ? { points: state.testPoints.slice(-50) } : {}),
+    // MACLEOD-646: what the newest passing test run covered, file paths only.
+    ...(state.testsPassed ? { testsPassed: state.testsPassed } : {}),
     // MACLEOD-510. Set by refreshDelivery, and absent rather than empty
     // outside a repository or when the branch has no pull request.
     git: state.git,
@@ -4082,6 +4122,8 @@ export function sanitizePayload(value, { kind = 'issue' } = {}) {
     'waitingOn','rework','lastFailure','transitions',
     // ADHOC-19: a gate's verdicts on the ticket it judged, scoped below.
     'verdicts', 'points',
+    // MACLEOD-646: a passing test run's reach, scoped below.
+    'testsPassed',
   ]);
   /*
    * MACLEOD-639: what only one document kind may carry at its root. A
@@ -4149,7 +4191,11 @@ export function sanitizePayload(value, { kind = 'issue' } = {}) {
   // it failed in, and when it was fixed. Never output, a message or a log.
   const pointOnly = new Set(['id', 'gate', 'key', 'text', 'from', 'rounds', 'lastRound', 'state', 'at', 'by',
     'doneAt', 'doneRound', 'doneBy']);
+  // A passing test run's reach (MACLEOD-646): a family, whether it ran all
+  // of it, the test files the command named, and when. Never a test name.
+  const testsPassedOnly = new Set(['family', 'all', 'files', 'at']);
   const nested = {
+    testsPassed: testsPassedOnly,
     agent: agentOnly, session: sessionOnly,
     rework: reworkOnly, lastFailure: failureOnly, transitions: transitionOnly,
     attempts: attemptOnly, retry: retryOnly, supersededBy: supersededOnly, actions: actionOnly,
@@ -4359,7 +4405,7 @@ export function credentialDestination(config = {}, bound = undefined) {
   const target = serviceUrl(config);
   const origin = originOf(target);
   if (!origin) {
-    return { ok: false, reason: `the configured serviceUrl (${target}) is not a URL, so no credential was sent` };
+    return { ok: false, reason: `the configured serviceUrl (${target}) is not a URL, so TeamFlow sent no credential` };
   }
   const loopback = isLoopbackOrigin(origin);
   if (!origin.startsWith('https:') && !loopback) {
@@ -4377,7 +4423,7 @@ export function credentialDestination(config = {}, bound = undefined) {
       // As in `ambientDestination`: no "sign in there instead". Where the
       // address came from an environment variable, that is the first
       // thing the reader needs, because it may not have been them.
-      reason: `this machine's credential was issued by ${bound} and was not sent to ${origin}. `
+      reason: `this machine holds a credential issued by ${bound}, so TeamFlow did not send it to ${origin}. `
         + `${provenance ? `${provenance} ` : ''}`
         // A placeholder, never the declined origin filled in: a line a
         // hurried person can paste is a line they will paste.
@@ -5887,6 +5933,7 @@ export function attributedPayload(state, attribution, config, info = {}) {
     lastFailure: undefined,
     testPoints: undefined,
     testRound: undefined,
+    testsPassed: undefined,
     waitingOn: undefined,
     transitions: [{ stage: attribution.stage, at: attribution.at, by: attribution.by }],
     evidence: [],

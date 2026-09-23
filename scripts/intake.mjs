@@ -175,7 +175,7 @@ function clock(at) {
 export function noticeFor(action = {}) {
   const by = oneLine(action.by, 80) || 'a lead';
   const gate = oneLine(action.args?.gate, 40);
-  const failure = gate ? ` for the failed ${gate} gate` : '';
+  const failure = gate ? ` for the failed ${gate} check` : '';
   const when = clock(action.at);
   const text = oneLine(action.args?.text);
   if (!text) return undefined;
@@ -303,7 +303,7 @@ function spawnDetached(argv, { cwd, env, graceMs = 1000 }) {
       const child = spawn(argv[0], argv.slice(1), { cwd, env, detached: true, stdio: 'ignore', shell: false });
       child.once('spawn', () => { child.unref(); done(resolve, child.pid); });
       child.once('error', (error) => done(reject, error));
-      setTimeout(() => done(reject, new Error('the gate did not start within a second')), graceMs).unref();
+      setTimeout(() => done(reject, new Error('the check did not start within a second')), graceMs).unref();
     } catch (error) {
       done(reject, error);
     }
@@ -354,31 +354,31 @@ export async function perform(action, {
     const idle = Object.entries(ticket.gates || {}).find(([c, status]) => status === 'idle' && !ticket.skipped?.[c])?.[0];
     const stalledHere = workflow.status === 'stalled' && workflow.stalledOn?.key === key;
     const cycle = idle || (stalledHere ? cycleFor(workflow.stalledOn?.gate) : undefined);
-    if (!cycle) return { ...said('refused', `no stalled gate on ${key}`) };
+    if (!cycle) return { ...said('refused', `${key} has no stalled check`) };
     move(workflow, key, { state: 'running', cycle });
     if (ticket.gateRetry) delete ticket.gateRetry[cycle];
     await sayGates(workflow, ticket, config, { at, deadlines, budget });
     await settleAndPublish();
-    return { ...said('done', `${cycle} gate restarted on ${key} by ${by}`) };
+    return { ...said('done', `${by} restarted the ${cycle} check on ${key}`) };
   }
 
   if (kind === 'skip_gate') {
     const reason = oneLine(action.args?.reason, REASON_MAX);
     const gate = String(action.args?.gate || '');
-    if (!gate) return { ...said('refused', 'skip_gate names no gate') };
-    if (!reason) return { ...said('refused', 'skip_gate needs a reason') };
+    if (!gate) return { ...said('refused', 'The skip names no check') };
+    if (!reason) return { ...said('refused', 'The skip needs a reason') };
     const cycle = cycleFor(gate);
-    if (!cycle) return { ...said('refused', `${gate} is not a gate this run holds`) };
-    if (ticket.cycle !== cycle) return { ...said('refused', `${key} is not at the ${cycle} gate`) };
+    if (!cycle) return { ...said('refused', `This run has no ${gate} check`) };
+    if (ticket.cycle !== cycle) return { ...said('refused', `${key} is not at the ${cycle} check`) };
     // The gate reads `idle` with the person's words from now on -- never
     // `success`, which only a run earns -- and the run records who.
     ticket.skipped = { ...(ticket.skipped || {}), [cycle]: { by, reason, at } };
     if (ticket.gateRetry) delete ticket.gateRetry[cycle];
     move(workflow, key, { state: 'running', cycle: NEXT_CYCLE[cycle] });
-    hygieneRow(workflow, 'skipped', by, `${cycle} gate on ${key} skipped: ${reason}`, at);
+    hygieneRow(workflow, 'skipped', by, `${by} skipped the ${cycle} check on ${key}: ${reason}`, at);
     await sayGates(workflow, ticket, config, { at, deadlines, budget });
     await settleAndPublish();
-    return { ...said('done', `${cycle} gate on ${key} skipped by ${by}: ${reason}`) };
+    return { ...said('done', `${by} skipped the ${cycle} check on ${key}: ${reason}`) };
   }
 
   if (kind === 'resume_plan') {
@@ -403,24 +403,24 @@ export async function perform(action, {
   // rerun_gate: this machine runs the gate only when it is on the ticket,
   // the gate is one of its own, it knows the command, and it is allowed to.
   const gate = String(action.args?.gate || '');
-  if (!gate) return { ...said('refused', 'rerun_gate names no gate') };
+  if (!gate) return { ...said('refused', 'The re-run names no check') };
   if (bound !== key) return { hold: true };
   const cycle = cycleFor(gate);
-  if (!cycle) return { ...said('refused', `${gate} is an external gate; the plugin never retries what it did not run`) };
+  if (!cycle) return { ...said('refused', `Another system runs the ${gate} check. The plugin runs only its own checks`) };
   if (cycle === 'deploy' && inWorktree(cwd)) {
     return { ...said('refused', 'deploy runs only from the main session') };
   }
   const command = gateCommand(gate, delivery);
   if (!command) {
-    return { ...said('refused', `no command configured for the ${gate} gate on this machine (delivery.gate_commands in your own config)`) };
+    return { ...said('refused', `This machine has no command for the ${gate} check. Set one in \`delivery.gate_commands\``) };
   }
   try {
     const cli = fileURLToPath(new URL('./cli.mjs', import.meta.url));
     await spawnGate([process.execPath, cli, 'ci', 'run', gate, '--jira', key, '--', ...command], { cwd, env });
   } catch (error) {
-    return { ...said('failed', `could not start the ${gate} gate: ${error?.message || error}`) };
+    return { ...said('failed', `could not start the ${gate} check: ${error?.message || error}`) };
   }
-  return { ...said('done', `${gate} gate started on ${key} by ${by}; the sidecar carries each try`) };
+  return { ...said('done', `${by} started the ${gate} check on ${key}. Each try shows on the card`) };
 }
 
 // --- the round ---------------------------------------------------------------------

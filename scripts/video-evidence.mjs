@@ -117,7 +117,7 @@ export async function attach({ key, files, post, put, gh }) {
     const sent = await put(answer.upload_url, { ...answer.headers, 'Content-Type': 'video/webm' }, first.file);
     if (!sent) return 'The Playwright video stayed on your machine: Linear did not take the upload.';
     const linked = await post('/v1/evidence/video/done', { key, asset_url: answer.asset_url, receipt: answer.receipt, expires: answer.expires });
-    return linked.ok ? `The Playwright video is on ${key}.` : `The Playwright video was uploaded but not linked: ${linked.message}`;
+    return linked.ok ? `The Playwright video is on ${key}.` : `TeamFlow uploaded the Playwright video but could not link it: ${linked.message}`;
   }
   return undefined;
 }

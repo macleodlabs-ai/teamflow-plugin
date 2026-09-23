@@ -249,7 +249,7 @@ Documents written before this shape are still read, and so are reports still sen
 - `childrenTotal` / `childrenDone`: a tally, for a tracker that counts sub-issues without naming them.
 - `relations`: `{type, key, title}` each, capped at fifty, where `type` is `blocks`, `blocked_by`, `related` or `duplicate`.
 
-Derived state, on the same rule as everything above: a key and a title name an issue. A title is capped at 120 characters. No issue description, no comment, no link comment, and no issue body — GitHub's relations are the keys read out of a body that is then dropped, never the body.
+Derived state, on the same rule as everything above: a key and a title name an issue. A title is capped at 120 characters. No issue description, no comment, no link comment, and no issue body — GitHub's relations are the keys read out of a body that is then dropped, never the body. The acceptance criteria are read out of the description the same way (MACLEOD-646, below) and land in their own document, never on this sidecar.
 
 An absent field means *this tracker did not say*, which is not the same as an empty list and is not drawn as one. `docs/TRACKERS.md` has the per-tracker table of what each webhook states and what it cannot.
 
@@ -683,7 +683,7 @@ inert as markdown on the way out: `[`, `]`, `(` and `)` are backslash-escaped,
 raw HTML tag, no bare address), mentions a person or a team, or points at
 another issue. A round that could
 not add every failure because the card already held 50 open points says so
-in its head: "2 more problems were not added. The card holds 50 open
+in its head: "TeamFlow did not add 2 more problems. The card holds 50 open
 points." Only on the Team plan and up, only where the organisation turned
 comments on for that tracker, never for a Jira connection (it holds no write
 credential), never for an ad hoc key (no tracker issue), and never for a
@@ -746,6 +746,7 @@ Four more fields on the issue document, plugin-written, and one more on the `age
 | `verdicts[]` (ADHOC-19) | `{round, gate, verdict, at, by?, summary?, raised?, fixed?, open?, notAdded?}`, the latest 20 | Every gate verdict on **this** ticket: an audit pass, or a round a gate sent it back. `gate` is a workflow cycle (`audit`, `test`, `deploy`, …), `verdict` is `pass` or `fail`, `round` is the attempt at that gate, `by` is the orchestrating person's display name (the report's `actor`). `summary` is the words the orchestrator deliberately wrote with `teamflow workflow ticket <KEY> --findings <text>` (or `--note` on a rework), like a ticket's `note`: one line, whitespace collapsed, control characters stripped, at most 280 characters, never a prompt, diff, command or log. A rework with no words is a round with no `summary`. Published on the ticket's own card, keyed by `<KEY>` and never by the session's binding. Appended, never rewritten: the plugin keeps the last 20 and the service carries the stored list across every report that leaves it out (a hook's report replaces this document whole), unioned by `(gate, verdict, round, at)`. `raised`, `fixed` and `open` are point ids (below): the points this round raised, the open ones it found fixed, and the ones still open after it. |
 | `points[]` (ADHOC-19) | `{id, gate, key?, text, from, rounds?, lastRound?, state, at, by?, doneAt?, doneRound?, doneBy?}`, 50 at most, open ones never dropped for the cap: a run that would push an open point out raises no point and counts it on its verdict as `notAdded` | Why a gate sent the card back, one line each, checked off by the runs that follow (one rule: `plugin/scripts/points.mjs`, mirrored in `adapters/teamflow/points.py`). A point failed again stays open and `rounds` goes up; a new failure is a new point in that round; a run that judged every point at its gate marks the ones it did not fail again `done` in that round. On this document the plugin writes two kinds. **Audit and recorded findings** (`F1`, `F2`, …): each `--finding <text>` a person gave to `teamflow workflow ticket <KEY> --state rework`, one line, at most 280 characters, the same sanitising as `note`, at most 20 in one round (more is refused with a sentence, never cut); `--done <ID>` and `--reopen <ID>` change `state`. Nothing is closed by omission: a failed audit only adds points, a second call at the same gate with no new rework in between adds to the same round, and only an audit given with `--rechecked` (a complete re-audit, or a pass that checked everything again) marks the open audit points it does not list `done`. A pass without `--rechecked` closes nothing. **Failing tests** (`T-<6 hex>`, gate `test`), see the next row. Points are never deleted. Carried by the service across reports that leave them out, merged by `id` with the report's copy winning. |
 | `points[]` from a test run (ADHOC-19) | **Off. The owner declined on 2026-09-22 for now; cards get a per-file count instead:** one point per failing test file with a count, `<file>: 2 tests failing` (key: the file), or `2 tests failing` when the runner names no file, and no test name. The service drops any named test point it receives. The code still holds the switches (`reporting.failingTests` in the plugin, `adapter.reporting.failingTests` in the service), both off, and they stay off unless the owner decides otherwise. What a named point would carry, for that decision: a failing test's **identifier**, its file and name as the runner printed them on its own summary line (`FAILED tests/test_x.py::test_y`, vitest `FAIL a.test.ts > group > name`, jest `● group › name`, TAP `not ok N - name`, go `--- FAIL: TestName`), with a trailing `[...]` parameter part cut off, at most 20 per run, 160 characters each. Parameter values a runner expands into the name itself (jest's `it.each` with `%s`) cannot be told from the name and stay in it | So a card a test run sent back carries which tests failed, and the next run checks each one off when it passes. Only the identifier: never the assertion message, a diff, a stack trace or any other line of output (`plugin/scripts/failing-tests.mjs`; `plugin/tests/failing-tests.test.mjs` asserts a message printed beside the name never reaches the payload). Test names come from the customer's repository, which is why this row is listed apart. Only a whole-suite run, or named test files run in full, checks a point off; a run of one file judges exactly that file's points. A directory, a filter word, a node id, a glob or a name filter (`-k`, `-t`, `--grep`, `--testNamePattern`) makes a run partial and it checks nothing off, and so does a run with more than 20 failures, whose list was cut. A run judges only its own runner's points: pytest the Python files, go the `_test.go` files, vitest, jest, mocha and node:test the JavaScript and TypeScript ones; a point whose name carries no file keeps its runner in its key (`js|group › name`). |
+| `testsPassed` (MACLEOD-646) | `{family, all, files?, at}` | What the newest **passing** test run covered, so the service can tick an acceptance criterion linked to a test file. `family` is `py`, `go` or `js` (the runner); `all` is true only for a run that named no file and no filter, so the whole family passed; `files` are the test files the command named, at most 20, each at most 160 characters -- the same class of identifier a failure point's `key` already carries. Never a test's name, the output or the command. Any failed test run clears it, so a pass is never read after a later failure. Scoped by `sanitizePayload`: `family`, `all`, `files` and `at` are allowed inside this block and nowhere else. |
 
 
 **Nothing else travels with them.** No command, no test output, no log line, no file name: `summary` is the sentence the classifier already puts in `summary` on the report, and the plugin's `sanitizePayload` allows `at` and `by` inside these blocks and nowhere else on the flat payload.
@@ -1026,6 +1027,63 @@ mark with `pingedAt`, so a card's History and the Attention row say who
 pinged and when (WS-D, both doors). The mail's clearing-link token is in the
 mail and in no stored object. The bundle serves the record as `pings {KEY:
 {pings[]}}`.
+
+## Acceptance criteria (MACLEOD-646)
+
+`criteria/<KEY>.json` — one per card, **service-written**, its own subject
+kind under the one path rule. No report writes it: `criteria` is not in
+`schema.KINDS`, and the report path never creates one. Shape
+(`schema.CRITERIA`):
+
+`{jiraKey, updatedAt, proposed?, criteria[] {id, text, source, evidence?
+{kind, ref?, auto?}, state, at, by?}, history[] {at, by?, text}, audit? {at,
+gate, total, uncovered}}`
+
+- `text` is one line, at most 120 characters, at most 20 criteria.
+  `source` is `tracker`, `proposed` or `board`. `state` is `open`, `met` or
+  `failed`. `evidence.kind` is `test` (a test file path), `check` (a
+  repository check's gate id), `audit` (`local` or `dev`) or `person`.
+  `by` is the member's address when a person changed or ticked it.
+- **Where the texts come from, and nowhere else.** (a) The ticket's own
+  description, read when a verified webhook or an import stores the issue:
+  a task list (`- [ ]`, `- [x]`) anywhere, or the bullets under an
+  "Acceptance criteria", "Done when" or "Definition of done" heading, in
+  Linear and GitHub markdown, Jira wiki text or Atlassian's document
+  format. The normaliser carries only `criteria [{text ≤ 120, ticked}]` (at
+  most 20) on the event and drops the description; `adapter.connector_event`
+  pops that off before any writer sees the event. To read it the Linear
+  import now asks for `description` and the Jira import for the
+  `description` field; GitHub's issue already carried its body. (b) When
+  the tracker gives none, fixed templates chosen by words in the title,
+  marked `proposed` until a member accepts them. (c) A member on the board.
+- **Nothing from a prompt.** No report field becomes a criterion: not the
+  legacy `acceptance[]` list, not a summary, not a title, not a failure
+  point's text. A report only moves the `state` of criteria that exist.
+- **What moves a state.** A passing test file (`testsPassed.files`, or
+  `testsPassed.all` for its family) or a fixed failure point with that file
+  as its key ticks a `test` criterion; an open failure point for the file
+  unticks it. A `check-<id>` sidecar's `success` or `failed`, an
+  `audit-local` or `audit-dev` sidecar's verdict, or the issue at
+  `LOCAL_AUDIT`/`DEV_AUDIT` `success` (or back in rework from it) does the
+  same for `check` and `audit` criteria. Idempotent: the same report twice
+  writes nothing. A criterion with no link is linked to a test file by one
+  fixed rule (every word of the file's own name is a word of the
+  criterion, and exactly one file matches), marked `auto`.
+- **The audit's line.** An audit pass while criteria have no test, check
+  or audit behind them sets `audit {gate, total, uncovered}` and one History
+  row: "The audit passed. 2 of 5 criteria have no test."
+- `history[]` — the newest 50 changes, one plain sentence each ("Tests for
+  'Sign-in works with Jira' passed."), `by` when a person made it.
+
+| Route | Who |
+| --- | --- |
+| `POST /v1/members/cards/{key}/criteria {op, id?, text?, evidence?}` | any active member, never a viewer (403 `viewer`). `op` is `add`, `edit`, `remove`, `accept`, `link`, `tick`, `untick` or `propose`. A pipeline token is refused: every change is attributed to a person |
+
+The bundle serves the documents as `criteria {KEY: {…}}`. An ad hoc card's
+criteria follow it when it is converted into a ticket.
+
+**Not yet:** writing criteria back to the tracker as a checklist. Listed as
+a follow-up on MACLEOD-646.
 
 ## Learning from outcomes (MACLEOD-639, WS-K3)
 

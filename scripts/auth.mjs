@@ -1044,7 +1044,7 @@ export function verificationUrl(given, config = {}) {
 }
 
 const DEVICE_REFUSALS = {
-  access_denied: 'the sign-in was refused in the browser',
+  access_denied: 'the browser refused the sign-in',
   expired_token: 'the code expired before anybody approved it',
   invalid_grant: 'that code is no longer valid; start again',
 };
@@ -1483,7 +1483,7 @@ async function deviceAccessToken(config, session = readSession()) {
       status: answer.status,
       error: answer.error,
       reason: answer.error === 'invalid_grant'
-        ? 'this machine is no longer authorized (the device was revoked, or its seat has gone); '
+        ? 'this machine is no longer authorized (somebody revoked the device, or its seat has gone); '
           + 'run /teamflow:login to authorize it again'
         : `could not refresh this machine's authorization: ${answer.reason || 'no access token'}`,
     };
@@ -1549,7 +1549,7 @@ async function cognitoToken(config, session, save) {
     return {
       ok: false,
       refused: true,
-      reason: 'this session names a sign-in service that is not the one it was issued by, which is '
+      reason: 'this session names a sign-in service that did not issue it, which is '
         + 'what a repository could do before this version. It has not been used. Run `teamflow login` '
         + 'again to replace it, and revoke the old session on the members page.',
     };

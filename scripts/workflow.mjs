@@ -764,9 +764,9 @@ export function move(workflow, key, {
 // never the findings' text, which quotes code.
 
 const GATES = {
-  test: { slot: 'ci', kind: 'test', stage: 'LOCAL_TEST', label: 'Test gate' },
-  audit: { slot: 'audit-local', kind: 'audit', stage: 'LOCAL_AUDIT', label: 'Audit gate' },
-  deploy: { slot: 'deploy', kind: 'deploy', stage: 'DEPLOY_DEV', label: 'Deploy gate' },
+  test: { slot: 'ci', kind: 'test', stage: 'LOCAL_TEST', label: 'Test check' },
+  audit: { slot: 'audit-local', kind: 'audit', stage: 'LOCAL_AUDIT', label: 'Audit check' },
+  deploy: { slot: 'deploy', kind: 'deploy', stage: 'DEPLOY_DEV', label: 'Deploy check' },
 };
 
 /** Cycle → the sidecar slot its gate is written to. What selfheal.mjs reads. */
@@ -967,7 +967,7 @@ export function gateReports(workflow, ticket, { reason, at = now(), deadlines } 
         : status === 'idle'
           ? (ticket.skipped?.[cycle]
             ? `skipped by ${ticket.skipped[cycle].by}: ${ticket.skipped[cycle].reason}`
-            : `No verdict from the ${gate.label.toLowerCase()} for ${ageWords(Date.parse(at) - Date.parse(startedAt || at))}`)
+            : `No result from the ${gate.label.toLowerCase()} for ${ageWords(Date.parse(at) - Date.parse(startedAt || at))}`)
           : `${gate.label} passed${was === 'failed' ? ' on the way back' : ''}`;
     const payload = {
       jiraKey: ticket.key,
@@ -1352,7 +1352,7 @@ export async function main(args, {
       return 1;
     }
     print(`TeamFlow adopted "${taken.name}" (${taken.id}) into this organisation. `
-      + 'Nothing was sent and nothing was removed.');
+      + 'TeamFlow sent nothing and removed nothing.');
     return 0;
   }
 
@@ -1619,7 +1619,7 @@ export async function main(args, {
       if (!sent.ok && !sent.queued) break;
       put += 1;
     }
-    if (put) print(`Put ${put} gate ${put === 1 ? 'verdict' : 'verdicts'} on other tickets right.`);
+    if (put) print(`Corrected ${put} check ${put === 1 ? 'result' : 'results'} on other tickets.`);
 
     /*
      * And the ticket's own card (MACLEOD-601). The gate chips above say
@@ -1890,7 +1890,7 @@ function removeEdge(workflow, from, on, { reason, found = 'planning' } = {}) {
   const edges = workflow.dependencies || [];
   const index = edges.findIndex((d) => d.from === a && d.on === b);
   if (index < 0) {
-    throw new Error(`${a} does not wait on ${b} in "${workflow.name}". Nothing was removed.`);
+    throw new Error(`${a} does not wait on ${b} in "${workflow.name}". TeamFlow removed nothing.`);
   }
   edges.splice(index, 1);
   workflow.dependencies = edges;
@@ -1970,7 +1970,7 @@ export function dependsBatch(workflow, entries, { found } = {}) {
     if (!edge.remove) { present.add(id); return; }
     if (!present.has(id)) {
       throw new Error(`Edge ${index + 1}: ${edge.from} does not wait on ${edge.on}. `
-        + 'Nothing was changed.');
+        + 'TeamFlow changed nothing.');
     }
     present.delete(id);
   });

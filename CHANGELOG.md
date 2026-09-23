@@ -3,6 +3,19 @@
 What changed in each published version of the TeamFlow plugin, newest first.
 Only what a person using it would notice.
 
+## 0.3.33
+
+- **Plain titles for agents' cards.** A card for a dispatched agent says what
+  the work is, such as "Security fixes", instead of a branch name and a tool
+  name. Every report for an ad hoc card now carries its title, so a later
+  report never leaves the card without one.
+- **`teamflow adhoc titles`** gives a title to every ad hoc card on the board
+  that has none. It uses this machine's session records, then the first
+  commit that names the card. It prints what it would send; `--send` sends.
+- **Plain words everywhere the plugin speaks.** Its lines, its command output
+  and the summaries it puts on a card use short sentences and no internal
+  words: a "check", never a "gate"; "no result", never "no verdict".
+
 ## 0.3.32
 
 - **A live heartbeat for every session.** Every two minutes the plugin tells

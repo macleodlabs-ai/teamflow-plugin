@@ -81,8 +81,8 @@ export async function mcpHeaders(config = {}, { url = declaredMcpUrl(), announce
   const destination = credentialDestination({ serviceUrl: target }, bound);
   if (!destination.ok) return refuse(destination.reason);
   if (target !== bound) {
-    return refuse(`this machine's authorization was issued by ${bound}, and the MCP server is at `
-      + `${target}; the token was not sent there`);
+    return refuse(`this machine holds an authorization issued by ${bound}, and the MCP server is at `
+      + `${target}; TeamFlow did not send the token there`);
   }
   // The refresh goes to `serviceUrl(config)`. That must be the same
   // origin, or a token minted by one service would be handed to another.
@@ -158,7 +158,7 @@ export async function mcpStatus(config = {}, { url = declaredMcpUrl() } = {}) {
       return {
         ...base, ok: false, authorized: false, reachable: true,
         reason: `the MCP server answered ${init.status} to this machine's token; ${LOGIN} again, `
-          + 'or check that the device has not been revoked on the Organisation page',
+          + 'or check on the Organisation page that nobody revoked the device',
       };
     }
     if (!init.ok || !init.message?.result) {

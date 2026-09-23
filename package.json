@@ -1,6 +1,6 @@
 {
   "name": "@macleodlabs/teamflow",
-  "version": "0.3.32",
+  "version": "0.3.33",
   "description": "TeamFlow delivery reporting: one CLI and one set of skills for Claude Code, Cursor, Copilot, Codex, Gemini CLI and any other agent tool.",
   "type": "module",
   "license": "SEE LICENSE IN LICENSE",

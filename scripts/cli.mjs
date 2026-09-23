@@ -606,7 +606,7 @@ async function doctor() {
         : ['none connected'];
       const warnings = [];
       if (!connected.has(tracker)) {
-        warnings.push(`this repo reports ${tracker} issues, but the org has connected no ${tracker} tracker, `
+        warnings.push(`this repository reports ${tracker} issues, but the org has connected no ${tracker} tracker, `
           + `so ${tracker} updates (created, assigned, done, cancelled) never reach the board. `
           + `Connect one at ${serviceUrl(config)}/members/ and see docs/TRACKERS.md.`);
       }
@@ -687,7 +687,7 @@ function replacedSession(before, after) {
   if (!before) return '';
   const was = [before.email, before.account].filter(Boolean).join(', org ');
   const now = [after.email, after.account].filter(Boolean).join(', org ');
-  if (!was) return 'The session that was on this machine has been replaced.\n';
+  if (!was) return 'This replaced the session that was on this machine.\n';
   if (was === now) return `This replaced the session already here (${was}).\n`;
   return `This replaced the session that was here: ${was}.\n`;
 }
@@ -794,7 +794,7 @@ async function deviceLogin(because, before, { noBrowser = false, canOpen = false
     // Except a refusal — somebody said no in the browser, and telling
     // the terminal to ask again is the wrong advice (MACLEOD-567).
     const again = result.error === 'access_denied'
-      ? ' If that was not you, nothing was issued and nothing needs undoing.'
+      ? ' If that was not you, TeamFlow issued nothing and nothing needs undoing.'
       : ' Run /teamflow:login again for a fresh code.';
     throw new Error(`TeamFlow was not connected: ${result.reason}.${again}`);
   }
@@ -921,7 +921,7 @@ async function logout() {
   }
   const revoked = out.device
     ? (out.revoked
-      ? ' The device credential was revoked at the service too.'
+      ? ' The service revoked the device credential too.'
       : ` The device credential could not be revoked at the service (${out.reason});`
         + ' revoke it from the members page.')
     : '';

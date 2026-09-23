@@ -296,7 +296,7 @@ export const BACKOFF_S = 30;
  */
 export function afterAttempt({ attempt, of, exit, timedOut, deadlineMs, at, attempts = [], nextAt, gate = 'gate' }) {
   const reason = timedOut
-    ? `no verdict after ${Math.round(deadlineMs / 60000)} min`
+    ? `no result after ${Math.round(deadlineMs / 60000)} min`
     : exit === 0 ? 'passed' : `${gate} command exited ${exit}`;
   const status = timedOut ? 'idle' : exit === 0 ? 'success' : 'failed';
   const history = [...attempts, { at, status, reason }].slice(-16);

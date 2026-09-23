@@ -47,6 +47,7 @@
 // the tool is told nothing.
 
 import { currentBinding, mint, TITLE_MAX, TRACKER } from './adhoc.mjs';
+import { title } from './words.mjs';
 import {
   agentLabel, dataDir, isAdHocKey, isAgentTool, issuePayload, launchesPath, organisationScope, readJson, readWorkflows,
   reportScope, sendReport, workflowsPath, writeJson, writeWorkflows,
@@ -98,16 +99,18 @@ export function dispatchOf(event, input = {}) {
 
 /**
  * The item's title: the agent's label and its one-line task, as the
- * launch registry already holds them. Derived state, one line, capped
- * at the ad hoc title cap. The prompt is not an input to this function
- * and cannot become one: `dispatchOf` never reads it.
+ * launch registry already holds them, in plain words (MACLEOD-646): the
+ * writer drops branch words and ticket keys and keeps the task when it
+ * says more than the label. Derived state, one line, 60 characters. The
+ * prompt is not an input to this function and cannot become one:
+ * `dispatchOf` never reads it.
  */
 export function nodeTitle(dispatch = {}) {
   const name = agentLabel(dispatch.name, 64);
   const task = agentLabel(dispatch.task, 80);
   const type = agentLabel(dispatch.type, 40);
-  const text = name && task ? `${name}: ${task}` : (name || task || (type ? `Agent ${type}` : 'Agent'));
-  return agentLabel(text, TITLE_MAX);
+  const text = name && task ? `${name}: ${task}` : (name || task || (type ? `${type} agent` : ''));
+  return agentLabel(title(text), TITLE_MAX);
 }
 
 /** The run's name: the bound ticket and its title, or the date. */

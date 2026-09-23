@@ -44,9 +44,9 @@ export function policyOf(config = {}, served = undefined) {
   };
 }
 
-/** `ci` is the test gate in a sentence; the rest read as they are spelled. */
+/** `ci` is the test check in a sentence; the rest read as they are spelled (MACLEOD-646). */
 const WORDS = { ci: 'test', 'audit-local': 'audit', 'audit-dev': 'dev audit', 'dev-test': 'dev test' };
-const words = (slot) => `${WORDS[slot] || String(slot || 'gate')} gate`;
+const words = (slot) => `${WORDS[slot] || String(slot || 'deploy')} check`;
 const minutes = (ms) => `${Math.max(1, Math.round(ms / 60000))} min`;
 const iso = (ms) => new Date(ms).toISOString();
 const asMs = (t) => (typeof t === 'number' ? t : Date.parse(String(t || '')));
@@ -89,8 +89,8 @@ export function decide(gate = {}, { now = Date.now(), policy = DEFAULT_POLICY, d
     const window = deadline * 2 ** (attempt - 1);
     const elapsed = Number.isFinite(started) ? at - started : (gate.status === 'idle' ? window : 0);
     if (gate.status !== 'idle' && elapsed < window) return { kind: 'none' };
-    const why = `no verdict from the ${words(slot)} after ${minutes(Math.max(elapsed, window))}`;
-    if (attempt >= of) return { kind: 'delay', reason: `no verdict from the ${words(slot)} · ${attempt} attempts`.slice(0, 120) };
+    const why = `no result from the ${words(slot)} after ${minutes(Math.max(elapsed, window))}`;
+    if (attempt >= of) return { kind: 'delay', reason: `no result from the ${words(slot)} · ${attempt} attempts`.slice(0, 120) };
     return { kind: 'retry', attempt: attempt + 1, of, nextAt: iso(at), reason: why.slice(0, 120) };
   }
   return { kind: 'none' };
@@ -164,7 +164,7 @@ export function healRun(workflow, { now = Date.now(), policy = DEFAULT_POLICY, d
         ticket.updatedAt = at;
         lines.push(`re-running the ${words(gate.slot)} on ${ticket.key} (attempt ${verdict.attempt} of ${verdict.of}): ${verdict.reason}`);
       } else {
-        lines.push(`the ${words(gate.slot)} on ${ticket.key} is to be fixed and re-run (attempt ${verdict.attempt} of ${verdict.of})`);
+        lines.push(`fix and re-run the ${words(gate.slot)} on ${ticket.key} (attempt ${verdict.attempt} of ${verdict.of})`);
       }
       touched.push(ticket);
       continue;
@@ -208,7 +208,7 @@ export function adoptVerdict(workflow, ticket, sidecar, { now = Date.now() } = {
   if (sidecar.status === 'success') {
     move(workflow, ticket.key, { state: 'running', cycle: NEXT[cycle] });
     if (ticket.gateRetry) delete ticket.gateRetry[cycle];
-    return { resumed: true, reason: `resumed after ${words(slot)} verdict` };
+    return { resumed: true, reason: `resumed after the ${words(slot)} passed` };
   }
   if (sidecar.status === 'failed') {
     if (ticket.state !== 'rework') ticket.failures = (ticket.failures || 0) + 1;
@@ -365,7 +365,7 @@ export async function tick(config = {}, {
         changed = true;
         if (adopted.resumed) {
           hygieneRow(workflow, 'resumed', 'plugin', adopted.reason, at);
-          lines.push(`resumed plan ${workflow.name} after the ${words(GATE_SLOTS[ticket.cycle] || 'deploy')} verdict on ${ticket.key}`);
+          lines.push(`resumed plan ${workflow.name} after the ${words(GATE_SLOTS[ticket.cycle] || 'deploy')} passed on ${ticket.key}`);
         }
       }
       // 2. The policy, on what is left.

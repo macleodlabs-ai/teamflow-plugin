@@ -149,9 +149,10 @@ function skillInstruction(tracker) {
  * reaches a flag here.
  */
 export const ADHOC_INSTRUCTION =
-  'If the work you have been asked to do has no ticket, it is ad hoc work and still belongs on the board: '
-  + 'run `teamflow adhoc start "<a short sentence saying what the work is>"`. '
-  + 'The sentence says what the work is, never what was asked for -- the request is a prompt and stays on this machine.';
+  'Work with no ticket is ad hoc work, and it still belongs on the board. '
+  + 'Run `teamflow adhoc start "<a short sentence saying what the work is>"`. '
+  + 'The sentence says what the work is, never what the request said. '
+  + 'The request is a prompt and stays on this machine.';
 
 // Exported so `teamflow workflow plan` selects with the same call and
 // the same fields. A second `gh issue list` would be a second ordering

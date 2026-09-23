@@ -27,12 +27,17 @@
 // worse than no item.
 
 import fs from 'node:fs';
+import path from 'node:path';
+import { spawnSync } from 'node:child_process';
 
 import {
+  adHocTitle,
   bindingRefusalFor,
   credential,
   credentialKind,
+  dataDir,
   dataDirWritable,
+  fetchState,
   followKeyAliases,
   askAboutTicketOnce,
   isAdHocKey,
@@ -59,6 +64,7 @@ import {
   writeWorkflows,
 } from './core.mjs';
 import { refusalOf } from './refusal.mjs';
+import { title as plainTitle } from './words.mjs';
 
 export { isAdHocKey };
 
@@ -110,7 +116,113 @@ export const USAGE = `teamflow adhoc — work that arrived without a ticket
       Link the item to a ticket created elsewhere (a tracker MCP, by
       hand) and do the same, without creating anything. A ticket that
       already has its own history on the board, or that another ad hoc
-      item became, is refused unless --merge says to combine them.`;
+      item became, is refused unless --merge says to combine them.
+
+  teamflow adhoc titles [--send]
+      Give every ad hoc card on the board that has no title a plain one,
+      from this machine's own records: the agent's name and task in its
+      session record first, then the first commit that names the key,
+      else "Earlier ad hoc work" and a date. Prints what it would send;
+      --send sends it. Never reads or sends a prompt.`;
+
+/*
+ * Titles for the ad hoc cards that have none (MACLEOD-646).
+ *
+ * The live board held 52 ad hoc cards and almost none had a title: the
+ * plugin never sent one after the first report. The words are still on
+ * this machine, in two places, and only there:
+ *
+ *   a session record   `<data>/sessions/*.json`: the agent's name and
+ *                      one-line task, or the `adhoc start` line, which
+ *                      `adHocTitle` already reads. Never a prompt: no
+ *                      session record holds one.
+ *   git                the first commit subject that names the key.
+ *
+ * A session record wins over git, because it is what the work was said
+ * to be when it started. Every title goes through the writer.
+ */
+const MONTHS = ['January', 'February', 'March', 'April', 'May', 'June', 'July', 'August',
+  'September', 'October', 'November', 'December'];
+
+/** The title each ad hoc key has in this machine's session records. */
+export function sessionTitles(dir = path.join(dataDir(), 'sessions')) {
+  const out = new Map();
+  let names = [];
+  try { names = fs.readdirSync(dir).filter((n) => n.endsWith('.json')).sort(); } catch { return out; }
+  for (const name of names) {
+    const state = readJson(path.join(dir, name));
+    if (!state || typeof state !== 'object') continue;
+    const said = adHocTitle(state);
+    if (!said) continue;
+    for (const key of [state.jira?.key, state.binding?.key, state.dispatch?.key]) {
+      if (isAdHocKey(key) && !out.has(key)) out.set(key, said);
+    }
+  }
+  return out;
+}
+
+/** Every commit subject in this repository, oldest first. */
+export function gitSubjects(cwd) {
+  const got = spawnSync('git', ['log', '--all', '--reverse', '--format=%s'], { cwd, encoding: 'utf8', timeout: 10000 });
+  return got.status === 0 ? got.stdout.split('\n').filter(Boolean) : [];
+}
+
+/** The plain title for the first commit subject naming `key`, or nothing. */
+export function gitTitle(key, subjects) {
+  const named = new RegExp(`\\b${key}(?!\\d)`);
+  const subject = subjects.find((s) => named.test(s));
+  const said = subject ? plainTitle(subject) : undefined;
+  return said && said !== 'Agent work' ? said : undefined;
+}
+
+/** The fallback: when the card last moved, in words. */
+export function earlierTitle(at) {
+  const when = new Date(Date.parse(String(at || '')));
+  if (Number.isNaN(when.getTime())) return 'Earlier ad hoc work';
+  return plainTitle(`Earlier ad hoc work, ${when.getUTCDate()} ${MONTHS[when.getUTCMonth()]} ${when.getUTCFullYear()}`);
+}
+
+/**
+ * What to send: `{ key, title, from, card }` for each ad hoc card with
+ * no title that was never converted, in key order.
+ */
+export function titlePlan(issues = {}, { sessions = new Map(), subjects = [] } = {}) {
+  const plan = [];
+  const keys = Object.keys(issues).filter(isAdHocKey)
+    .sort((a, b) => Number(a.split('-')[1]) - Number(b.split('-')[1]));
+  for (const key of keys) {
+    const card = issues[key];
+    if (!card || typeof card !== 'object' || card.convertedTo || String(card.title || '').trim()) continue;
+    const fromSession = sessions.get(key);
+    const fromGit = fromSession ? undefined : gitTitle(key, subjects);
+    const title = fromSession || fromGit || earlierTitle(card.updatedAt);
+    plan.push({ key, title, from: fromSession ? 'session' : fromGit ? 'git' : 'date', card });
+  }
+  return plan;
+}
+
+const FROM_WORDS = { session: 'from its session record', git: 'from its first commit', date: 'from its last update' };
+
+/** Read the board, plan the titles, and send them when asked. */
+export async function backfillTitles(cwd, config = {}, { send = false, read = fetchState, report = sendReport, sessions, subjects } = {}) {
+  const got = await read('bundle', config);
+  if (!got?.ok || !got.document) {
+    throw new Error(`TeamFlow could not read the board: ${got?.reason || 'the service did not answer'}.`);
+  }
+  const issues = got.document.documents?.issues || {};
+  const plan = titlePlan(issues, {
+    sessions: sessions ?? sessionTitles(),
+    subjects: subjects ?? gitSubjects(cwd),
+  });
+  const lines = plan.map((p) => `${p.key}  ${p.title}  (${FROM_WORDS[p.from]})`);
+  if (!send) return { plan, lines, sent: 0 };
+  let sent = 0;
+  for (const p of plan) {
+    const result = await report('issue', undefined, { ...p.card, title: p.title }, config, { account: reportScope(config) });
+    if (result?.ok) sent += 1;
+  }
+  return { plan, lines, sent };
+}
 
 /**
  * The derived title, or a refusal.
@@ -129,7 +241,7 @@ export function checkTitle(value) {
   if (!title) throw new Error('Usage: teamflow adhoc start "<what the work is>"');
   if (title.length > TITLE_MAX) {
     throw new Error(`An ad hoc title is at most ${TITLE_MAX} characters and this one is ${title.length}. `
-      + 'Say what the work is, not what was asked for.');
+      + 'Say what the work is, not what the request said.');
   }
   return title;
 }
@@ -471,6 +583,20 @@ export async function main(args = [], ctx = {}) {
     const made = await convertItem(positional[0], { setting: true }, cwd, config);
     print(`${made.from} ${made.already ? 'was already' : 'is now'} ${made.key}${made.url ? ` (${made.url})` : ''}.`
       + (made.state ? ` Status: ${made.state}.` : ''));
+    return 0;
+  }
+
+  if (sub === 'titles') {
+    const send = rest.includes('--send');
+    const done = await backfillTitles(cwd, config, { send });
+    if (!done.plan.length) {
+      print('Every ad hoc card on the board has a title.');
+      return 0;
+    }
+    for (const line of done.lines) print(line);
+    print(send
+      ? `TeamFlow sent ${done.sent} of ${done.plan.length} titles.`
+      : `TeamFlow sent nothing. Run \`teamflow adhoc titles --send\` to send these ${done.plan.length} titles.`);
     return 0;
   }
 

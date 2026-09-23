@@ -98,9 +98,9 @@ export function uninstallWorkflowRule({ root = process.cwd(), file, written = []
 // Each maps to a stage through the same classifier every other hook
 // uses; see adapters.mjs.
 export const GIT_HOOKS = {
-  'post-commit': { stage: 'LOCAL_DEV', covers: 'a commit reports LOCAL_DEV progress' },
+  'post-commit': { stage: 'LOCAL_DEV', covers: 'a commit reports local work' },
   'post-merge': { stage: 'MERGE', covers: 'a merge reports MERGE' },
-  'pre-push': { stage: 'LOCAL_TEST', covers: 'a push runs the configured test command and reports LOCAL_TEST or LOCAL_REWORK' },
+  'pre-push': { stage: 'LOCAL_TEST', covers: 'a push runs the configured test command and reports a local test pass or failure' },
 };
 
 // `teamflow` when it is on PATH, the public package when it is not, so
@@ -125,7 +125,7 @@ export function gitHookBody(event) {
   // have nothing worth saying.
   const quiet = event !== 'pre-push';
   return [
-    '# TeamFlow delivery reporting. Observability, never a gate: this',
+    '# TeamFlow delivery reporting. Observability, never a blocker: this',
     '# block always succeeds, so a TeamFlow outage cannot stop a commit,',
     '# a merge or a push. Remove the block to stop reporting.',
     invocation(event, { quiet }),
@@ -493,7 +493,7 @@ export const HOOK_SPECS = {
   jetbrains: () => {
     const sh = path.join(home(), '.junie', 'teamflow-hook.sh');
     return {
-      covers: 'edits, as LOCAL_DEV; Junie fires no PostToolUse, so gates need the git fallback',
+      covers: 'edits, as local work; Junie fires no PostToolUse, so tests and audits need the git fallback',
       targets: [
         { file: sh, script: shimScript('jetbrains', { inRepository: false }) },
         {
@@ -662,8 +662,8 @@ export function hooksStatus(root = process.cwd(), config = {}) {
       installed: git,
       testCommand: config.testCommand || undefined,
       prePush: config.testCommand
-        ? `runs \`${config.testCommand}\` and reports LOCAL_TEST or LOCAL_REWORK`
-        : 'installed but inactive: set "testCommand" in .teamflow.json to report LOCAL_TEST on push',
+        ? `runs \`${config.testCommand}\` and reports a local test pass or failure`
+        : 'installed but inactive: set "testCommand" in .teamflow.json to report local tests on push',
     },
   };
 }
@@ -711,7 +711,7 @@ export async function credentialNotice({ root = process.cwd(), config } = {}) {
         '  This machine has no credential, so every report these hooks make',
         '  is dropped — silently, for ever, with an empty board as the only',
         '  symptom. Outside Claude Code a hook cannot tell you this later:',
-        '  stdout is how a hook denies an action in these tools.',
+        '  `stdout` is how a hook denies an action in these tools.',
         '',
         '      teamflow login            once: opens the consent page here, or',
         '                                prints a code for a browser anywhere',
@@ -787,7 +787,7 @@ export function removalReport(written, root = process.cwd()) {
     lines.push(`  ${verb} ${short(item.file)}${why}`);
   }
   if (!lines.length) return 'TeamFlow was not installed here. Nothing to remove.\n';
-  return `TeamFlow removed:\n${lines.join('\n')}\nNothing else was touched.\n`;
+  return `TeamFlow removed:\n${lines.join('\n')}\nTeamFlow touched nothing else.\n`;
 }
 
 // One tool, the git hooks, or everything. `--all` is the command a
