@@ -53,6 +53,7 @@ import {
   readJson, readWorkflows, reportScope, sendReport, sessionActors, workflowsPath, writeJson, writeWorkflows,
 } from './core.mjs';
 import { projectFor, projectsCachePath } from './project.mjs';
+import { launchRole, roleBlock } from './launch-role.mjs';
 import { addDispatched, autoCreate, finishRun, liveRun, move, publish, stated } from './workflow.mjs';
 
 import fs from 'node:fs';
@@ -297,7 +298,7 @@ export function ensureRun(config, state = {}, info = {}, { waitMs, keys = [] } =
  * gets neither a node nor the ticket it would want -- plus `notice` on
  * the dispatch that created the run. No network. Never throws.
  */
-export function planLaunch(config, { state = {}, dispatch = {}, cwd, info = {}, nested = false } = {}) {
+export function planLaunch(config, { state = {}, dispatch = {}, cwd, info = {}, nested = false, launch = {}, session = {} } = {}) {
   const out = {};
   try {
     const sessionKey = state.binding?.key;
@@ -307,6 +308,20 @@ export function planLaunch(config, { state = {}, dispatch = {}, cwd, info = {}, 
     if (nested) {
       if (sessionKey) out.under = sessionKey;
       out.reason = 'nested';
+      return out;
+    }
+    // What the agent is for (MACLEOD-722; MACLEOD-714 decided it by
+    // position alone): a reviewer of the card's step gets no node, it
+    // belongs to the card. `launch` is the Agent tool's own input; its
+    // prompt is scored in memory by `launchRole` and never kept.
+    const role = dispatch.kind === 'agent' && dispatch.type !== 'workflow'
+      ? launchRole({ ...launch, isolated: dispatch.isolated }, { ...session, key: sessionKey, stage: state.stage })
+      : undefined;
+    if (role) out.role = roleBlock(role);
+    if (role?.as === 'reviewer') {
+      out.under = sessionKey;
+      out.review = role.step;
+      if (role.features.lens) out.lens = role.features.lens;
       return out;
     }
     if (!boundToTeamflow(cwd, config, state, info?.repository)) {
@@ -479,18 +494,22 @@ export async function publishOwed(config, { sessionId, state = {}, cwd, info = {
  * its last report passed, `rework` when it failed. `skipped` with a note
  * when the agent went to work on another key instead.
  *
- * Only an ad hoc node the plugin put in a run for a dispatch. A
- * tracker ticket is never closed by an agent: an agent finishing is not
- * the ticket finishing. Idempotent: a node already closed is left as it
- * is. Under the runs lock; the run is published after. Never throws.
+ * Only an ad hoc node the plugin put in a run for a dispatch, or the
+ * ticket that node became (`was`, the ad hoc key it was minted as;
+ * MACLEOD-726). Any other tracker ticket is never closed by an agent: an
+ * agent finishing is not the ticket finishing. Idempotent: a node already
+ * closed is left as it is. Under the runs lock; the run is published
+ * after. Never throws.
  */
-export async function closeDispatched(config, { key, outcome = 'done', note } = {}) {
+export async function closeDispatched(config, { key, was, outcome = 'done', note, movedTo } = {}) {
   try {
-    if (!isAdHocKey(key)) return undefined;
+    const converted = !isAdHocKey(key) && isAdHocKey(was);
+    if (!isAdHocKey(key) && !converted) return undefined;
+    const mine = (t) => t.key === key && t.addedBy === (converted ? 'converted' : 'dispatch');
     const held = withRunsLock(() => {
       const runs = readWorkflows(config);
       const holding = Object.values(runs.workflows || {})
-        .filter((wf) => (wf.tickets || []).some((t) => t.key === key && t.addedBy === 'dispatch'));
+        .filter((wf) => (wf.tickets || []).some(mine));
       // A live run first; else the newest that holds it, because a run
       // closed on this machine before the agent moved still owes the
       // board the node's end (MACLEOD-641, tracking gap 2).
@@ -499,6 +518,12 @@ export async function closeDispatched(config, { key, outcome = 'done', note } = 
       const ticket = run?.tickets.find((t) => t.key === key);
       if (!ticket || ['done', 'skipped', outcome].includes(ticket.state)) return undefined;
       move(run, key, { state: outcome, ...(note ? { note } : {}) });
+      // The agent went to work on a tracker ticket (MACLEOD-733): that
+      // ticket is the plan's work now, so it joins the same run in the
+      // node's place. Without this the run lost the agent at once and the
+      // ticket sat in no plan.
+      const live = !['done', 'cancelled', 'archived'].includes(run.status);
+      if (movedTo && live && !(run.tickets || []).some((t) => t.key === movedTo)) addDispatched(run, movedTo);
       finishRun(run);
       writeWorkflows(runs, config);
       return run;

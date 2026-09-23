@@ -55,7 +55,7 @@ import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import {
-  accountName, credential, dataDir, globalConfigPath, isWorktree, machineId, readJson, reportScope,
+  accountName, credential, dataDir, globalConfigPath, isWorktree, machineId, readJson, readKeyAliases, reportScope,
   sendReport, serviceUrl, writeJson,
 } from './core.mjs';
 import {
@@ -313,6 +313,19 @@ function spawnDetached(argv, { cwd, env, graceMs = 1000 }) {
 // --- performing one action ----------------------------------------------------
 
 /**
+ * The ticket an ad hoc key became, when this machine knows (MACLEOD-726):
+ * an action queued before the card was converted is for the session on
+ * the ticket now. Any other key is itself.
+ */
+export function followedKey(key, config = {}) {
+  if (!/^ADHOC-\d{1,9}$/i.test(key)) return key;
+  return readKeyAliases(config)[key.toUpperCase()]?.to || key;
+}
+
+/** A held action this old is dropped here; the service gives it its outcome (MACLEOD-726). */
+export const HOLD_MAX_MS = 24 * 60 * 60 * 1000;
+
+/**
  * Do one action, or say why not. Pure apart from the doers handed in:
  * `state` is the workflow file as loaded, `bound` the key this session
  * holds, and the result says what to record and what to show. `hold`
@@ -325,7 +338,7 @@ export async function perform(action, {
   deadlines = gateDeadlinesOf({ delivery }), env = process.env,
 } = {}) {
   const kind = String(action.kind || '');
-  const key = String(action.key || '');
+  const key = followedKey(String(action.key || ''), config);
   const by = oneLine(action.by, 80) || 'a lead';
   if (!KINDS.has(kind)) return { ...said('refused', `unknown action kind ${kind}`) };
 
@@ -503,9 +516,10 @@ export async function intakePass(config = {}, {
         }
         if (result.hold) {
           // Not here, not now: taken back out, and kept for the session
-          // on its key.
+          // on its key -- for a day. After that the service has settled
+          // it, so it is forgotten here rather than shown a day late.
           ledger.handled = ledger.handled.filter((one) => one !== id);
-          still.push(action);
+          if (Date.parse(now) - Date.parse(action.at || now) < HOLD_MAX_MS) still.push(action);
           continue;
         }
       }

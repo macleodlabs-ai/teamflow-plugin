@@ -9,8 +9,12 @@
 // stays the only classifier. A stage that appears in Cursor and not in
 // Claude Code would mean two classifiers, and two classifiers drift.
 
+import path from 'node:path';
+
 import {
   absorbRootActor,
+  dataDir,
+  writeJson,
   allActors,
   isPhantomAgent,
   purgePhantomAgents,
@@ -59,6 +63,11 @@ import {
   clearPause, ensureHeartbeat, limitOf, markHandoff, markLimit, rotating, sessionLines, stopHeartbeat,
 } from './heartbeat.mjs';
 import { pruneSnapshots, resumeNotice, saveSnapshot } from './resume.mjs';
+import { WORK_TOOLS, cardDirections, publishDirections } from './continue.mjs';
+import {
+  afterFindings, claimReview, findingsOf, lensOf, parseReview, reportReview, reviewCommandOf, reviewPayload, settleReview,
+} from './review.mjs';
+import { REVIEW_NEXT_MS, batchSize, changesFiles, reviewStartOf, stripMark, teamLeanOf } from './launch-role.mjs';
 import {
   boundToTeamflow, closeDispatched, dispatchOf, launchesOf, planLaunch, publishOwed, settle, withMint,
 } from './dispatch.mjs';
@@ -289,7 +298,7 @@ export function claudeContext(event, state, justBound, stale = staleBuildNotice(
 export function withAgentIdentity(event, input, state, sessionId, agentKey, launched = false) {
   const tool = input.tool_name || '';
   if (event === 'PreToolUse' && isAgentTool(tool) && !agentKey) {
-    const launch = recordLaunch(sessionId, launchFields(tool, input.tool_input), undefined, state.represented, input.tool_use_id);
+    const launch = recordLaunch(sessionId, launchFields(tool, input.tool_input), undefined, state.represented, input.tool_use_id, input.prompt_id);
     // Remembered on the session's own state so a later worktree event
     // can tell "this session runs agents" from "this person opened a
     // second repository", without listing a directory per event.
@@ -297,7 +306,7 @@ export function withAgentIdentity(event, input, state, sessionId, agentKey, laun
   }
   if (event === 'PostToolUse' && isAgentTool(tool) && !agentKey) {
     // Planned just now because the PreToolUse recorded nothing (MACLEOD-640).
-    if (state.represented) recordLaunch(sessionId, launchFields(tool, input.tool_input), undefined, state.represented, input.tool_use_id);
+    if (state.represented) recordLaunch(sessionId, launchFields(tool, input.tool_input), undefined, state.represented, input.tool_use_id, input.prompt_id);
     claimLaunch(sessionId, parseAgentId(input.tool_response), input.tool_input?.subagent_type, input.tool_use_id);
     return { ...state, launched: true };
   }
@@ -305,11 +314,11 @@ export function withAgentIdentity(event, input, state, sessionId, agentKey, laun
   // session's own launches, with the launcher's id, so the nested one
   // is named and carries `parentAgent`.
   if (event === 'PreToolUse' && isAgentTool(tool) && agentKey && state.agent) {
-    recordLaunch(sessionId, launchFields(tool, input.tool_input), state.agent.id, state.represented, input.tool_use_id);
+    recordLaunch(sessionId, launchFields(tool, input.tool_input), state.agent.id, state.represented, input.tool_use_id, input.prompt_id);
     return state;
   }
   if (event === 'PostToolUse' && isAgentTool(tool) && agentKey && state.agent) {
-    if (state.represented) recordLaunch(sessionId, launchFields(tool, input.tool_input), state.agent.id, state.represented, input.tool_use_id);
+    if (state.represented) recordLaunch(sessionId, launchFields(tool, input.tool_input), state.agent.id, state.represented, input.tool_use_id, input.prompt_id);
     claimLaunch(sessionId, parseAgentId(input.tool_response), input.tool_input?.subagent_type, input.tool_use_id);
     return state;
   }
@@ -336,8 +345,13 @@ export function withAgentIdentity(event, input, state, sessionId, agentKey, laun
         parent: sessionId,
         ...((launch?.launchedBy || state.agent?.parentAgent)
           ? { parentAgent: launch?.launchedBy || state.agent?.parentAgent } : {}),
+        // What it was launched for (MACLEOD-722): enums and numbers only.
+        ...((launch?.role || state.agent?.role) ? { role: launch?.role || state.agent.role } : {}),
         startedAt: state.agent?.startedAt || new Date().toISOString(),
       },
+      // A reviewer of the step its session's ticket stands at (MACLEOD-714).
+      ...(launch?.review && launch.under && !state.review
+        ? { review: { key: launch.under, step: launch.review, lens: launch.lens || lensOf(stripMark(launch.task), launch.name) } } : {}),
       // The node minted for this agent when it was dispatched
       // (MACLEOD-639, ADHOC-13), for `handleEvent` to bind it to. Local
       // only; the launch file is where it came from.
@@ -366,6 +380,122 @@ export function withAgentIdentity(event, input, state, sessionId, agentKey, laun
     };
   }
   return state;
+}
+
+function teamTasksPath(sessionId) {
+  return path.join(dataDir(), 'sessions', `${sessionId}.team.json`);
+}
+
+/**
+ * An agent-team task names what a teammate is for (MACLEOD-722).
+ * `TaskCreated` and `TaskCompleted` carry `task_subject` and, when a
+ * teammate is involved, `teammate_name`; the subject is read here and
+ * only its lean (`reviewer` or `worker`) is kept, under the teammate's
+ * name, in a local file the session's next launch of that name reads.
+ * Never throws.
+ */
+export function recordTeamTask(sessionId, input = {}) {
+  try {
+    const name = typeof input.teammate_name === 'string' ? input.teammate_name.slice(0, 64) : '';
+    const lean = name ? teamLeanOf(input.task_subject) : undefined;
+    if (!lean) return undefined;
+    const file = teamTasksPath(sessionId);
+    const held = readJson(file, undefined) || {};
+    const names = Object.keys(held);
+    // A small map: the oldest names go first.
+    if (!(name in held) && names.length >= 50) delete held[names[0]];
+    held[name] = lean;
+    writeJson(file, held);
+    return lean;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * What the session knows about a launch it is making (MACLEOD-722): the
+ * batch it is part of, a `teamflow review start` still waiting for its
+ * launch, and whether the step's last round found problems. Local only.
+ */
+export function roleContext(sessionId, state = {}, cwd = undefined, promptId = undefined) {
+  const out = { cwd };
+  try {
+    const team = readJson(teamTasksPath(sessionId), undefined);
+    if (team && typeof team === 'object') out.teamTasks = team;
+    // A batch ends at a prompt, and at any agent's end: a launch after
+    // results came back is the supervisor's next move, not the same team.
+    const ended = sessionActors(sessionId).map((a) => a.agent?.endedAt).filter(Boolean).sort().at(-1);
+    const since = [state.promptAt, ended].filter(Boolean).sort().at(-1);
+    out.batch = batchSize(launchesOf(sessionId), { promptAt: since, promptId });
+    const next = state.reviewNext;
+    if (next && Date.now() - Date.parse(next.at) < REVIEW_NEXT_MS) out.reviewNext = next;
+    out.afterFindings = afterFindings(sessionId, state.binding?.key, state.stage);
+  } catch { /* position decides, as before */ }
+  return out;
+}
+
+/**
+ * One reviewer's life on the card (MACLEOD-714): a slot claimed on its
+ * first async event and reported `running`; `teamflow review done` in
+ * its own shell states the result exactly; its end reports what its
+ * last message says, read here by a local parser and dropped. Only the
+ * enum and the counts go out. A stated result wins over the parser.
+ * Returns the state to save. Never throws.
+ */
+export async function trackReview(event, input, state, sessionId, config) {
+  try {
+    let review = state.review;
+    if (review.withdrawn) return state;
+    // A "reviewer" that edits files or commits is doing the work
+    // (MACLEOD-722): it is moved to worker once, and its slot is
+    // withdrawn so the step's result no longer counts it. The withdrawn
+    // report's sentence is the one History line.
+    if (event === 'PostToolUse' && changesFiles(input, input.cwd)) {
+      if (review.n) {
+        await reportReview(reviewPayload(review, { result: 'withdrawn' }, state), config);
+        settleReview(sessionId, review.key, review.n, 'withdrawn');
+      }
+      const role = { ...(state.agent?.role || {}), as: 'worker', by: 'moved', moved: true };
+      delete role.ask;
+      return { ...state, review: { ...review, withdrawn: true, done: true, result: 'withdrawn' }, agent: { ...state.agent, role } };
+    }
+    if (!review.n) {
+      const claimed = claimReview(sessionId, { key: review.key, step: review.step, lens: review.lens, agentId: state.agent?.id });
+      if (!claimed) return state;
+      review = { ...review, n: claimed.n, round: claimed.round, startedAt: new Date().toISOString() };
+      await reportReview(reviewPayload(review, { result: 'running' }, state), config);
+    }
+    const tool = event === 'PostToolUse' ? input.tool_name : undefined;
+    const stated = tool === 'Bash' ? reviewCommandOf(input.tool_input?.command) : undefined;
+    // Claude Code's structured findings (MACLEOD-722): stronger than any
+    // words, weaker only than `teamflow review done`.
+    const reported = tool === 'ReportFindings' && !review.stated ? findingsOf(input.tool_input) : undefined;
+    // The words the agent ends on: its hand-back report when it made one
+    // (`SubagentHandback`'s `tool_input.message`; its SubagentStop's last
+    // message is then only closing text), else that last message.
+    const words = tool === 'SubagentHandback' ? input.tool_input?.message
+      : event === 'SubagentStop' ? (input.last_assistant_message ?? '') : undefined;
+    let verdict;
+    if (stated) {
+      verdict = { ...stated, stated: true };
+      review = { ...review, stated: verdict };
+    } else if (reported) {
+      verdict = reported;
+      review = { ...review, reported: true };
+    } else if (words !== undefined && !review.stated && !review.done) {
+      const parsed = parseReview(words);
+      // An agent that ended while its words still said "running" gave no answer.
+      verdict = parsed.result === 'running' ? { result: 'failed' } : parsed;
+    }
+    if (verdict) {
+      await reportReview(reviewPayload(review, verdict, state), config);
+      settleReview(sessionId, review.key, review.n, verdict.result);
+      review = { ...review, done: true, result: verdict.result };
+    }
+    return { ...state, review };
+  } catch {
+    return state;
+  }
 }
 
 /**
@@ -518,6 +648,12 @@ export async function handleEvent(input = {}) {
       // Where the session was, before the limit or the compaction.
       try { saveSnapshot(sessionId, { config: loadConfig(readJson(sessionPath(sessionId))?.cwd || given) }); } catch { /* the last one stands */ }
     }
+    return { state: readJson(sessionPath(sessionId)) ?? newSession(sessionId, given), justBound: false, event, signedIn: true, refused: undefined, notices: [] };
+  }
+  // An agent-team task (MACLEOD-722): its subject's lean, kept for the
+  // teammate it names. A task being created is nothing more to report.
+  if (event === 'TaskCreated' || event === 'TaskCompleted') recordTeamTask(sessionId, input);
+  if (event === 'TaskCreated') {
     return { state: readJson(sessionPath(sessionId)) ?? newSession(sessionId, given), justBound: false, event, signedIn: true, refused: undefined, notices: [] };
   }
   if (!input.reporter_tool) {
@@ -735,14 +871,37 @@ export async function handleEvent(input = {}) {
     dispatching = undefined;
   }
   if (dispatching) {
+    // What the launch is for (MACLEOD-722). The Agent tool's input goes
+    // in whole so its prompt's opening lines can be scored in memory;
+    // only the enum and a number come back out.
+    const given = dispatching.kind === 'agent' ? (input.tool_input || {}) : {};
     const shown = planLaunch(config, {
       state, dispatch: dispatching, cwd, info, nested: Boolean(agentKey && state.agent),
+      launch: { type: given.subagent_type, description: given.description, prompt: given.prompt, name: given.name },
+      session: dispatching.kind === 'agent' && !agentKey ? roleContext(sessionId, state, cwd, input.prompt_id) : {},
     });
+    // `teamflow review start` marks one launch, the next.
+    if (shown.role && state.reviewNext) delete state.reviewNext;
     if (dispatching.kind === 'agent') state.represented = shown;
     if (shown.notice) state.dispatchNotice = shown.notice;
     // A shell dispatch has no launch to settle; its run is published here,
     // on the async path it already runs on.
     if (dispatching.kind !== 'agent' && shown.run) await settle(config, { sessionId, state, cwd, info, publishRun: true });
+  }
+
+  // The batch ends at a prompt (MACLEOD-722): agents launched after the
+  // person spoke again are a new team.
+  if (event === 'UserPromptSubmit' && !agentKey) state.promptAt = new Date().toISOString();
+  // Work, for auto-continue's "nothing changed" guard (MACLEOD-726): an
+  // edit, a command or a dispatch. A read is not a change.
+  if ((event === 'PostToolUse' || event === 'PostToolUseFailure') && WORK_TOOLS.has(input.tool_name)) {
+    state.workAt = new Date().toISOString();
+  }
+  // `teamflow review start --lens <name>` in the session's own shell: its
+  // next launch is a reviewer with that lens.
+  if (event === 'PostToolUse' && input.tool_name === 'Bash' && !agentKey) {
+    const start = reviewStartOf(input.tool_input?.command);
+    if (start) state.reviewNext = { ...start, at: new Date().toISOString() };
   }
 
   state = withAgentIdentity(event, input, state, sessionId, agentKey, Boolean(main?.launched));
@@ -802,6 +961,16 @@ export async function handleEvent(input = {}) {
     }
   }
 
+  // A reviewer's slot and result on the card (MACLEOD-714). Fails open.
+  if (agentKey && state.review && !LOCAL_ONLY.includes(event)) state = await trackReview(event, input, state, sessionId, config);
+  // The outcome label (MACLEOD-722): did this agent's end count as a
+  // review (a pass or findings) or as work. The service keeps it beside
+  // the rules' answer and the classifier's.
+  if (event === 'SubagentStop' && state.agent?.role?.as) {
+    const reviewed = ['pass', 'findings'].includes(state.review?.result);
+    state.agent = { ...state.agent, role: { ...state.agent.role, outcome: reviewed ? 'review' : 'work' } };
+  }
+
   const transition = classifyTool(resolved, state, config);
   state = applyTransition(state, transition);
 
@@ -855,6 +1024,9 @@ export async function handleEvent(input = {}) {
   // Synchronous SessionStart/UserPromptSubmit must stay fast so they never hold up the tool.
   // Async tool/task/stop hooks publish to the service (or legacy S3).
   if (!LOCAL_ONLY.includes(event) && state.binding?.key) {
+    // What TeamFlow told this agent (MACLEOD-726/733), for the card's Progress line.
+    const told = cardDirections(sessionId, agentKey, state.workAt);
+    if (told.length) state.directions = told;
     await publishState(state, config, info, { force: event === 'Stop' });
     saveSession(state);
     // A repository check's verdict (ADHOC-20), after the issue report so
@@ -889,11 +1061,11 @@ export async function handleEvent(input = {}) {
   if (agentKey && state.dispatch?.key && !state.dispatch.nested && !LOCAL_ONLY.includes(event)) {
     if (event === 'SubagentStop') {
       const failed = saved?.status === 'failed' || ['LOCAL_REWORK', 'DEV_REWORK'].includes(state.stage);
-      await closeDispatched(config, { key: state.dispatch.key, outcome: failed ? 'rework' : 'done' });
+      await closeDispatched(config, { key: state.dispatch.key, was: state.dispatch.was, outcome: failed ? 'rework' : 'done' });
     } else if (state.dispatch.bound && !state.dispatch.moved && state.binding?.key
       && state.binding.key !== state.dispatch.key) {
       const moved = await closeDispatched(config, {
-        key: state.dispatch.key, outcome: 'skipped', note: `moved to ${state.binding.key}`,
+        key: state.dispatch.key, was: state.dispatch.was, outcome: 'skipped', note: `moved to ${state.binding.key}`, movedTo: state.binding.key,
       });
       if (moved) {
         state.dispatch = { ...state.dispatch, moved: true };
@@ -913,6 +1085,9 @@ export async function handleEvent(input = {}) {
   // A card minted for an agent whose first publish was lost (MACLEOD-641,
   // tracking gap 3): tried again once a turn, a few at a time.
   if (event === 'Stop' || event === 'SubagentStop') await publishOwed(config, { sessionId, state, cwd, info });
+  // The directions auto-continue put on a run (MACLEOD-726): its hook
+  // may not wait on the network, so this turn's end sends them.
+  if (event === 'Stop' || event === 'SubagentStop') await publishDirections(config);
 
   /*
    * And a slice of the reconcile pass (MACLEOD-601).

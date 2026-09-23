@@ -1219,6 +1219,17 @@ export function followKeyAliases(state, cwd, config = {}) {
   const named = state?.jira && hop(state.jira.key);
   if (named) state.jira = { ...state.jira, key: named.to };
   /*
+   * The node minted for a dispatched agent follows too (MACLEOD-726, census
+   * fix 4). Left behind, the agent's binding moved to the ticket while its
+   * node kept the ad hoc key, so the agent read as "moved to" its own
+   * ticket, and its end never closed the node the board shows.
+   */
+  const minted = state?.dispatch && hop(state.dispatch.key);
+  if (minted) {
+    state.dispatch = { ...state.dispatch, key: minted.to, was: String(state.dispatch.key).toUpperCase() };
+    moved = true;
+  }
+  /*
    * The history belongs to the work, and the work kept going under a new
    * name. `withHistory` starts both lists again when the bound key and
    * `historyKey` differ -- right for a session rebound to another ticket,
@@ -1919,7 +1930,7 @@ export function launchFields(tool, toolInput = {}) {
  * brief, model- and user-written, and `docs/REPORTING_CONTRACT.md` has
  * always said a prompt stays on the machine.
  */
-export function recordLaunch(sessionId, toolInput = {}, launchedBy = undefined, represented = {}, toolUseId = undefined) {
+export function recordLaunch(sessionId, toolInput = {}, launchedBy = undefined, represented = {}, toolUseId = undefined, promptId = undefined) {
   const name = agentLabel(toolInput.name, 64);
   const task = agentLabel(toolInput.description, 80);
   const type = agentLabel(toolInput.subagent_type, 40);
@@ -1940,13 +1951,20 @@ export function recordLaunch(sessionId, toolInput = {}, launchedBy = undefined, 
   // hoc key minted for it and its derived title, or the session's own
   // key it will report under, or why neither could be had. Local, and
   // what `teamflow status` counts; the agent's first hook reads `key`.
-  for (const field of ['key', 'title', 'under', 'reason']) {
+  for (const field of ['key', 'title', 'under', 'reason', 'review', 'lens']) {
     if (represented[field]) launch[field] = String(represented[field]).slice(0, 180);
   }
+  // What the agent is for (MACLEOD-722): the answer and its fixed
+  // features, enums and numbers only. The prompt it was scored on is
+  // not here and never was.
+  if (represented.role && typeof represented.role === 'object') launch.role = represented.role;
   // The agent that launched this one, when it was an agent (MACLEOD-639):
   // its capped id, which becomes `agent.parentAgent` on the launched
   // one's rows so the board can nest them.
   if (launchedBy) launch.launchedBy = String(launchedBy).slice(0, 80);
+  // The user prompt it was launched under (`prompt_id`, MACLEOD-722): a
+  // batch never spans two prompts. Local only; an opaque id.
+  if (typeof promptId === 'string' && /^[A-Za-z0-9_-]{1,80}$/.test(promptId)) launch.promptId = promptId;
   // A file nobody else writes, named for its tool call or for nothing but
   // chance, so five of these at once are five files rather than four
   // lost updates.
@@ -3944,6 +3962,8 @@ export function agentBlock(state = {}) {
   if (agent.parentAgent) block.parentAgent = String(agent.parentAgent).slice(0, 80);
   if (agent.startedAt) block.startedAt = agent.startedAt;
   if (agent.endedAt) block.endedAt = agent.endedAt;
+  // What it was launched for (MACLEOD-722), enums and numbers only.
+  if (agent.role?.as) block.role = { ...agent.role };
   return block;
 }
 
@@ -4064,6 +4084,8 @@ export function issuePayload(state, config, info) {
     ...(state.testPoints?.length ? { points: state.testPoints.slice(-50) } : {}),
     // MACLEOD-646: what the newest passing test run covered, file paths only.
     ...(state.testsPassed ? { testsPassed: state.testsPassed } : {}),
+    // MACLEOD-726/733: what TeamFlow told the agent on this card, newest last.
+    ...(state.directions?.length ? { directions: state.directions.slice(-10) } : {}),
     // MACLEOD-510. Set by refreshDelivery, and absent rather than empty
     // outside a repository or when the branch has no pull request.
     git: state.git,
@@ -4170,6 +4192,8 @@ export function sanitizePayload(value, { kind = 'issue' } = {}) {
     'verdicts', 'points',
     // MACLEOD-646: a passing test run's reach, scoped below.
     'testsPassed',
+    // MACLEOD-726/733: what TeamFlow told the agent, scoped below.
+    'directions',
   ]);
   /*
    * MACLEOD-639: what only one document kind may carry at its root. A
@@ -4181,7 +4205,14 @@ export function sanitizePayload(value, { kind = 'issue' } = {}) {
    * them, inside `executions[]`. `actions` -- what a lead asked and what
    * came of it -- is the issue document's alone.
    */
-  const runtimeRoot = new Set(['startedAt', 'endedAt', 'session', 'attempts', 'retry', 'supersededBy', 'gate', 'failedSteps']);
+  const runtimeRoot = new Set(['startedAt', 'endedAt', 'session', 'attempts', 'retry', 'supersededBy', 'gate', 'failedSteps', 'review',
+    // The reviewer's own agent block (MACLEOD-714, carried from MACLEOD-722): the
+    // contract always listed it, and without it the board could not put a
+    // reviewer under its person nor the service read its role.
+    'agent']);
+  // A reviewer of a step (MACLEOD-714): its lens, the fixed result and
+  // counts. Never the words the reviewer wrote; there is no field for them.
+  const reviewOnly = new Set(['lens', 'result', 'round', 'findings', 'high', 'medium', 'low', 'stated']);
   const issueRoot = new Set(['actions']);
   /*
    * MACLEOD-548: the one event shape. `at` is when the event happened and
@@ -4209,7 +4240,12 @@ export function sanitizePayload(value, { kind = 'issue' } = {}) {
    * the payload they are dropped, `prompt` and `last_assistant_message`
    * among them, because neither is in either set.
    */
-  const agentOnly = new Set(['id', 'name', 'task', 'type', 'parent', 'parentAgent', 'startedAt', 'endedAt']);
+  const agentOnly = new Set(['id', 'name', 'task', 'type', 'parent', 'parentAgent', 'startedAt', 'endedAt', 'role']);
+  // What the agent was launched for (MACLEOD-722): the answer, how it was
+  // reached and the classifier's fixed features. Enums, flags, one count
+  // and one number; the prompt it was scored on has no field here.
+  const roleOnly = new Set(['as', 'by', 'intent', 'confidence', 'batch', 'bound', 'position', 'claude', 'step', 'ask',
+    'moved', 'outcome']);
   // Which session a run happened in. `repository` and `branch` are in the
   // flat set already; the rest are here and nowhere else, so a transcript
   // path or a raw session id has no field to arrive on.
@@ -4240,12 +4276,15 @@ export function sanitizePayload(value, { kind = 'issue' } = {}) {
   // A passing test run's reach (MACLEOD-646): a family, whether it ran all
   // of it, the test files the command named, and when. Never a test name.
   const testsPassedOnly = new Set(['family', 'all', 'files', 'at']);
+  // What TeamFlow told the agent (MACLEOD-726/733): a clock, one plain
+  // line of the plugin's own words, and whether it is still to come.
+  const directionOnly = new Set(['at', 'text', 'next']);
   const nested = {
-    testsPassed: testsPassedOnly,
+    testsPassed: testsPassedOnly, directions: directionOnly,
     agent: agentOnly, session: sessionOnly,
     rework: reworkOnly, lastFailure: failureOnly, transitions: transitionOnly,
     attempts: attemptOnly, retry: retryOnly, supersededBy: supersededOnly, actions: actionOnly,
-    verdicts: verdictOnly, points: pointOnly,
+    verdicts: verdictOnly, points: pointOnly, review: reviewOnly, role: roleOnly,
   };
   const rootOnly = kind === 'runtime' ? runtimeRoot : issueRoot;
   function walk(v, scope) {
@@ -4259,7 +4298,7 @@ export function sanitizePayload(value, { kind = 'issue' } = {}) {
         ? nested[scope].has(key)
         : allowed.has(key) || (scope === 'event' && eventOnly.has(key)) || (scope === 'root' && rootOnly.has(key));
       if (!ok) continue;
-      const next = nested[scope] ? scope
+      const next = nested[scope] ? (scope === 'agent' && key === 'role' ? 'role' : scope)
         : nested[key] ? key
           : key === 'executions' ? 'event' : scope;
       out[key] = walk(item, next);

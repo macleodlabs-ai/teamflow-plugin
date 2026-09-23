@@ -77,9 +77,15 @@ const USAGE = `teamflow \u2014 delivery reporting for TeamFlow
   teamflow work-on <issue>         bind, with --local implied inside a git worktree;
                                    identical to bind everywhere else
   teamflow next [--dry-run]        take the top-priority open ticket and bind it
+  teamflow progress [--csv|--line] the progress of all current and remaining work,
+                                   as the table the dashboard shows
   teamflow adhoc start "<what the work is>" | title "<...>" | done
                                    work that arrived without a ticket: TeamFlow
                                    mints the key; \`teamflow adhoc --help\` has the rest
+  teamflow review start --lens <name>
+                                   the next agent you start reviews the card
+  teamflow review done --result pass|findings|failed [--high N --medium N --low N]
+                                   a reviewer agent states its result for the card
   teamflow workflow create <name> | add <KEY> | show | status <s>
                                    the pool of tickets a run works through;
                                    \`teamflow workflow --help\` lists its flags
@@ -102,6 +108,8 @@ const USAGE = `teamflow \u2014 delivery reporting for TeamFlow
   teamflow admin launch [--confirm]         end demo mode; run once, on the day
   teamflow report --issue ... --stage ...   report one stage transition
   teamflow skills install --for <tool>      install these skills into another tool
+  teamflow continue on|off|status   whether TeamFlow tells a stopped session what
+                                   to do next (on for plan runs by default)
   teamflow hooks status | install           report automatically from that tool
   teamflow hooks uninstall --all            take all of it back out again
   teamflow hook --for <tool>                the hook entry itself; tools call this
@@ -270,6 +278,9 @@ async function status() {
   // When this session last saved where it was (MACLEOD-641).
   const { snapshotLine } = await import('./resume.mjs');
   const snapshot = snapshotLine(state?.sessionId);
+  // Whether TeamFlow keeps a stopped session going, and how often it did (MACLEOD-726).
+  const { continueLine } = await import('./continue.mjs');
+  const autoContinue = continueLine(state?.sessionId);
   /*
    * Fixes from a lead, first (MACLEOD-639, ruling 10). `status` is the
    * first thing somebody runs when a ticket has stopped, and a lead may
@@ -324,6 +335,7 @@ async function status() {
     ...(toPass?.length ? { checksToPass: toPass } : {}),
     dispatched,
     heartbeat,
+    autoContinue,
     snapshot,
     lastPublishResult: state?.lastPublishResult,
     // Machine-wide, and until a report is accepted again (MACLEOD-620).
@@ -964,6 +976,11 @@ try {
     const { main } = await import('./next.mjs');
     process.exit(await main(args, { cwd, config, info, bind }));
   }
+  else if (command === 'progress') {
+    // Read-only: the organisation's bundle, through the dashboard's own rules.
+    const { main } = await import('./progress.mjs');
+    process.exit(await main(args, { config }));
+  }
   else if (command === 'workflow') {
     const { main } = await import('./workflow.mjs');
     process.exit(await main(args, { cwd, config, info }));
@@ -973,6 +990,11 @@ try {
     // fails a build -- and `run` exits with the command's own code.
     const { ciMain } = await import('./runtime-report.mjs');
     process.exit(await ciMain(args, { cwd, config }));
+  }
+  else if (command === 'review') {
+    // A reviewer states its result (MACLEOD-714); exit 2 on bad words.
+    const { main } = await import('./review.mjs');
+    process.exit(main(args));
   }
   else if (command === 'adhoc') {
     const { main } = await import('./adhoc.mjs');
@@ -1008,6 +1030,19 @@ try {
     print(on
       ? 'TeamFlow will show fixes a lead writes on your ticket at the start of a session and in `teamflow status`.'
       : 'TeamFlow will not fetch fixes written on your tickets for this machine. `teamflow config set intake on` turns it back on.');
+  }
+  else if (command === 'continue') {
+    // `teamflow continue on|off|status` (MACLEOD-726): whether TeamFlow
+    // tells a session what to do next when it stops.
+    const { continueLine, setSetting } = await import('./continue.mjs');
+    const [verb = 'status'] = args;
+    if (verb === 'status') print(`Auto-continue: ${continueLine(latestSessionForCwd(cwd, config)?.sessionId)}`);
+    else {
+      const on = setSetting(verb) === 'on';
+      print(on
+        ? 'TeamFlow will tell a stopped session what to do next, in a plan and outside one.'
+        : 'TeamFlow will not tell a stopped session what to do next. `teamflow continue on` turns it back on.');
+    }
   }
   else if (command === 'statusline-tap') {
     // Chained from a statusline command: reads its JSON, prints nothing (MACLEOD-641).

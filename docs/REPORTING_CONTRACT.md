@@ -308,6 +308,7 @@ It may carry:
 - `tickets[].note` (MACLEOD-639, ADHOC-14): one sentence of at most 120 characters that somebody passed to `teamflow workflow ticket <KEY> --note <text>`, such as `audit: 1 high, critical did not stop the harness`, drawn in the Status view's state cell. It is only what the command line passed: never the order, a gate `--reason`, a prompt or anything the plugin composes. The plugin makes it one line, strips every control character and collapses whitespace (`noteLine` in plugin/scripts/workflow.mjs); the service refuses a document whose note is not one clean line (`WORKFLOW_NOTE_MAX`, `_one_line` in schema.py). `--note ""` clears it
 - `phases[]`: `n`, `state`, `tickets[]`
 - `origin` — `auto` when the plugin created the run itself because a session dispatched agents with no run to hold them (MACLEOD-639). Absent on every run a person created. The board draws an `auto` run as unplanned: its nodes are real, its edges are unknown until `teamflow workflow depends` draws them. `tickets[].addedBy` gains `dispatch` for the same reason: a node the hooks put in the pool because an agent was sent to work on it. Its title is the agent's label and one-line task as the launch registry already carries them, capped like any summary: the label at 64 characters and the task (the `Agent` tool's `description`) at 80, each collapsed to one line; the prompt the agent was given is not an input to it
+- `directions[]` — what auto-continue told a session to do next (MACLEOD-726): `at`, `kind` (`fix`, `points`, `finish`, `next`, `waiting`; and for an agent told to wait, MACLEOD-733, `start` and `wait`), `key` (absent on `waiting`) and `said` (≤ 240), capped at 20. `said` is the plugin's own fixed words with keys, step names, counts and the run's name reduced to plain characters; never a title, a point's text, a note or anything else the service sent. `continued` is how many times the plugin kept a session going on this run. The Progress view reads both
 
 **The user's order does not travel.** The order is a prompt, and the rule
 above admits no exception for this one: it selects tickets on the machine and
@@ -748,6 +749,7 @@ Four more fields on the issue document, plugin-written, and one more on the `age
 | `points[]` (ADHOC-19) | `{id, gate, key?, text, from, rounds?, lastRound?, state, at, by?, doneAt?, doneRound?, doneBy?}`, 50 at most, open ones never dropped for the cap: a run that would push an open point out raises no point and counts it on its verdict as `notAdded` | Why a gate sent the card back, one line each, checked off by the runs that follow (one rule: `plugin/scripts/points.mjs`, mirrored in `adapters/teamflow/points.py`). A point failed again stays open and `rounds` goes up; a new failure is a new point in that round; a run that judged every point at its gate marks the ones it did not fail again `done` in that round. On this document the plugin writes two kinds. **Audit and recorded findings** (`F1`, `F2`, …): each `--finding <text>` a person gave to `teamflow workflow ticket <KEY> --state rework`, one line, at most 280 characters, the same sanitising as `note`, at most 20 in one round (more is refused with a sentence, never cut); `--done <ID>` and `--reopen <ID>` change `state`. Nothing is closed by omission: a failed audit only adds points, a second call at the same gate with no new rework in between adds to the same round, and only an audit given with `--rechecked` (a complete re-audit, or a pass that checked everything again) marks the open audit points it does not list `done`. A pass without `--rechecked` closes nothing. **Failing tests** (`T-<6 hex>`, gate `test`), see the next row. Points are never deleted. Carried by the service across reports that leave them out, merged by `id` with the report's copy winning. |
 | `points[]` from a test run (ADHOC-19) | **Off. The owner declined on 2026-09-22 for now; cards get a per-file count instead:** one point per failing test file with a count, `<file>: 2 tests failing` (key: the file), or `2 tests failing` when the runner names no file, and no test name. The service drops any named test point it receives. The code still holds the switches (`reporting.failingTests` in the plugin, `adapter.reporting.failingTests` in the service), both off, and they stay off unless the owner decides otherwise. What a named point would carry, for that decision: a failing test's **identifier**, its file and name as the runner printed them on its own summary line (`FAILED tests/test_x.py::test_y`, vitest `FAIL a.test.ts > group > name`, jest `● group › name`, TAP `not ok N - name`, go `--- FAIL: TestName`), with a trailing `[...]` parameter part cut off, at most 20 per run, 160 characters each. Parameter values a runner expands into the name itself (jest's `it.each` with `%s`) cannot be told from the name and stay in it | So a card a test run sent back carries which tests failed, and the next run checks each one off when it passes. Only the identifier: never the assertion message, a diff, a stack trace or any other line of output (`plugin/scripts/failing-tests.mjs`; `plugin/tests/failing-tests.test.mjs` asserts a message printed beside the name never reaches the payload). Test names come from the customer's repository, which is why this row is listed apart. Only a whole-suite run, or named test files run in full, checks a point off; a run of one file judges exactly that file's points. A directory, a filter word, a node id, a glob or a name filter (`-k`, `-t`, `--grep`, `--testNamePattern`) makes a run partial and it checks nothing off, and so does a run with more than 20 failures, whose list was cut. A run judges only its own runner's points: pytest the Python files, go the `_test.go` files, vitest, jest, mocha and node:test the JavaScript and TypeScript ones; a point whose name carries no file keeps its runner in its key (`js|group › name`). |
 | `testsPassed` (MACLEOD-646) | `{family, all, files?, at}` | What the newest **passing** test run covered, so the service can tick an acceptance criterion linked to a test file. `family` is `py`, `go` or `js` (the runner); `all` is true only for a run that named no file and no filter, so the whole family passed; `files` are the test files the command named, at most 20, each at most 160 characters -- the same class of identifier a failure point's `key` already carries. Never a test's name, the output or the command. Any failed test run clears it, so a pass is never read after a later failure. Scoped by `sanitizePayload`: `family`, `all`, `files` and `at` are allowed inside this block and nowhere else. |
+| `directions` (MACLEOD-726, MACLEOD-733) | `[{at, text, next?}]`, at most 10 | What TeamFlow told this card's agent when it stopped, for the Progress view: "Told the agent to carry on with the plan", "Told the agent to start. What it waited for is done", or, with `next: true`, what it waits for ("Start when MACLEOD-701 is done"). `text` is the plugin's own fixed words with keys and branch names only, at most 120 characters. Scoped by `sanitizePayload`: `text` and `next` are allowed inside this block and nowhere else. |
 
 
 **Nothing else travels with them.** No command, no test output, no log line, no file name: `summary` is the sentence the classifier already puts in `summary` on the report, and the plugin's `sanitizePayload` allows `at` and `by` inside these blocks and nowhere else on the flat payload.
@@ -898,6 +900,143 @@ status: "failed"}`. Still names and numbers only.
 `GET /v1/members/pipeline` also answers `tier`, `customGates` (may this
 organisation add a column) and `customGatesTier` (the plan that adds them,
 by name), so the editor offers only what the `PUT` would accept.
+
+### Reviewers of a check step (MACLEOD-714)
+
+An agent started from a session bound to a ticket while that ticket
+stands at a check step (Local Test, Local Audit, Dev Test, Dev Audit, or
+a custom check reported at one of them) is a **reviewer** of that step.
+The plugin no longer decides this by where the ticket is alone (see
+MACLEOD-722 below), never by the agent's name, and mints no ad hoc card
+for a reviewer. Each reviewer is one runtime
+sidecar:
+
+| Field | Value |
+| --- | --- |
+| slot | `review-<n>`, n from 1 to 8 (`schema.is_review_slot`). One per reviewer of one round |
+| `kind`, `stage` | `audit` at an audit step, else `test`; the step's own stage |
+| `label` | the lens: the agent's one-line description through the plain-words writer, at most 80 characters. Never the prompt |
+| `status` | `running`, `success` (pass) or `failed` (findings or failed) |
+| `summary` | the plugin's own sentence from the enum and counts only (`Security found 2 medium problems.`) |
+| `agent` | the reviewer's `agent` block, so the board puts it under its person |
+| `review.lens` | the same lens |
+| `review.result` | `running`, `pass`, `findings`, `failed`, or `withdrawn` (MACLEOD-722: it changed files and was moved to worker) |
+| `review.round` | ISO time the round began; the step is judged on the newest round |
+| `review.findings`, `review.high`, `review.medium`, `review.low` | counts, 0 to 999, each optional |
+| `review.stated` | `true` when the agent said the result with `teamflow review done` |
+
+**The result is derived on the machine.** Claude Code's own
+`ReportFindings` call, when the reviewer makes one, is the result: an
+empty `findings` list is `pass`, else `findings` with the count
+(findings a re-report marks `fixed` or `no_change_needed` are not
+counted). That list has no severity, so no `high`, `medium` or `low` is
+sent for it, and no finding's file, summary or scenario leaves the
+machine. Otherwise the plugin reads the reviewer's report — its
+`SubagentHandback` message when it made one, else its last message
+(`last_assistant_message` on its `SubagentStop`) — with a small fixed parser (✅, PASS, ❌, FAIL, "2 medium", "3 findings")
+and sends only the enum and the counts. The message itself never leaves
+the machine. `teamflow review done --result pass|findings|failed
+[--high N --medium N --low N]`, run by the reviewer, states the result
+exactly and wins over `ReportFindings` and the parser; the hook reads those words from the
+agent's own shell command and nothing else from it. A message the parser
+cannot read is `failed`: a review with no clear answer is not a pass.
+
+**The step's result** is folded by the dashboard, not stored: the step
+passes when every reviewer of the newest round passes, reads running while
+any is running, and goes back to rework when any found problems or
+failed. The History line names the lenses (`Security found 2 medium
+problems.`).
+
+### What an agent was launched for (MACLEOD-722)
+
+Position alone was wrong the moment a review found problems: the
+supervisor sent a fix agent while the ticket still stood at the audit,
+and it was counted as one more reviewer. Now the plugin answers
+`reviewer | worker | adhoc` for each launch from signals read on the
+machine, strongest first:
+
+1. **An explicit mark.** A description that starts `Review:` or
+   `Reviewer:` is a reviewer; `Fix:` or `Build:` is a worker;
+   `teamflow review start --lens <name>` run in the session marks its
+   next launch a reviewer with that lens. A mark decides.
+2. **Claude Code's own word.** An agent-team task (`TaskCreated` or
+   `TaskCompleted`, with `teammate_name` and `task_subject`) whose
+   subject says review or build, for the teammate a launch's `name`
+   names, decides just below a mark (`by: claude`). Only the lean is
+   kept, on the machine; the subject never leaves it. Else the
+   `subagent_type` names an agent
+   definition (the project's `.claude/agents/<name>.md`, the user's, or a
+   plugin's `<plugin>:<name>`). A definition that may not edit files
+   (its `tools` list has no Edit, Write, MultiEdit or NotebookEdit, or
+   `disallowedTools` names all four), or whose name and description say
+   it reviews, leans reviewer; one that says it builds leans worker. The
+   definition is read and dropped.
+3. **The batch.** Agents one parent launched in one burst (within five
+   seconds, under one `prompt_id`, with no prompt and no agent's end
+   between them) are a team; a team at a check step leans reviewer. The
+   prompt id is kept on the machine only.
+4. **Intent.** `subagent_type`, the description and the prompt's first
+   three lines, scored by a fixed word rule (review, audit, verify,
+   check, assess, inspect and lens names; fix, implement, build, write,
+   refactor, add, change; research words). **The prompt never leaves the
+   machine**: only `intent` and `confidence` do.
+5. **Position.** At a check step, one signal. Right after a round that
+   found problems, one agent alone leans worker: that is the fix.
+
+Strong signals that agree decide. Weak or disagreeing signals still
+decide at once by the rules, and the agent's `role` block says `ask:
+true`. A reviewer away from a check step reviews `LOCAL_AUDIT`, and only
+on a clear lean. A reviewer with no ticket bound is `adhoc`.
+
+**The `role` block** rides inside `agent` on the agent's own runs and on
+its `review-<n>` sidecar (whose `agent` block now reaches the wire, as
+the table above always said):
+
+| Field | Value |
+| --- | --- |
+| `as` | `reviewer`, `worker` or `adhoc` |
+| `by` | `mark`, `claude`, `batch`, `intent`, `position`, `rules` (signals disagreed) or `moved` |
+| `intent`, `confidence` | `review`, `build`, `research` or `other`; 0 to 1 |
+| `batch` | 1 to 50, the launches in its burst |
+| `bound`, `position`, `claude`, `step` | a ticket was bound; `check_step` or `other`; the definition's lean `reviewer`, `worker` or `none`; the step |
+| `ask` | the classifier is asked too |
+| `moved`, `outcome` | it was moved to worker; at its end, `review` (a pass or findings) or `work` |
+
+**Correcting.** A reviewer that edits a file in its repository or runs
+`git commit` is moved to worker once: its `review-<n>` sidecar is sent
+with `review.result: withdrawn`, `status: idle` and the one History line
+`<lens> changed files, so it counts as work, not a review.` The step's
+result no longer counts it.
+
+**The classifier, watch-only.** A report carrying `role.ask` marks the
+key like any other decision; the decide job asks one `launch_role`
+question per agent, showing the decider only `step`, `batch`,
+`subagentType`, `intent`, `confidence`, `bound`, `position` and `claude`,
+with the answers `reviewer`, `worker` and `adhoc`. The answer is kept on
+the hygiene sidecar's `launchRoles[]` (at most 16 rows of `{agent, at,
+question, mode: watch, features, rules, rulesBy, chosen, confidence, by,
+decider_version, outcome?, outcomeAt?, moved?}`) and nothing acts on it.
+The agent's `outcome`, when it arrives, is added to the same row, so both
+answers can be graded. Acting on the answer is MACLEOD-648's.
+
+**How a quiet card's work ended (MACLEOD-726, L10).** No report carries
+anything new for this. The five-minute repair pass marks a card that a
+plan still holds open, that no fact finished and that nobody has worked on
+for the idle band; the decide job then asks one `work_outcome` question in
+the organisation's own slice. The decider is shown only fixed features the
+service derives: `stage`, `prevStage`, `mergeSeen` (a flag),
+`prState` (`none`, `open`, `merged`, `closed`), `trackerClass` (`none`,
+`todo`, `in_progress`, `done`), `nodeState` and `aliasNodeState` (a plan
+node's state, or `none`), `endKind` (`none`, `ended`, `crashed`, `quiet`),
+`minutesSinceEvent` (0 to 10080) and `rework` (the open rework count).
+Never a key, a name, a title or any text. The answers are `done`, `rework`,
+`unfinished` and `still_working`. The row is kept on the hygiene sidecar's
+`workOutcomes[]` (at most 8 rows of `{at, question, mode, digest, features,
+rules, chosen, confidence, by, decider_version?, acted?}`); `digest` is the
+features without the clock, so the same facts are asked once. At the bar
+(0.7), `done` and `rework` set the plan node and write one History line;
+below it the row is `mode: watch` and nothing moves. A card's
+`autonomy_off` wins over any answer.
 
 ### What the SERVICE writes beside a card (MACLEOD-639, WS-D)
 

@@ -100,6 +100,8 @@ export const USAGE = `teamflow workflow — the pool of tickets a run works thro
                             [--found planning|build] [--to <name>]
       One ticket waits on another. Re-levels the phases, because an edge
       a team found mid-build moves tickets between them.
+      With --branch <name>, the waiting ticket starts from that branch's
+      commits: TeamFlow tells its agent to start once the branch is pushed.
 
   teamflow workflow depends <KEY> --on <KEY> --remove [--reason <why>]
                             [--found planning|build] [--to <name>]
@@ -513,6 +515,12 @@ export function published(workflow) {
   if (Array.isArray(workflow.hygiene) && workflow.hygiene.length) {
     out.hygiene = workflow.hygiene.slice(-20).map((row) => pick(row, ['at', 'action', 'by', 'reason']));
   }
+  // What TeamFlow told the session to do next, and how many times it
+  // kept a session going (MACLEOD-726). Plugin words and facts only.
+  if (Array.isArray(workflow.directions) && workflow.directions.length) {
+    out.directions = workflow.directions.slice(-20).map((row) => pick(row, ['at', 'kind', 'key', 'said']));
+  }
+  if (Number.isInteger(workflow.continued) && workflow.continued > 0) out.continued = workflow.continued;
   // A run the plugin created because a session dispatched work without
   // one (MACLEOD-639). The board draws it as unplanned -- a run with
   // nodes and no edges -- rather than as a plan somebody wrote.
@@ -1491,6 +1499,7 @@ export async function main(args, {
       return 0;
     }
     const edge = depends(target, positional[0], flag(rest, 'on'), {
+      branch: flag(rest, 'branch'),
       reason: flag(rest, 'reason'),
       found: flag(rest, 'found') || 'planning',
     });
@@ -1841,6 +1850,9 @@ export function seed(workflow, keys = []) {
   return workflow.tickets;
 }
 
+// A git branch name with nothing a shell or git could read as more.
+export const BRANCH = /^(?![-.\/])(?!.*\.\.)(?!.*\/\/)(?!.*\.lock$)[A-Za-z0-9._\/-]{1,100}(?<![./])$/;
+
 /**
  * Record one edge, without re-levelling.
  *
@@ -1852,7 +1864,7 @@ export function seed(workflow, keys = []) {
  * left as it is: widening the service's allowlist before the ad hoc subject
  * exists would accept ids nothing can draw.
  */
-function recordEdge(workflow, from, on, { reason, found = 'planning' } = {}) {
+function recordEdge(workflow, from, on, { reason, found = 'planning', branch } = {}) {
   const a = String(from || '').trim();
   const b = String(on || '').trim();
   if (!a || !b) throw new Error('Usage: teamflow workflow depends <KEY> --on <KEY>');
@@ -1864,6 +1876,13 @@ function recordEdge(workflow, from, on, { reason, found = 'planning' } = {}) {
   const existing = edges.find((d) => d.from === a && d.on === b);
   const edge = existing || { from: a, on: b, found };
   if (reason) edge.reason = String(reason).slice(0, 180);
+  // The branch whose commits the waiting ticket starts from (MACLEOD-733).
+  // Kept on this machine only; auto-continue asks git whether it is on
+  // the remote, so it is a plain branch name and nothing else.
+  if (branch !== undefined) {
+    if (!BRANCH.test(String(branch))) throw new Error('--branch must be a plain branch name, such as lane-theme');
+    edge.branch = String(branch);
+  }
   edge.found = found;
   if (!existing) edges.push(edge);
   workflow.dependencies = edges;

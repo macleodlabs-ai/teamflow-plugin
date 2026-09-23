@@ -3,6 +3,26 @@
 What changed in each published version of the TeamFlow plugin, newest first.
 Only what a person using it would notice.
 
+## 0.3.37
+
+- **TeamFlow keeps your agents going.** When a session in a plan stops,
+  TeamFlow tells it the next step: fix a failed check first, then the next
+  ready item. It never answers a question meant for you, and never acts after
+  a usage limit or an error. It stops after 5 in a row, or when nothing
+  changed. `teamflow continue on|off|status` turns it on or off.
+- **Agents that wait start by themselves.** When an agent waits for work that
+  is done, or for a commit that is on GitHub, TeamFlow tells it to start.
+  While it still waits, its card says what it waits for.
+- **`teamflow progress`** prints the state of all current and remaining work
+  as one table. `--csv` gives a file you can open in a spreadsheet.
+- **Reviewers are known.** A review team's agents show as reviewers on the
+  card, whatever their names.
+
+### Also
+
+- An agent that moves to a real ticket keeps that ticket in its plan.
+- A fix queued on an ad hoc card follows the ticket it became.
+
 ## 0.3.36
 
 - **Background agents show as live** while they work, and as ended after.
