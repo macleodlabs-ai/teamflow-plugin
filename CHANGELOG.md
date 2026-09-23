@@ -3,6 +3,16 @@
 What changed in each published version of the TeamFlow plugin, newest first.
 Only what a person using it would notice.
 
+## 0.3.36
+
+- **Background agents show as live** while they work, and as ended after.
+  A resumed session is no longer read as ended.
+- **An agent's card folds into the real ticket** it moves its work to, and an
+  empty agent card closes by itself.
+- **No lost cards.** A card for a new agent is sent first and retried if
+  needed.
+- **Workflow runs** get a card on the board too.
+
 ## 0.3.35
 
 - **Trial ended** links to the new pricing page, https://codercat.io/pricing/.

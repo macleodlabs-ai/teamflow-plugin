@@ -29,6 +29,7 @@ import {
   followKeyAliases,
   isAdHocKey,
   isAgentTool,
+  launchFields,
   loadConfig,
   findLaunch,
   isLinkedWorktree,
@@ -59,7 +60,7 @@ import {
 } from './heartbeat.mjs';
 import { pruneSnapshots, resumeNotice, saveSnapshot } from './resume.mjs';
 import {
-  boundToTeamflow, closeDispatched, dispatchOf, launchesOf, planLaunch, settle, withMint,
+  boundToTeamflow, closeDispatched, dispatchOf, launchesOf, planLaunch, publishOwed, settle, withMint,
 } from './dispatch.mjs';
 
 /** Whether a launch in this session was claimed by this agent id. Local files only. */
@@ -288,7 +289,7 @@ export function claudeContext(event, state, justBound, stale = staleBuildNotice(
 export function withAgentIdentity(event, input, state, sessionId, agentKey, launched = false) {
   const tool = input.tool_name || '';
   if (event === 'PreToolUse' && isAgentTool(tool) && !agentKey) {
-    const launch = recordLaunch(sessionId, input.tool_input || {}, undefined, state.represented, input.tool_use_id);
+    const launch = recordLaunch(sessionId, launchFields(tool, input.tool_input), undefined, state.represented, input.tool_use_id);
     // Remembered on the session's own state so a later worktree event
     // can tell "this session runs agents" from "this person opened a
     // second repository", without listing a directory per event.
@@ -296,7 +297,7 @@ export function withAgentIdentity(event, input, state, sessionId, agentKey, laun
   }
   if (event === 'PostToolUse' && isAgentTool(tool) && !agentKey) {
     // Planned just now because the PreToolUse recorded nothing (MACLEOD-640).
-    if (state.represented) recordLaunch(sessionId, input.tool_input || {}, undefined, state.represented, input.tool_use_id);
+    if (state.represented) recordLaunch(sessionId, launchFields(tool, input.tool_input), undefined, state.represented, input.tool_use_id);
     claimLaunch(sessionId, parseAgentId(input.tool_response), input.tool_input?.subagent_type, input.tool_use_id);
     return { ...state, launched: true };
   }
@@ -304,11 +305,11 @@ export function withAgentIdentity(event, input, state, sessionId, agentKey, laun
   // session's own launches, with the launcher's id, so the nested one
   // is named and carries `parentAgent`.
   if (event === 'PreToolUse' && isAgentTool(tool) && agentKey && state.agent) {
-    recordLaunch(sessionId, input.tool_input || {}, state.agent.id, state.represented, input.tool_use_id);
+    recordLaunch(sessionId, launchFields(tool, input.tool_input), state.agent.id, state.represented, input.tool_use_id);
     return state;
   }
   if (event === 'PostToolUse' && isAgentTool(tool) && agentKey && state.agent) {
-    if (state.represented) recordLaunch(sessionId, input.tool_input || {}, state.agent.id, state.represented, input.tool_use_id);
+    if (state.represented) recordLaunch(sessionId, launchFields(tool, input.tool_input), state.agent.id, state.represented, input.tool_use_id);
     claimLaunch(sessionId, parseAgentId(input.tool_response), input.tool_input?.subagent_type, input.tool_use_id);
     return state;
   }
@@ -909,6 +910,9 @@ export async function handleEvent(input = {}) {
   // older plugin wrote, and the ends they owed (MACLEOD-641, audit K4).
   if (event === 'Stop') purgePhantomAgents();
   if (event === 'Stop' || (absorbed && !LOCAL_ONLY.includes(event))) await flushPendingEnds(config, 3, sessionId);
+  // A card minted for an agent whose first publish was lost (MACLEOD-641,
+  // tracking gap 3): tried again once a turn, a few at a time.
+  if (event === 'Stop' || event === 'SubagentStop') await publishOwed(config, { sessionId, state, cwd, info });
 
   /*
    * And a slice of the reconcile pass (MACLEOD-601).

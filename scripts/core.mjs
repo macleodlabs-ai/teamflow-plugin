@@ -1890,7 +1890,28 @@ export function agentLabel(value, max) {
 
 /** True for the tool that launches an agent, under either of its names. */
 export function isAgentTool(tool) {
-  return tool === 'Agent' || tool === 'Task';
+  return tool === 'Agent' || tool === 'Task' || isWorkflowTool(tool);
+}
+
+/**
+ * The Workflow tool starts agents of its own, and Claude Code documents
+ * no SubagentStart for them (MACLEOD-641, tracking gaps). Its PreToolUse
+ * is the one hook there is, so the session records the workflow run as
+ * one launch and mints it a node, as it does for an `Agent`.
+ */
+export function isWorkflowTool(tool) {
+  return tool === 'Workflow';
+}
+
+/**
+ * What a launch records from a tool's input: the `Agent` tool's own
+ * fields, or a workflow run's name and description under the type
+ * "workflow". Never anything else the input holds.
+ */
+export function launchFields(tool, toolInput = {}) {
+  const given = toolInput || {};
+  if (!isWorkflowTool(tool)) return given;
+  return { name: given.name, description: given.description, subagent_type: 'workflow' };
 }
 
 /**
@@ -3958,7 +3979,11 @@ export function sessionBlock(state = {}, info = {}) {
   const tool = state.reporter?.tool;
   if (tool) block.tool = String(tool).slice(0, 80);
   if (state.startedAt) block.startedAt = state.startedAt;
-  if (state.ended && state.updatedAt) block.endedAt = state.updatedAt;
+  // The session's own end only. An agent's actor names the session it
+  // runs under, and its end is the agent's (in `agent.endedAt`): stamped
+  // here it read as the whole session ending, and every row went `ended`
+  // while the session still beat (MACLEOD-641, tracking gap 1).
+  if (state.ended && state.updatedAt && !state.agentKey) block.endedAt = state.updatedAt;
   if (info.repository) block.repository = String(info.repository).slice(0, 200);
   if (info.branch) block.branch = String(info.branch).slice(0, 200);
   return block;

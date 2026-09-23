@@ -49,8 +49,8 @@
 import { currentBinding, mint, TITLE_MAX, TRACKER } from './adhoc.mjs';
 import { title } from './words.mjs';
 import {
-  agentLabel, dataDir, isAdHocKey, isAgentTool, issuePayload, launchesPath, organisationScope, readJson, readWorkflows,
-  reportScope, sendReport, workflowsPath, writeJson, writeWorkflows,
+  agentLabel, dataDir, isAdHocKey, isAgentTool, isWorkflowTool, issuePayload, launchesPath, launchFields, organisationScope,
+  readJson, readWorkflows, reportScope, sendReport, sessionActors, workflowsPath, writeJson, writeWorkflows,
 } from './core.mjs';
 import { projectFor, projectsCachePath } from './project.mjs';
 import { addDispatched, autoCreate, finishRun, liveRun, move, publish, stated } from './workflow.mjs';
@@ -76,6 +76,12 @@ export function dispatchOf(event, input = {}) {
   // two seconds and a busy machine can miss them, and then the launch
   // was never recorded and `status` said "0 agents dispatched". The hook
   // plans on PostToolUse only a launch its PreToolUse did not record.
+  if ((event === 'PreToolUse' || event === 'PostToolUse') && isWorkflowTool(tool)) {
+    // A workflow run always gets a node of its own: its agents fire no
+    // SubagentStart to bind them to anything else (MACLEOD-641).
+    const given = launchFields(tool, input.tool_input);
+    return { kind: 'agent', name: agentLabel(given.name, 64), task: agentLabel(given.description, 80), type: 'workflow', isolated: true };
+  }
   if ((event === 'PreToolUse' || event === 'PostToolUse') && isAgentTool(tool)) {
     const given = input.tool_input || {};
     return {
@@ -378,16 +384,21 @@ export async function settle(config, { sessionId, launch, state = {}, cwd, info 
     if (launch?.id && launch.pending) {
       const claim = claimMint(sessionId, launch);
       const plan = claim.locked ? claim.value : undefined;
-      if (plan?.done) result = plan.done;
+      if (plan?.done) result = await publishMinted(sessionId, launch, plan.done, { state, cwd, config, info });
       if (plan?.go) {
         const got = await mint(config);
         if (got.ok) {
           const title = nodeTitle(launch);
-          result = { state: 'minted', key: got.key, title, at: new Date().toISOString() };
+          // `published: false` until the card is out, so a hook killed
+          // between the mint and the publish leaves a card owed, not lost
+          // (MACLEOD-641, tracking gap 3: ADHOC-62 and 63 were minted and
+          // never reached the board). The card goes before the run lock,
+          // which may wait five seconds.
+          result = { state: 'minted', key: got.key, title, at: new Date().toISOString(), published: false };
           writeMint(sessionId, launch.id, result);
           minted = true;
+          result = await publishMinted(sessionId, launch, result, { state, cwd, config, info });
           ensureRun(config, state, info, { waitMs: 5000, keys: [got.key] });
-          try { await publishItem(got.key, title, launch, state, cwd, config, info); } catch { /* the run names it */ }
         } else {
           result = {
             state: 'failed',
@@ -410,6 +421,55 @@ export async function settle(config, { sessionId, launch, state = {}, cwd, info 
   return result;
 }
 
+/** Whether some actor of the session already reported under this key. */
+function reportedUnder(sessionId, key) {
+  return sessionActors(sessionId).some((one) => one.binding?.key === key && one.lastPublishedAt);
+}
+
+/**
+ * Publish the card a mint is owed (MACLEOD-641, tracking gap 3). Returns
+ * the mint record as it now stands. A card sent, or queued for the
+ * outbox, is published; so is one an agent already reported under,
+ * because the item would overwrite the agent's own report. A refusal
+ * counts as an attempt, and after MINT_ATTEMPTS nothing is tried again.
+ * A record from before this field existed is left alone. Never throws.
+ */
+async function publishMinted(sessionId, launch, held, { state = {}, cwd, config, info } = {}) {
+  if (!held?.key || held.published !== false || (held.publishAttempts || 0) >= MINT_ATTEMPTS) return held;
+  let out;
+  if (reportedUnder(sessionId, held.key)) {
+    out = { ...held, published: true };
+  } else {
+    let sent;
+    try { sent = await publishItem(held.key, held.title, launch, state, cwd, config, info); } catch { sent = undefined; }
+    out = sent?.ok || sent?.queued
+      ? { ...held, published: true }
+      : { ...held, publishAttempts: (held.publishAttempts || 0) + 1 };
+  }
+  writeMint(sessionId, launch.id, out);
+  return out;
+}
+
+/**
+ * Publish the cards this session's mints still owe, at most `limit` a
+ * turn (MACLEOD-641, tracking gap 3). On `Stop` and `SubagentStop`, so a
+ * card whose first publish was lost reaches the board on the next turn.
+ * Returns how many were tried. Never throws.
+ */
+export async function publishOwed(config, { sessionId, state = {}, cwd, info = {}, limit = 3 } = {}) {
+  let tried = 0;
+  try {
+    for (const launch of launchesOf(sessionId)) {
+      if (tried >= limit) break;
+      const held = mintOf(sessionId, launch.id);
+      if (!held?.key || held.published !== false || (held.publishAttempts || 0) >= MINT_ATTEMPTS) continue;
+      tried += 1;
+      await publishMinted(sessionId, launch, held, { state, cwd, config, info });
+    }
+  } catch { /* the next turn tries again */ }
+  return tried;
+}
+
 /**
  * Close the node minted for one agent (MACLEOD-641, audit K1 and K7).
  *
@@ -419,7 +479,7 @@ export async function settle(config, { sessionId, launch, state = {}, cwd, info 
  * its last report passed, `rework` when it failed. `skipped` with a note
  * when the agent went to work on another key instead.
  *
- * Only an ad hoc node the plugin put in a live run for a dispatch. A
+ * Only an ad hoc node the plugin put in a run for a dispatch. A
  * tracker ticket is never closed by an agent: an agent finishing is not
  * the ticket finishing. Idempotent: a node already closed is left as it
  * is. Under the runs lock; the run is published after. Never throws.
@@ -429,9 +489,13 @@ export async function closeDispatched(config, { key, outcome = 'done', note } = 
     if (!isAdHocKey(key)) return undefined;
     const held = withRunsLock(() => {
       const runs = readWorkflows(config);
-      const run = Object.values(runs.workflows || {})
-        .filter((wf) => !['done', 'cancelled', 'archived'].includes(wf.status))
-        .find((wf) => (wf.tickets || []).some((t) => t.key === key && t.addedBy === 'dispatch'));
+      const holding = Object.values(runs.workflows || {})
+        .filter((wf) => (wf.tickets || []).some((t) => t.key === key && t.addedBy === 'dispatch'));
+      // A live run first; else the newest that holds it, because a run
+      // closed on this machine before the agent moved still owes the
+      // board the node's end (MACLEOD-641, tracking gap 2).
+      const run = holding.find((wf) => !['done', 'cancelled', 'archived'].includes(wf.status))
+        || holding.sort((a, b) => String(b.updatedAt || '').localeCompare(String(a.updatedAt || '')))[0];
       const ticket = run?.tickets.find((t) => t.key === key);
       if (!ticket || ['done', 'skipped', outcome].includes(ticket.state)) return undefined;
       move(run, key, { state: outcome, ...(note ? { note } : {}) });
