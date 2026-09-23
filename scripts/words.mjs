@@ -12,6 +12,7 @@
  *   title(raw)       a plain card title from free text such as an agent's
  *                    name and description, 60 characters at most.
  *   candidates(raw)  every title `title` could have chosen, best first.
+ *   about(raw)       one plain sentence saying what the work is, or "".
  *   check(text)      the problems in a text: { rule, sentence, found, plain }.
  *   GLOSSARY         internal word -> plain word.
  *
@@ -61,6 +62,8 @@ export const GLOSSARY = {
   DEV_REWORK: 'Dev Rework',
   DEV_VERIFIED: 'Deployed',
   READY_PROD: 'Done',
+  // A name only TeamFlow's own people know (MACLEOD-646 follow-up).
+  Laya: 'the classifier',
 };
 
 export const BANNED = ['sidecar', 'sidecars', 'hygiene', 'accounting', 'gate verdict',
@@ -80,7 +83,7 @@ const PASSIVE_OK = ['based', 'supposed', 'used', 'finished', 'done', 'interested
   'red', 'need', 'seed', 'speed', 'bed', 'shed', 'feed', 'weed'];
 
 const PROPER = ['Claude', 'Code', 'TeamFlow', 'GitHub', 'Linear', 'Jira', 'SonarQube',
-  'Playwright', 'Stripe', 'Google', 'Cognito', 'AWS', 'Laya', 'Resend', 'Slack', 'Cursor',
+  'Playwright', 'Stripe', 'Google', 'Cognito', 'AWS', 'Resend', 'Slack', 'Cursor',
   'Copilot', 'Windsurf', 'Cline', 'Codex', 'Gemini', 'Junie', 'Dev', 'Delivery', 'Home',
   'Attention', 'History', 'Test', 'Audit', 'Rework', 'Deployed', 'Local', 'Done', 'CI/CD',
   'January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September',
@@ -89,13 +92,24 @@ const PROPER = ['Claude', 'Code', 'TeamFlow', 'GitHub', 'Linear', 'Jira', 'Sonar
 const NOISE = ['claude-code', 'claude code', 'general-purpose', 'wf'];
 
 const TAIL = ['a', 'an', 'and', 'the', 'to', 'of', 'for', 'with', 'in', 'on', 'or', 'at',
-  'by', 'from'];
+  'by', 'from', 'until', 'but'];
 
 const KEY = /\b[A-Z][A-Z0-9]*-\d+\b:?/g;
 const AGENT_ID = /\b(?:worktree-)?agent-[0-9a-f]{6,}\b/gi;
 const HEX = /^(?=[0-9a-f]*\d)[0-9a-f]{7,}$/i;
 const CUT = /\S*(?:…|\.\.\.)$/;
-const SPLIT = /\s+·\s+|:\s+|\s+—\s+|\s+-\s+/;
+const MAJOR = /\s+·\s+|\s+—\s+|\s+-\s+/;
+const COLON = /:\s+/;
+// An agent's code name says who, not what: ws-d, *-opus, WS-K3.
+const CODENAME = /^ws-|-(?:opus|sonnet|haiku|fable)(?:-\d+)?$/i;
+const CODEWORD = /^[a-z]+\d[a-z\d]*$/i;
+const BRACKETS = /\([\s,;&]*\)|\[[\s,;&]*\]/g;
+// Where a long title may stop: after a clause, never inside one.
+const CLAUSE = /[,;.](?=\s)|\s—(?=\s)/g;
+const AREA_MAX = 3;
+const ABOUT_MIN = 3;
+// Where an about line stops: its first sentence or clause.
+const FIRST = /(?<=[.;!?])\s/;
 const SENTENCES = /(?<=[.!?])\s+|\n+|\s+·\s+/;
 const CODE = /`[^`]*`/g;
 const WORD = /[A-Za-z0-9']/;
@@ -110,6 +124,7 @@ function any(terms) {
 }
 
 const LOOKUP = Object.fromEntries(Object.entries(GLOSSARY).map(([k, v]) => [k.toLowerCase(), v]));
+const ORIGINAL = Object.fromEntries(Object.keys(GLOSSARY).map((k) => [k.toLowerCase(), k]));
 // Plain words the glossary writes with a hyphen: words, never a slug.
 const HYPHENED = Object.values(GLOSSARY).filter((v) => v.includes('-')).map((v) => v.toLowerCase());
 const GLOSS = any(Object.keys(GLOSSARY));
@@ -130,9 +145,14 @@ function strip(text, chars, left = true) {
 
 /** Every glossary word in `text` swapped for its plain word. */
 export function plainer(text) {
-  return text.replace(GLOSS, (found) => {
+  return text.replace(GLOSS, (found, _g, at) => {
     const plain = LOOKUP[found.toLowerCase()];
-    return isUpper(found[0]) ? upperFirst(plain) : plain;
+    // A capital at the start of a sentence carries over; a name's own
+    // capital ("Laya") and a capital mid-sentence ("the Sidecar") do not.
+    const original = ORIGINAL[found.toLowerCase()];
+    const before = text.slice(0, at).trimEnd();
+    const first = !before || '.!?'.includes(before[before.length - 1]);
+    return isUpper(found[0]) && original === original.toLowerCase() && first ? upperFirst(plain) : plain;
   });
 }
 
@@ -147,7 +167,11 @@ export function sentence(parts) {
   if (!text) return '';
   const words = text.split(' ');
   const at = words.flatMap((w, i) => (WORD.test(w) ? [i] : []));
-  if (at.length > MAX_WORDS) text = strip(words.slice(0, at[MAX_WORDS - 1] + 1).join(' '), ' .;:,', false);
+  if (at.length > MAX_WORDS) {
+    const kept = words.slice(0, at[MAX_WORDS - 1] + 1);
+    while (kept.length > 1 && TAIL.includes(strip(kept[kept.length - 1].toLowerCase(), ',;:'))) kept.pop();
+    text = strip(kept.join(' '), ' .;:,', false);
+  }
   text = upperFirst(text);
   return '?!'.includes(text[text.length - 1]) ? text : `${text}.`;
 }
@@ -173,9 +197,16 @@ function slug(token, alone) {
     || token.toLowerCase().startsWith('wf-') || /-\d+$/.test(token);
 }
 
+/** An agent's code name, or a lone letters-and-digits handle. */
+function code(token, alone) {
+  if (GLOSS_WHOLE.test(token)) return false;
+  return CODENAME.test(token) || (alone && CODEWORD.test(token));
+}
+
 /** One segment of a raw title as words, and whether it was prose. */
 function cleanSegment(segment) {
-  const tokens = segment.split(' ').filter((t) => !NOISE.includes(t.toLowerCase()));
+  const raw = segment.split(' ').map((t) => (t.startsWith('--') ? t.slice(2) : t));
+  const tokens = raw.filter((t) => !NOISE.includes(t.toLowerCase()) && !code(t, raw.length === 1));
   const words = [];
   let prose = 0;
   let slugs = 0;
@@ -194,43 +225,96 @@ function cleanSegment(segment) {
   return [words.join(' '), prose > 0 && !slugs];
 }
 
+/** A word that keeps its capital: a name, an acronym, a camel case. */
+function isName(word) {
+  const bare = strip(word, '()[],;.');
+  return PROPER.includes(bare) || bare.slice(1) !== bare.slice(1).toLowerCase();
+}
+
+/**
+ * Sentence case. A Title Cased Line loses its capitals; a sentence keeps
+ * the ones it has, which are names ("Cloud Map", "Fargate").
+ */
 function sentenceCase(text) {
-  return text.split(' ').map((word, i) => {
+  const words = text.split(' ');
+  const rest = words.slice(1).map((w) => strip(w, '()[],;.')).filter((w) => /^[A-Za-z]/.test(w));
+  const titled = rest.length > 0 && 2 * rest.filter((w) => isUpper(w[0])).length >= rest.length;
+  return words.map((word, i) => {
     const bare = strip(word, '()[],;.');
     const keep = PROPER.includes(bare) || !(bare && isUpper(bare[0]) && bare.slice(1) === bare.slice(1).toLowerCase());
     if (i === 0) return upperFirst(word);
-    return keep ? word : word.toLowerCase();
+    return titled && !keep ? word.toLowerCase() : word;
   }).join(' ');
 }
 
-/** At most 60 characters, cut at a word, never ending on "and". */
+/**
+ * At most 60 characters. A long title stops after a clause, else at a
+ * word, and never ends on "and", "until" or "the".
+ */
 function cap(text) {
-  const words = text.split(' ');
+  if (text.length > TITLE_MAX) {
+    const cuts = [...text.matchAll(CLAUSE)].map((m) => m.index)
+      .filter((at) => at <= TITLE_MAX && text.slice(0, at).split(/\s+/).filter(Boolean).length > 1);
+    if (cuts.length) text = text.slice(0, cuts[cuts.length - 1]);
+  }
+  let words = text.split(' ');
   while (words.length > 1 && words.join(' ').length > TITLE_MAX) words.pop();
-  while (words.length > 1 && TAIL.includes(words[words.length - 1].toLowerCase())) words.pop();
+  words = strip(words.join(' '), ' .;:,-', false).split(' ');
+  while (words.length > 1 && TAIL.includes(words[words.length - 1].toLowerCase())) {
+    words = strip(words.slice(0, -1).join(' '), ' .;:,-', false).split(' ');
+  }
   return words.join(' ').slice(0, TITLE_MAX);
 }
 
-/** Every plain title the raw text offers, best first. */
-export function candidates(raw) {
-  let text = squash(raw);
-  text = strip(text.replace(CUT, ''), ' ·:—-');
-  text = squash(text.replace(AGENT_ID, ' ').replace(KEY, ' ').replace(/\(\s*\)|\[\s*\]/g, ' '));
-  const found = [];
-  text.split(SPLIT).forEach((segment, i) => {
-    const [cleaned, prose] = cleanSegment(squash(segment));
+/**
+ * [rank, -words, order, text] for one part of a raw title. An "Area:
+ * detail" description keeps both halves when the area is short and
+ * written by a person; a commit's "area: text" keeps the text.
+ */
+function segments(group, at) {
+  const parts = [];
+  for (const part of group.split(COLON)) {
+    const [cleaned, prose] = cleanSegment(squash(part));
     const words = strip(squash(plainer(cleaned)), ' .;:,-');
-    if (words) found.push({ slug: !prose, n: -words.split(' ').length, i, words });
-  });
-  found.sort((a, b) => (Number(a.slug) - Number(b.slug)) || (a.n - b.n) || (a.i - b.i));
+    if (words && words.toLowerCase() !== 'agent') parts.push([words, prose, part.trim()]);
+  }
   const out = [];
-  for (const { words } of found) {
-    const mine = words.toLowerCase().split(' ');
-    if (out.some((o) => { const theirs = o.toLowerCase().split(' '); return mine.every((w) => theirs.includes(w)); })) continue;
+  if (parts.length === 2 && parts[0][1] && parts[1][1] && isUpper(parts[0][2][0])
+      && parts[0][0].split(' ').length <= AREA_MAX) {
+    const [first, ...rest] = parts[1][0].split(' ');
+    const detail = [isName(first) ? first : first.toLowerCase(), ...rest].join(' ');
+    const joined = `${parts[0][0]}: ${detail}`;
+    if (joined.length <= TITLE_MAX) out.push([0, -joined.split(' ').length, at, joined]);
+  }
+  parts.forEach(([words, prose], n) => out.push([prose ? 1 : 2, -words.split(' ').length, at + n + 1, words]));
+  return out;
+}
+
+/** Free text without a cut last word, agent ids, keys or the empty brackets the keys leave. */
+function prepare(raw) {
+  const text = strip(squash(raw).replace(CUT, ''), ' ·:—-');
+  return squash(text.replace(AGENT_ID, ' ').replace(KEY, ' ').replace(BRACKETS, ' '));
+}
+
+const bag = (words) => new Set(words.toLowerCase().match(/[\w'$/-]+/g));
+
+/**
+ * Every plain title the raw text offers, best first: a short area with
+ * its detail, then prose, then slugs, longer before shorter, none
+ * contained in a better one and none of a single word.
+ */
+export function candidates(raw) {
+  const text = prepare(raw);
+  const found = [];
+  for (const group of text.split(MAJOR)) found.push(...segments(group, found.length * 10));
+  found.sort((a, b) => (a[0] - b[0]) || (a[1] - b[1]) || (a[2] - b[2]));
+  const out = [];
+  for (const [, , , words] of found) {
+    const mine = bag(words);
+    if (out.some((o) => { const theirs = bag(o); return [...mine].every((w) => theirs.has(w)); })) continue;
     out.push(words);
   }
-  const titled = out.map((words) => strip(cap(sentenceCase(words)), ' .;:,-', false))
-    .filter((t) => t.toLowerCase() !== 'agent');
+  const titled = out.map((words) => cap(sentenceCase(words))).filter((t) => t.split(' ').length > 1);
   return titled.length ? titled : ['Agent work'];
 }
 
@@ -240,6 +324,26 @@ export function candidates(raw) {
  */
 export function title(raw) {
   return candidates(raw)[0];
+}
+
+/**
+ * One plain sentence saying what the work is, for under a card's title:
+ * the first sentence or clause of free text such as an agent's task or a
+ * commit subject, with keys and code names gone. "" when it says too
+ * little (fewer than ABOUT_MIN words).
+ */
+export function about(raw) {
+  let text = prepare(raw).split(FIRST)[0];
+  // A commit's own "area: " prefix is a code area, not the work.
+  const colon = text.indexOf(': ');
+  const area = colon > 0 ? text.slice(0, colon) : '';
+  if (area && text.slice(colon + 2) && /^[a-z]/.test(area) && area.split(' ').length <= AREA_MAX) text = text.slice(colon + 2);
+  // A clause cut inside brackets leaves one open: it goes.
+  const open = text.lastIndexOf('(');
+  if (open >= 0 && !text.slice(open).includes(')')) text = text.slice(0, open);
+  const kept = text.split(' ').filter((w) => !NOISE.includes(w.toLowerCase()) && !CODENAME.test(strip(w, ':', false)));
+  const said = sentence(strip(kept.join(' '), ' :·—-'));
+  return counted(said).length >= ABOUT_MIN ? said : '';
 }
 
 function sentences(text) {

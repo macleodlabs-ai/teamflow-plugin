@@ -9,7 +9,7 @@ import { refusalOf } from './refusal.mjs';
 import { TOOL_CAPABILITIES } from './tools.mjs';
 import { checkNameFor, checkNames, readChecks } from './checks.mjs';
 import { advance as advancePoints, stableId } from './points.mjs';
-import { title as plainTitle } from './words.mjs';
+import { about as aboutLine, title as plainTitle } from './words.mjs';
 import {
   countedByFile, pointFamily, readFailingTests, runnerFamily, testFile, testScope, withFamily,
 } from './failing-tests.mjs';
@@ -3972,10 +3972,30 @@ export function sessionBlock(state = {}, info = {}) {
  */
 export function adHocTitle(state = {}) {
   const agent = state.agent || {};
-  const raw = state.jira?.title || state.binding?.title || state.dispatch?.title
-    || [agentLabel(agent.name, 64), agentLabel(agent.task, 80)].filter(Boolean).join(': ');
-  const plain = raw ? plainTitle(raw) : undefined;
-  return plain && plain !== 'Agent work' ? plain : undefined;
+  // The task line first: it is the Agent tool's description, the words
+  // "Simplify review: service" came in. A title an older plugin made from
+  // it, then the agent's name, come after; the first that says enough wins.
+  const name = agentLabel(agent.name, 64);
+  const task = agentLabel(agent.task, 80);
+  const sources = [task, state.jira?.title, state.binding?.title, state.dispatch?.title, name,
+    name && task ? `${name}: ${task}` : undefined];
+  for (const raw of sources) {
+    const plain = raw ? plainTitle(raw) : 'Agent work';
+    if (plain !== 'Agent work') return plain;
+  }
+  return undefined;
+}
+
+/**
+ * The plain line under an ad hoc card's title (MACLEOD-646): the agent's
+ * one-line task, when it says more than the title does. Never the prompt.
+ */
+export function adHocAbout(state = {}, title = adHocTitle(state)) {
+  const said = aboutLine(agentLabel(state.agent?.task, 200) || '');
+  if (!said) return undefined;
+  const words = (text) => new Set(String(text || '').toLowerCase().match(/[a-z0-9'-]+/g) || []);
+  const known = words(title);
+  return [...words(said)].every((w) => known.has(w)) ? undefined : said;
 }
 
 export function issuePayload(state, config, info) {
@@ -3991,6 +4011,7 @@ export function issuePayload(state, config, info) {
     jiraUrl,
     // Every ad hoc card carries a readable title (MACLEOD-646).
     title: isAdHocKey(key) ? adHocTitle(state) : state.jira?.title,
+    about: isAdHocKey(key) ? adHocAbout(state) : undefined,
     jiraStatus: state.jira?.status,
     parentKeys: state.jira?.parentKeys,
     project: issueProject(key, tracker),
@@ -4096,7 +4117,7 @@ export function issuePayload(state, config, info) {
 
 export function sanitizePayload(value, { kind = 'issue' } = {}) {
   const allowed = new Set([
-    'tracker','jiraKey','jiraUrl','title','jiraStatus','parentKeys','project','actor','repository','branch',
+    'tracker','jiraKey','jiraUrl','title','about','jiraStatus','parentKeys','project','actor','repository','branch',
     'tenantId','stage','status','summary','updatedAt','loopCount','reworkFrom','evidence','executions',
     'id','kind','label','value','displayName','active','recent','slot',
     // MACLEOD-510, and the same names adapters/teamflow/schema.py takes.

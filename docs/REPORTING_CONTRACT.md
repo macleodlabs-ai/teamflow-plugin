@@ -123,6 +123,7 @@ The account behind the credential being the tenant also decides what the plugin 
 - `tenantId`
 - `tracker` (`jira`, `linear` or `github`)
 - issue key/link and short title/status, carried in the `jiraKey` / `jiraUrl` / `jiraStatus` fields, named for history
+- an ad hoc item's `about`: one plain sentence (at most 200 characters) saying what the work is, made on the machine by the writer (`words.about`) from the agent's one-line task, the first commit subject naming the item, or the plan's name. Never the prompt (MACLEOD-646)
 - parent/related keys
 - actor, repository and branch
 - `git`: `branch`, `head.sha` and `head.subject`, `commitsSinceMain`, `ahead`, `behind`, `pushed`, `dirty` — where the branch stands, as counts and flags. Derived state: a count of commits is not the commits, and the subject line is capped at one line's length so a hunk cannot ride in as prose.

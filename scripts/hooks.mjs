@@ -628,6 +628,14 @@ export function detectedTools(root = process.cwd()) {
     jetbrains: ['.junie', '.idea'],
     aider: ['CONVENTIONS.md', '.aider.conf.yml'],
     'claude-desktop': [],
+    grok: ['.grok'],
+    // Shares .codex with the CLI, so nothing on disk tells the two apart.
+    'codex-ide': [],
+    opencode: ['opencode.json', '.opencode'],
+    openhands: ['.openhands'],
+    pi: ['.pi'],
+    kiro: ['.kiro'],
+    qwen: ['QWEN.md', '.qwen'],
   };
   return Object.entries(marker)
     .filter(([, paths]) => paths.some((p) => fs.existsSync(path.join(root, p))))

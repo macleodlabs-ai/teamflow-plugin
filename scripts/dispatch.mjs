@@ -109,8 +109,11 @@ export function nodeTitle(dispatch = {}) {
   const name = agentLabel(dispatch.name, 64);
   const task = agentLabel(dispatch.task, 80);
   const type = agentLabel(dispatch.type, 40);
-  const text = name && task ? `${name}: ${task}` : (name || task || (type ? `${type} agent` : ''));
-  return agentLabel(title(text), TITLE_MAX);
+  // The task is the Agent tool's description, what the work is; the name
+  // is a code name ("ws-d-opus") and only a fallback.
+  const sources = [task, name, name && task ? `${name}: ${task}` : '', type ? `${type} agent` : ''];
+  const said = sources.map((text) => title(text)).find((t) => t !== 'Agent work') || 'Agent work';
+  return agentLabel(said, TITLE_MAX);
 }
 
 /** The run's name: the bound ticket and its title, or the date. */

@@ -3,6 +3,28 @@
 What changed in each published version of the TeamFlow plugin, newest first.
 Only what a person using it would notice.
 
+## 0.3.34
+
+- **Trial ended.** When a trial ends, the plugin says so and links to the
+  pricing page. Your board stays readable.
+- **More tools listed.** Grok, the Codex IDE extension, OpenCode, OpenHands,
+  Pi, Kiro and Qwen Code have setup guides. Claude Code is the tested one; the
+  rest are marked untested for now.
+- **`teamflow adhoc titles --from <file>`** sends titles a person reviewed.
+- **Plain ticket text.** A ticket made from ad hoc work says what the work is,
+  where it is now and what each check said.
+
+### Also
+
+- **Better ad hoc titles.** "Simplify review: service" keeps both halves. A
+  title never ends on "until" or "and", and an agent's code name such as
+  "ws-d-opus" is never a title.
+- **One plain line under an ad hoc title.** When the title is short, the card
+  also says what the work is, from the agent's task.
+- **`teamflow adhoc titles`** also fills that line, from the session record,
+  then the first commit, then the plan. A card already made a ticket is listed
+  for a rename by hand and never sent.
+
 ## 0.3.33
 
 - **Plain titles for agents' cards.** A card for a dispatched agent says what

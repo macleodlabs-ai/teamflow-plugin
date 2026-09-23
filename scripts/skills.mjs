@@ -329,6 +329,77 @@ export const TOOLS = {
     }),
     note: `This writes Junie's config. AI Assistant registers MCP through Settings -> Tools -> AI Assistant -> Model Context Protocol; paste the same JSON there. Its OAuth support is undocumented; if the sign-in never appears, register \`npx -y mcp-remote ${MCP_URL}\` as a stdio server instead.`,
   },
+  // The tools added on 2026-09-23 (MACLEOD-639). Every path below is
+  // from that tool's own page, read that day; where a page names no file
+  // for the MCP server, the step is written out by hand instead of a
+  // path being guessed.
+  grok: {
+    label: 'Grok Build',
+    // Grok reads AGENTS.md and Claude Code's .claude/ skills; it names no
+    // `.agents/skills` of its own, so the rules file carries the skills.
+    rules: (root) => path.join(root, 'AGENTS.md'),
+    mcp: () => ({
+      file: path.join(home(), '.grok', 'config.toml'),
+      toml: { table: 'mcp_servers.teamflow', body: `url = "${MCP_URL}"` },
+    }),
+    note: 'Grok signs in to the server the first time it uses it.',
+  },
+  'codex-ide': {
+    label: 'OpenAI Codex IDE extension',
+    // The extension shares the CLI's config, skills and AGENTS.md.
+    skills: agentsSkills,
+    rules: (root) => path.join(root, 'AGENTS.md'),
+    mcp: () => ({
+      file: path.join(home(), '.codex', 'config.toml'),
+      toml: { table: 'mcp_servers.teamflow', body: `url = "${MCP_URL}"` },
+    }),
+    note: 'Sign in with `codex mcp login teamflow`; the extension and the CLI share it.',
+  },
+  opencode: {
+    label: 'OpenCode',
+    rules: (root) => path.join(root, 'AGENTS.md'),
+    mcp: (root) => ({
+      file: path.join(root, 'opencode.json'),
+      json: { mcp: { teamflow: { type: 'remote', url: MCP_URL } } },
+    }),
+    note: 'OpenCode starts the sign-in when the server answers 401, or run `opencode mcp auth teamflow`.',
+  },
+  openhands: {
+    label: 'OpenHands',
+    skills: agentsSkills,
+    rules: (root) => path.join(root, 'AGENTS.md'),
+    manual: [
+      `openhands mcp add teamflow --transport http --auth oauth ${MCP_URL}`,
+    ],
+    note: 'The MCP server is added with the OpenHands command above, which also signs you in.',
+  },
+  pi: {
+    label: 'Pi',
+    rules: (root) => path.join(root, 'AGENTS.md'),
+    // Pi has no MCP client by design; the rules point it at the command.
+    noMcp: true,
+    note: 'Pi loads AGENTS.md at startup. It has no MCP client, so it reports with the `teamflow` command.',
+  },
+  kiro: {
+    label: 'Kiro',
+    rules: (root) => path.join(root, '.kiro', 'steering', 'teamflow.md'),
+    manual: [
+      `In Kiro, run "Kiro: Open workspace MCP config (JSON)" and add a server named teamflow at ${MCP_URL}.`,
+    ],
+    note: 'Kiro reads steering files from .kiro/steering on every turn.',
+  },
+  qwen: {
+    label: 'Qwen Code',
+    skills: (root, user) => (user
+      ? path.join(home(), '.qwen', 'skills')
+      : path.join(root, '.qwen', 'skills')),
+    rules: (root) => path.join(root, 'QWEN.md'),
+    mcp: (root) => ({
+      file: path.join(root, '.qwen', 'settings.json'),
+      json: { mcpServers: { teamflow: { httpUrl: MCP_URL } } },
+    }),
+    note: 'Qwen Code reads the server from .qwen/settings.json.',
+  },
   'claude-desktop': {
     label: 'Claude Desktop',
     // Nothing on disk: remote servers are added through Connectors and

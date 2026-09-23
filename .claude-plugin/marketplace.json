@@ -8,7 +8,7 @@
     {
       "name": "teamflow",
       "source": "./",
-      "description": "Zero-touch Jira delivery reporting for TeamFlow"
+      "description": "TeamFlow, the DevOps harness for agentic software delivery. Shows every agent at work in real time, fixes stuck agents and keeps your code on your machine."
     }
   ]
 }

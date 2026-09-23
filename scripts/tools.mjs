@@ -73,12 +73,29 @@
 //
 // Every `doc` URL was read on 2026-09-17, re-read on 2026-09-18, and
 // the `notice` entries were read on 2026-09-19.
+//
+// `tested` says whether TeamFlow has been run in that tool, day to day,
+// with a real session moving real cards (MACLEOD-639). It is a stronger
+// claim than `verified.from: 'run'`: one payload watched arriving is not
+// a tool we use every day. Only Claude Code is tested today. Hook-payload
+// unit tests in plugin/tests do not count, because they feed the adapter
+// a payload copied from the docs and never start the tool. Every page
+// that lists a tool reads this field: a tested tool says so, and an
+// untested one is shown dimmed as "Untested · coming shortly", with its
+// install steps kept in full.
+//
+// `vendorHooks` names hooks a tool documents that TeamFlow does not read
+// yet (MACLEOD-639, the tools added 2026-09-23). A tool listed with it
+// reports through the git fallback until an adapter is written against
+// a payload somebody has seen, so the pages can say "it has hooks, and
+// TeamFlow does not use them yet" rather than "it has no hooks".
 
 export const TOOL_CAPABILITIES = [
   {
     id: 'claude-code',
     name: 'Claude Code',
     automation: 'hooks',
+    tested: true,
     events: ['SessionStart', 'UserPromptSubmit', 'PostToolUse', 'PostToolUseFailure', 'TaskCompleted', 'SubagentStart', 'SubagentStop', 'Stop', 'SessionEnd'],
     doc: 'https://code.claude.com/docs/en/hooks',
     verified: {
@@ -98,6 +115,7 @@ export const TOOL_CAPABILITIES = [
     id: 'cursor',
     name: 'Cursor',
     automation: 'hooks',
+    tested: false,
     events: ['afterFileEdit', 'postToolUse', 'postToolUseFailure', 'afterShellExecution', 'stop'],
     doc: 'https://cursor.com/docs/agent/hooks',
     verified: {
@@ -126,6 +144,7 @@ export const TOOL_CAPABILITIES = [
     id: 'copilot',
     name: 'VS Code with GitHub Copilot',
     automation: 'hooks',
+    tested: false,
     events: ['PostToolUse', 'PostToolUseFailure', 'Stop', 'postToolUse', 'postToolUseFailure', 'agentStop'],
     doc: 'https://code.visualstudio.com/docs/copilot/customization/hooks',
     verified: {
@@ -150,6 +169,7 @@ export const TOOL_CAPABILITIES = [
     id: 'windsurf',
     name: 'Windsurf / Devin Desktop',
     automation: 'hooks',
+    tested: false,
     events: ['post_write_code', 'post_run_command', 'post_cascade_response'],
     doc: 'https://docs.devin.ai/desktop/cascade/hooks',
     verified: {
@@ -170,6 +190,7 @@ export const TOOL_CAPABILITIES = [
     id: 'cline',
     name: 'Cline',
     automation: 'hooks',
+    tested: false,
     events: ['PostToolUse'],
     doc: 'https://cline.bot/blog/cline-v3-36-hooks',
     verified: {
@@ -191,6 +212,7 @@ export const TOOL_CAPABILITIES = [
     id: 'codex',
     name: 'OpenAI Codex CLI',
     automation: 'hooks',
+    tested: false,
     events: ['PostToolUse', 'Stop'],
     doc: 'https://learn.chatgpt.com/docs/hooks',
     verified: {
@@ -211,6 +233,7 @@ export const TOOL_CAPABILITIES = [
     id: 'gemini',
     name: 'Gemini CLI',
     automation: 'hooks',
+    tested: false,
     events: ['AfterTool', 'AfterAgent'],
     doc: 'https://github.com/google-gemini/gemini-cli/blob/main/docs/hooks/reference.md',
     verified: {
@@ -231,6 +254,7 @@ export const TOOL_CAPABILITIES = [
     id: 'jetbrains',
     name: 'JetBrains Junie',
     automation: 'hooks',
+    tested: false,
     events: ['PreToolUse', 'Stop'],
     doc: 'https://junie.jetbrains.com/docs/junie-cli-hooks.html',
     verified: {
@@ -282,6 +306,7 @@ export const TOOL_CAPABILITIES = [
     id: 'zed',
     name: 'Zed',
     automation: 'git-hooks',
+    tested: false,
     events: ['post-commit', 'post-merge', 'pre-push'],
     doc: 'https://zed.dev/docs/ai/agent-panel',
     verified: {
@@ -300,6 +325,7 @@ export const TOOL_CAPABILITIES = [
     id: 'aider',
     name: 'Aider',
     automation: 'git-hooks',
+    tested: false,
     events: ['post-commit', 'post-merge', 'pre-push'],
     doc: 'https://aider.chat/docs/usage/lint-test.html',
     verified: {
@@ -310,10 +336,127 @@ export const TOOL_CAPABILITIES = [
     notice: [],   // the git fallback; see zed
     description: 'Aider has no hook system, but it commits after every edit by default, so the git post-commit hook tracks an Aider session closely.',
   },
+  // The tools added on 2026-09-23 at the owner's request (MACLEOD-639).
+  // Each was read off its vendor's own page that day. None is tested,
+  // and none has an adapter yet, so each reports through the git
+  // fallback; `vendorHooks` names the hooks it documents.
+  {
+    id: 'grok',
+    name: 'Grok Build',
+    automation: 'git-hooks',
+    tested: false,
+    events: ['post-commit', 'post-merge', 'pre-push'],
+    vendorHooks: ['PreToolUse', 'PostToolUse', 'PostToolUseFailure', 'SessionStart', 'SessionEnd', 'Stop'],
+    doc: 'https://docs.x.ai/build/features/hooks',
+    verified: {
+      date: '2026-09-23',
+      from: 'docs',
+      note: 'Hooks run a command with the event as JSON on stdin: `hookEventName`, `sessionId`, `cwd`, `workspaceRoot`, and `toolName` and `toolInput` for tool events. No tool result is documented, so a test run cannot be read as passed or failed yet.',
+    },
+    notice: [],
+    description: 'Grok Build has its own hooks, and it also reads Claude Code and Cursor hook files. TeamFlow does not read its payload yet, so it reports on commit, merge and push.',
+  },
+  {
+    id: 'codex-ide',
+    name: 'OpenAI Codex IDE extension',
+    automation: 'git-hooks',
+    tested: false,
+    events: ['post-commit', 'post-merge', 'pre-push'],
+    vendorHooks: [],
+    doc: 'https://developers.openai.com/codex/ide',
+    verified: {
+      date: '2026-09-23',
+      from: 'docs',
+      note: 'The extension shares `~/.codex/config.toml` with Codex CLI, but Codex hooks fire in the CLI only (openai/codex#17930), so the extension has no hook to subscribe to.',
+    },
+    notice: [],
+    description: 'The Codex extension for VS Code and Cursor shares the CLI’s configuration but not its hooks, so TeamFlow reports from git hooks here.',
+  },
+  {
+    id: 'opencode',
+    name: 'OpenCode',
+    automation: 'git-hooks',
+    tested: false,
+    events: ['post-commit', 'post-merge', 'pre-push'],
+    vendorHooks: ['tool.execute.after', 'file.edited', 'session.idle'],
+    doc: 'https://opencode.ai/docs/plugins/',
+    verified: {
+      date: '2026-09-23',
+      from: 'docs',
+      note: 'OpenCode events reach JavaScript or TypeScript plugins only; there is no configured shell command to run on an event, so a TeamFlow plugin for OpenCode is the next step.',
+    },
+    notice: [],
+    description: 'OpenCode hooks are JavaScript plugins, not commands. Until TeamFlow ships one, OpenCode work reports on commit, merge and push.',
+  },
+  {
+    id: 'openhands',
+    name: 'OpenHands',
+    automation: 'git-hooks',
+    tested: false,
+    events: ['post-commit', 'post-merge', 'pre-push'],
+    vendorHooks: ['PreToolUse', 'PostToolUse', 'UserPromptSubmit', 'Stop', 'SessionStart', 'SessionEnd'],
+    doc: 'https://docs.openhands.dev/sdk/guides/hooks',
+    verified: {
+      date: '2026-09-23',
+      from: 'docs',
+      note: 'The hooks are documented for the OpenHands SDK, set in Python with `HookConfig`; the CLI documents no hook file, so there is nothing for an installer to write yet.',
+    },
+    notice: [],
+    description: 'OpenHands documents hooks in its SDK and not in its CLI, so TeamFlow reports OpenHands work on commit, merge and push.',
+  },
+  {
+    id: 'pi',
+    name: 'Pi',
+    automation: 'git-hooks',
+    tested: false,
+    events: ['post-commit', 'post-merge', 'pre-push'],
+    vendorHooks: ['tool_call', 'tool_result', 'session_start', 'session_shutdown'],
+    doc: 'https://github.com/badlogic/pi-mono/blob/main/packages/coding-agent/docs/extensions.md',
+    verified: {
+      date: '2026-09-23',
+      from: 'docs',
+      note: 'Pi events reach TypeScript or JavaScript extensions through `pi.on()`, not a configured command, and Pi has no MCP client, so the rules point it at the `teamflow` command.',
+    },
+    notice: [],
+    description: 'Pi hooks are extensions written in TypeScript, and Pi has no MCP client. TeamFlow reports Pi work on commit, merge and push.',
+  },
+  {
+    id: 'kiro',
+    name: 'Kiro',
+    automation: 'git-hooks',
+    tested: false,
+    events: ['post-commit', 'post-merge', 'pre-push'],
+    vendorHooks: ['PreToolUse', 'PostToolUse', 'PostFileSave', 'Stop'],
+    doc: 'https://kiro.dev/docs/hooks/',
+    verified: {
+      date: '2026-09-23',
+      from: 'docs',
+      note: 'Hooks live in `.kiro/hooks/*.json` and a command hook gets session context as JSON on stdin, but the fields are not documented, and stdout goes into the agent’s context.',
+    },
+    notice: [],
+    description: 'Kiro has hooks, but it does not document what they send. Until that is seen, TeamFlow reports Kiro work on commit, merge and push.',
+  },
+  {
+    id: 'qwen',
+    name: 'Qwen Code',
+    automation: 'git-hooks',
+    tested: false,
+    events: ['post-commit', 'post-merge', 'pre-push'],
+    vendorHooks: ['PreToolUse', 'PostToolUse', 'UserPromptSubmit', 'Stop'],
+    doc: 'https://qwenlm.github.io/qwen-code-docs/en/users/features/hooks/',
+    verified: {
+      date: '2026-09-23',
+      from: 'docs',
+      note: '`PostToolUse` documents `tool_name`, `tool_input`, `tool_response`, `tool_use_id` and `duration_ms` in `.qwen/settings.json` hooks, close to Claude Code’s shape; an adapter is the next step once a real session is watched.',
+    },
+    notice: [],
+    description: 'Qwen Code has hooks close to Claude Code’s. TeamFlow does not read them yet, so it reports Qwen Code work on commit, merge and push.',
+  },
   {
     id: 'claude-desktop',
     name: 'Claude Desktop',
     automation: 'rules',
+    tested: false,
     events: [],
     doc: 'https://code.claude.com/docs/en/desktop',
     verified: {

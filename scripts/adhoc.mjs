@@ -31,6 +31,7 @@ import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 
 import {
+  adHocAbout,
   adHocTitle,
   bindingRefusalFor,
   credential,
@@ -64,7 +65,7 @@ import {
   writeWorkflows,
 } from './core.mjs';
 import { refusalOf } from './refusal.mjs';
-import { title as plainTitle } from './words.mjs';
+import { about as aboutLine, title as plainTitle } from './words.mjs';
 
 export { isAdHocKey };
 
@@ -120,10 +121,12 @@ export const USAGE = `teamflow adhoc — work that arrived without a ticket
 
   teamflow adhoc titles [--send]
       Give every ad hoc card on the board that has no title a plain one,
-      from this machine's own records: the agent's name and task in its
-      session record first, then the first commit that names the key,
-      else "Earlier ad hoc work" and a date. Prints what it would send;
-      --send sends it. Never reads or sends a prompt.`;
+      and one plain line saying what the work is, from this machine's own
+      records: the agent's name and task in its session record first,
+      then the first commit that names the key, then its plan, else
+      "Earlier ad hoc work" and a date. Prints what it would send; --send
+      sends it. A card already made a ticket is listed, never sent.
+      Never reads or sends a prompt.`;
 
 /*
  * Titles for the ad hoc cards that have none (MACLEOD-646).
@@ -144,15 +147,15 @@ export const USAGE = `teamflow adhoc — work that arrived without a ticket
 const MONTHS = ['January', 'February', 'March', 'April', 'May', 'June', 'July', 'August',
   'September', 'October', 'November', 'December'];
 
-/** The title each ad hoc key has in this machine's session records. */
-export function sessionTitles(dir = path.join(dataDir(), 'sessions')) {
+/** Each ad hoc key's words in this machine's session records, by `pick`. */
+function fromSessions(dir, pick) {
   const out = new Map();
   let names = [];
   try { names = fs.readdirSync(dir).filter((n) => n.endsWith('.json')).sort(); } catch { return out; }
   for (const name of names) {
     const state = readJson(path.join(dir, name));
     if (!state || typeof state !== 'object') continue;
-    const said = adHocTitle(state);
+    const said = pick(state);
     if (!said) continue;
     for (const key of [state.jira?.key, state.binding?.key, state.dispatch?.key]) {
       if (isAdHocKey(key) && !out.has(key)) out.set(key, said);
@@ -161,18 +164,52 @@ export function sessionTitles(dir = path.join(dataDir(), 'sessions')) {
   return out;
 }
 
+/** The title each ad hoc key has in this machine's session records. */
+export function sessionTitles(dir = path.join(dataDir(), 'sessions')) {
+  return fromSessions(dir, (state) => adHocTitle(state));
+}
+
+/** The about line each ad hoc key has in this machine's session records. */
+export function sessionAbouts(dir = path.join(dataDir(), 'sessions')) {
+  return fromSessions(dir, (state) => adHocAbout(state));
+}
+
 /** Every commit subject in this repository, oldest first. */
 export function gitSubjects(cwd) {
   const got = spawnSync('git', ['log', '--all', '--reverse', '--format=%s'], { cwd, encoding: 'utf8', timeout: 10000 });
   return got.status === 0 ? got.stdout.split('\n').filter(Boolean) : [];
 }
 
-/** The plain title for the first commit subject naming `key`, or nothing. */
+/** The commit subjects that name `key`, oldest first. */
+const naming = (key, subjects) => subjects.filter((s) => new RegExp(`\\b${key}(?!\\d)`).test(s));
+
+/** The plain title of the first commit subject naming `key` that says enough, or nothing. */
 export function gitTitle(key, subjects) {
-  const named = new RegExp(`\\b${key}(?!\\d)`);
-  const subject = subjects.find((s) => named.test(s));
-  const said = subject ? plainTitle(subject) : undefined;
-  return said && said !== 'Agent work' ? said : undefined;
+  // A subject too thin for a title ("workflow: x") hands on to the next.
+  for (const subject of naming(key, subjects)) {
+    const said = plainTitle(subject);
+    if (said !== 'Agent work') return said;
+  }
+  return undefined;
+}
+
+/** The about line of the first commit subject naming `key` that says enough, or nothing. */
+export function gitAbout(key, subjects) {
+  for (const subject of naming(key, subjects)) {
+    const said = aboutLine(subject);
+    if (said) return said;
+  }
+  return undefined;
+}
+
+/** "Part of the plan: …" for the plan run that holds `key`, or nothing. */
+export function planAbout(key, runs = {}) {
+  for (const run of Object.values(runs || {})) {
+    if (!(run?.tickets || []).some((t) => t?.key === key)) continue;
+    const name = plainTitle(run.name);
+    if (name !== 'Agent work') return aboutLine(`Part of the plan: ${name}`);
+  }
+  return undefined;
 }
 
 /** The fallback: when the card last moved, in words. */
@@ -182,29 +219,66 @@ export function earlierTitle(at) {
   return plainTitle(`Earlier ad hoc work, ${when.getUTCDate()} ${MONTHS[when.getUTCMonth()]} ${when.getUTCFullYear()}`);
 }
 
+/** True when every word of `about` is already in `title`. */
+function saysNothingMore(about, title) {
+  const words = (text) => String(text || '').toLowerCase().match(/[a-z0-9'-]+/g) || [];
+  const known = new Set(words(title));
+  return words(about).every((w) => known.has(w));
+}
+
 /**
- * What to send: `{ key, title, from, card }` for each ad hoc card with
- * no title that was never converted, in key order.
+ * What to send, in key order: `{ key, card, title?, about?, from }` for
+ * each ad hoc card that lacks a title or an about line. A converted card
+ * carries `convertedTo`: it is listed and never sent, because its words
+ * now live in the tracker, which TeamFlow does not rename.
+ *
+ * Titles: the session record, then git, then the date. About lines: the
+ * session record, then git, then the plan that holds the card.
  */
-export function titlePlan(issues = {}, { sessions = new Map(), subjects = [] } = {}) {
+export function titlePlan(issues = {}, { sessions = new Map(), abouts = new Map(), subjects = [], runs = {} } = {}) {
   const plan = [];
   const keys = Object.keys(issues).filter(isAdHocKey)
     .sort((a, b) => Number(a.split('-')[1]) - Number(b.split('-')[1]));
   for (const key of keys) {
     const card = issues[key];
-    if (!card || typeof card !== 'object' || card.convertedTo || String(card.title || '').trim()) continue;
-    const fromSession = sessions.get(key);
-    const fromGit = fromSession ? undefined : gitTitle(key, subjects);
-    const title = fromSession || fromGit || earlierTitle(card.updatedAt);
-    plan.push({ key, title, from: fromSession ? 'session' : fromGit ? 'git' : 'date', card });
+    if (!card || typeof card !== 'object') continue;
+    const entry = { key, card, from: {} };
+    if (card.convertedTo) entry.convertedTo = card.convertedTo;
+    if (!String(card.title || '').trim()) {
+      const fromSession = sessions.get(key);
+      const fromGit = fromSession ? undefined : gitTitle(key, subjects);
+      entry.title = fromSession || fromGit || earlierTitle(card.updatedAt);
+      entry.from.title = fromSession ? 'session' : fromGit ? 'git' : 'date';
+    }
+    if (!String(card.about || '').trim()) {
+      const title = entry.title || card.title;
+      const found = [['session', abouts.get(key)], ['git', gitAbout(key, subjects)], ['plan', planAbout(key, runs)]]
+        .find(([, said]) => said && !saysNothingMore(said, title));
+      if (found) [entry.from.about, entry.about] = found;
+    }
+    if (entry.title || entry.about) plan.push(entry);
   }
   return plan;
 }
 
-const FROM_WORDS = { session: 'from its session record', git: 'from its first commit', date: 'from its last update' };
+const FROM_WORDS = {
+  session: 'its session record', git: 'its first commit', date: 'its last update', plan: 'its plan',
+  reviewed: 'a person\'s review',
+};
 
-/** Read the board, plan the titles, and send them when asked. */
-export async function backfillTitles(cwd, config = {}, { send = false, read = fetchState, report = sendReport, sessions, subjects } = {}) {
+/** One line of the dry run for one entry. */
+export function planLine(entry) {
+  const parts = [entry.key];
+  if (entry.title) parts.push(`title "${entry.title}" (from ${FROM_WORDS[entry.from.title]})`);
+  if (entry.about) parts.push(`about "${entry.about}" (from ${FROM_WORDS[entry.from.about]})`);
+  if (entry.convertedTo) parts.push(`is now ${entry.convertedTo}: rename it in the tracker by hand`);
+  return parts.join('  ');
+}
+
+/** Read the board, plan the titles and about lines, and send them when asked. */
+export async function backfillTitles(cwd, config = {}, {
+  send = false, read = fetchState, report = sendReport, sessions, abouts, subjects, overrides = {},
+} = {}) {
   const got = await read('bundle', config);
   if (!got?.ok || !got.document) {
     throw new Error(`TeamFlow could not read the board: ${got?.reason || 'the service did not answer'}.`);
@@ -212,13 +286,32 @@ export async function backfillTitles(cwd, config = {}, { send = false, read = fe
   const issues = got.document.documents?.issues || {};
   const plan = titlePlan(issues, {
     sessions: sessions ?? sessionTitles(),
+    abouts: abouts ?? sessionAbouts(),
     subjects: subjects ?? gitSubjects(cwd),
+    runs: got.document.documents?.workflows || {},
   });
-  const lines = plan.map((p) => `${p.key}  ${p.title}  (${FROM_WORDS[p.from]})`);
+  // Titles a person reviewed win over the derived ones (`--from <file>`).
+  // Each still goes through the writer's checks, so a reviewed title is plain too.
+  for (const [rawKey, words] of Object.entries(overrides || {})) {
+    const key = String(rawKey).toUpperCase();
+    const card = issues[key];
+    if (!isAdHocKey(key) || !card || !words || typeof words !== 'object') continue;
+    const title = words.title ? checkTitle(words.title) : undefined;
+    const about = words.about ? String(words.about).trim() : undefined;
+    let entry = plan.find((row) => row.key === key);
+    if (!entry) {
+      entry = { key, card, from: {}, ...(card.convertedTo ? { convertedTo: card.convertedTo } : {}) };
+      plan.push(entry);
+    }
+    if (title) { entry.title = title; entry.from = { ...entry.from, title: 'reviewed' }; }
+    if (about) { entry.about = about; entry.from = { ...entry.from, about: 'reviewed' }; }
+  }
+  const lines = plan.map(planLine);
   if (!send) return { plan, lines, sent: 0 };
   let sent = 0;
-  for (const p of plan) {
-    const result = await report('issue', undefined, { ...p.card, title: p.title }, config, { account: reportScope(config) });
+  for (const p of plan.filter((entry) => !entry.convertedTo)) {
+    const words = { ...(p.title ? { title: p.title } : {}), ...(p.about ? { about: p.about } : {}) };
+    const result = await report('issue', undefined, { ...p.card, ...words }, config, { account: reportScope(config) });
     if (result?.ok) sent += 1;
   }
   return { plan, lines, sent };
@@ -588,15 +681,20 @@ export async function main(args = [], ctx = {}) {
 
   if (sub === 'titles') {
     const send = rest.includes('--send');
-    const done = await backfillTitles(cwd, config, { send });
+    const fromAt = rest.indexOf('--from');
+    const overrides = fromAt >= 0 && rest[fromAt + 1]
+      ? JSON.parse(fs.readFileSync(path.resolve(cwd, rest[fromAt + 1]), 'utf8'))
+      : {};
+    const done = await backfillTitles(cwd, config, { send, overrides });
     if (!done.plan.length) {
-      print('Every ad hoc card on the board has a title.');
+      print('Every ad hoc card on the board has a title and an about line.');
       return 0;
     }
     for (const line of done.lines) print(line);
+    const sendable = done.plan.filter((p) => !p.convertedTo).length;
     print(send
-      ? `TeamFlow sent ${done.sent} of ${done.plan.length} titles.`
-      : `TeamFlow sent nothing. Run \`teamflow adhoc titles --send\` to send these ${done.plan.length} titles.`);
+      ? `TeamFlow sent ${done.sent} of ${sendable} cards.`
+      : `TeamFlow sent nothing. Run \`teamflow adhoc titles --send\` to send these ${sendable} cards.`);
     return 0;
   }
 
