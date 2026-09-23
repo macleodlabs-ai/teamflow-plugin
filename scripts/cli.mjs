@@ -264,6 +264,12 @@ async function status() {
   // fact somebody checked and not a line that was never there.
   const { dispatchLine, dispatchSummary } = await import('./dispatch.mjs');
   const dispatched = dispatchLine(dispatchSummary(state?.sessionId));
+  // Whether this session's live heartbeat is running (MACLEOD-641).
+  const { heartbeatLine } = await import('./heartbeat.mjs');
+  const heartbeat = heartbeatLine(state?.sessionId);
+  // When this session last saved where it was (MACLEOD-641).
+  const { snapshotLine } = await import('./resume.mjs');
+  const snapshot = snapshotLine(state?.sessionId);
   /*
    * Fixes from a lead, first (MACLEOD-639, ruling 10). `status` is the
    * first thing somebody runs when a ticket has stopped, and a lead may
@@ -317,6 +323,8 @@ async function status() {
     loopCount: state?.loopCount || 0,
     ...(toPass?.length ? { checksToPass: toPass } : {}),
     dispatched,
+    heartbeat,
+    snapshot,
     lastPublishResult: state?.lastPublishResult,
     // Machine-wide, and until a report is accepted again (MACLEOD-620).
     ...(readSoftRefusal(reportScope(config)) ? { reportingPaused: readSoftRefusal(reportScope(config)).reason } : {}),
@@ -1000,6 +1008,14 @@ try {
     print(on
       ? 'TeamFlow will show fixes a lead writes on your ticket at the start of a session and in `teamflow status`.'
       : 'TeamFlow will not fetch fixes written on your tickets for this machine. `teamflow config set intake on` turns it back on.');
+  }
+  else if (command === 'statusline-tap') {
+    // Chained from a statusline command: reads its JSON, prints nothing (MACLEOD-641).
+    try {
+      const { readStdin } = await import('./hook-core.mjs');
+      const { usageTap } = await import('./resume.mjs');
+      await usageTap(await readStdin(), { config: loadConfig(process.cwd()) });
+    } catch { /* never in the way of the statusline */ }
   }
   else if (command === 'doctor') await doctor();
   else if (command === 'login') await login();

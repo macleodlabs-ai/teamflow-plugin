@@ -11,6 +11,10 @@
 
 import {
   absorbRootActor,
+  allActors,
+  isPhantomAgent,
+  purgePhantomAgents,
+  supersededEnd,
   resolveActorKey,
   applyTransition,
   bindingRefusal,
@@ -51,12 +55,23 @@ import {
 } from './core.mjs';
 import { NO_PROJECT_SENTENCE, resolveProject } from './project.mjs';
 import {
-  boundToTeamflow, dispatchOf, launchesOf, planLaunch, settle, withMint,
+  clearPause, ensureHeartbeat, limitOf, markHandoff, markLimit, rotating, sessionLines, stopHeartbeat,
+} from './heartbeat.mjs';
+import { pruneSnapshots, resumeNotice, saveSnapshot } from './resume.mjs';
+import {
+  boundToTeamflow, closeDispatched, dispatchOf, launchesOf, planLaunch, settle, withMint,
 } from './dispatch.mjs';
+
+/** Whether a launch in this session was claimed by this agent id. Local files only. */
+function seenLaunch(sessionId, agentId) {
+  return Boolean(agentId) && launchesOf(sessionId).some((launch) => launch.agentId === agentId);
+}
 
 // Events that must stay synchronous and fast, because the tool is
 // waiting on them before it shows the developer anything.
 const FAST = ['SessionStart', 'UserPromptSubmit'];
+// A SessionEnd the person chose: the session is not moving anywhere.
+const DELIBERATE_END = new Set(['clear', 'logout', 'prompt_input_exit']);
 // Events Claude Code waits on, which spend nothing on the network. The
 // fast events, plus the `Agent` tool's PreToolUse (MACLEOD-639 audit):
 // it holds the dispatch until it exits, so it writes the local run and
@@ -339,9 +354,13 @@ export function withAgentIdentity(event, input, state, sessionId, agentKey, laun
     };
   }
   if (event === 'SubagentStop') {
+    // The agent's end ends the actor (MACLEOD-641, audit K3): `ended` as
+    // well as `agent.endedAt`, so the session block carries the end time
+    // and nothing counts the agent as working any more.
     state = {
       ...state,
       status: 'idle',
+      ended: true,
       agent: { ...(state.agent || {}), endedAt: new Date().toISOString() },
     };
   }
@@ -366,8 +385,21 @@ export async function flushPendingEnds(config, limit = 3, sessionId = undefined)
   let scope;
   try { scope = { tenantId: tenantId(config), serviceUrl: serviceUrl(config) }; } catch { return 0; }
   let flushed = 0;
+  let everyone;
   for (const actor of pendingEndActors(sessionId, scope)) {
     if (flushed >= limit) break;
+    /*
+     * An end nobody should hear (MACLEOD-641, audit K4 and K5): a phantom
+     * agent that never started, or an end older than a report this
+     * machine has since made on the same key. Either one, sent now, puts
+     * an old stage back on the card. The debt is cleared, not paid, and
+     * costs no request.
+     */
+    everyone ??= allActors();
+    if (isPhantomAgent(actor) || supersededEnd(actor, everyone)) {
+      try { saveSession({ ...actor, pendingEnd: false }); } catch { /* next turn */ }
+      continue;
+    }
     flushed += 1;
     /*
      * Its OWN repository's configuration, never the caller's — and what
@@ -471,6 +503,32 @@ export async function handleEvent(input = {}) {
   const event = input.hook_event_name || 'Unknown';
   const sessionId = input.session_id || 'unknown-session';
   const given = input.cwd || process.cwd();
+  /*
+   * A usage limit (MACLEOD-641). A turn that ends at a rate limit or a
+   * billing error is a StopFailure: the session either waits for the
+   * reset or a tool such as cc-rotate moves it to another account. Both
+   * start with two local files the heartbeat reads; nothing else runs.
+   * Any later event means the session carried on here, so it drops the
+   * pause, and a prompt the person typed drops the hand-off too.
+   */
+  if (event === 'StopFailure' || event === 'PreCompact') {
+    if (!input.reporter_tool) {
+      try { if (event === 'StopFailure') markLimit(sessionId, limitOf(input)); } catch { /* the heartbeat reads it as a crash */ }
+      // Where the session was, before the limit or the compaction.
+      try { saveSnapshot(sessionId, { config: loadConfig(readJson(sessionPath(sessionId))?.cwd || given) }); } catch { /* the last one stands */ }
+    }
+    return { state: readJson(sessionPath(sessionId)) ?? newSession(sessionId, given), justBound: false, event, signedIn: true, refused: undefined, notices: [] };
+  }
+  if (!input.reporter_tool) {
+    try {
+      if (event === 'SessionEnd') {
+        if (rotating()) markHandoff(sessionId);
+        else if (DELIBERATE_END.has(input.reason)) clearPause(sessionId, { handoff: true });
+      } else if (event !== 'SubagentStop') {
+        clearPause(sessionId, { handoff: event === 'UserPromptSubmit' });
+      }
+    } catch { /* a mark left behind is read as fresh for ten minutes at most */ }
+  }
   // The session's own actor, which is also how a worktree is recognised:
   // a repository root that is not this one is somebody else working
   // under the same `session_id` (MACLEOD-574).
@@ -515,6 +573,17 @@ export async function handleEvent(input = {}) {
   const absorbed = agentKey && input.agent_id && cwd !== main?.cwd
     ? absorbRootActor(sessionId, agentKey, cwd)
     : undefined;
+  /*
+   * An end with no agent behind it (MACLEOD-641, audit K4). A
+   * `SubagentStop` for an actor this machine never saw start, with no
+   * launch claimed under its id, made a new actor at BACKLOG and
+   * published that as the ticket's latest word: thousands of zero-length
+   * "Agent" files, and 22 cards sent back to Backlog at once. Such an
+   * end is dropped here, before anything is written or sent.
+   */
+  if (event === 'SubagentStop' && agentKey && !saved && !absorbed && !seenLaunch(sessionId, input.agent_id)) {
+    return { state: main ?? newSession(sessionId, cwd), justBound: false, event, signedIn: true, refused: undefined, notices: [] };
+  }
   // The resolved root travels on the event, so anything reading the
   // event rather than this function's `cwd` sees the same directory.
   const resolved = { ...input, cwd };
@@ -599,6 +668,11 @@ export async function handleEvent(input = {}) {
     if (state.status === 'running') state.status = 'idle';
     state.updatedAt = at;
     saveSession(state);
+    // The heartbeat sends the last beat itself (MACLEOD-641): this only
+    // leaves the mark, because this event may not use the network.
+    if (!input.reporter_tool) {
+      try { stopHeartbeat(sessionId); } catch { /* the process ends on its own */ }
+    }
     return { state, justBound: false, event, signedIn: true, refused: undefined };
   }
 
@@ -804,10 +878,36 @@ export async function handleEvent(input = {}) {
     }
   }
 
+  /*
+   * The node minted for an agent closes when the agent ends, or when the
+   * agent went to work on another key (MACLEOD-641, audit K1 and K7).
+   * After the publish, so the card's last report is the agent's own.
+   * Only the agent's own ad hoc node; `closeDispatched` never touches a
+   * tracker ticket. Fails open.
+   */
+  if (agentKey && state.dispatch?.key && !state.dispatch.nested && !LOCAL_ONLY.includes(event)) {
+    if (event === 'SubagentStop') {
+      const failed = saved?.status === 'failed' || ['LOCAL_REWORK', 'DEV_REWORK'].includes(state.stage);
+      await closeDispatched(config, { key: state.dispatch.key, outcome: failed ? 'rework' : 'done' });
+    } else if (state.dispatch.bound && !state.dispatch.moved && state.binding?.key
+      && state.binding.key !== state.dispatch.key) {
+      const moved = await closeDispatched(config, {
+        key: state.dispatch.key, outcome: 'skipped', note: `moved to ${state.binding.key}`,
+      });
+      if (moved) {
+        state.dispatch = { ...state.dispatch, moved: true };
+        saveSession(state);
+      }
+    }
+  }
+
   // Once a turn, on the event that already forces a publish. Anything on
   // this machine flushes anything else's unreported ends, so a session
   // that was killed has its agents taken off the board by the next
   // session that does any work at all.
+  // Once per data folder, before the first flush: the phantom agents an
+  // older plugin wrote, and the ends they owed (MACLEOD-641, audit K4).
+  if (event === 'Stop') purgePhantomAgents();
   if (event === 'Stop' || (absorbed && !LOCAL_ONLY.includes(event))) await flushPendingEnds(config, 3, sessionId);
 
   /*
@@ -928,6 +1028,11 @@ export async function handleEvent(input = {}) {
       notices = [...notices, ...takeNotices(dataDir())];
     } catch { /* nothing to say is said */ }
   }
+  // Other sessions on this card or in this folder (MACLEOD-641): told,
+  // never blocked. Local files only; the heartbeat keeps the service's word.
+  if (FAST.includes(event) && !input.reporter_tool) {
+    try { notices = [...notices, ...sessionLines(sessionId, cwd)]; } catch { /* nothing to say */ }
+  }
   if (FAST.includes(event) && state.intakePending?.length) {
     notices = [...state.intakePending, ...notices];
     delete state.intakePending;
@@ -954,6 +1059,38 @@ export async function handleEvent(input = {}) {
   const project = event === 'SessionStart'
     ? await resolveProject(info?.repository, config, { timeoutMs: 1500 })
     : undefined;
+
+  /*
+   * The live heartbeat (MACLEOD-641): one background process per Claude
+   * Code session, started here and re-checked on every other event. The
+   * check is a small read and a `kill(pid, 0)`. Claude Code only: a
+   * repository hook's parent exits at once. Last, after the state above
+   * is saved, so a resumed session is no longer marked ended when the
+   * process first looks.
+   */
+  let started;
+  if (!input.reporter_tool) {
+    try { started = ensureHeartbeat(sessionId, { event, source: input.source, cwd }); } catch { /* no heartbeat this event */ }
+  }
+
+  /*
+   * Where the session was (MACLEOD-641): saved when a turn or an agent
+   * ends, and read back once when a session resumes, is compacted, or
+   * carries on another after a hand-off. Local files only.
+   */
+  if (!input.reporter_tool) {
+    try {
+      if (event === 'Stop' || event === 'SubagentStop') saveSnapshot(sessionId, { config });
+      if (event === 'SessionStart') {
+        pruneSnapshots();
+        const block = resumeNotice(state, { source: input.source, continues: started?.continues });
+        if (block) {
+          notices = [...(notices || []), block];
+          saveSession(state);
+        }
+      }
+    } catch { /* nothing to say is said */ }
+  }
 
   return {
     state,

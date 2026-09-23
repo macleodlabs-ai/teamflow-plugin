@@ -42,7 +42,8 @@ anything else" below.
 3. `PostToolUse` / `PostToolUseFailure` derive local dev/test/audit, merge, dev deploy/test/audit and rework stages.
 4. Meaningful state changes are deduplicated and published under the configured tenant prefix.
 5. Reporting failures are queued locally and never block development.
-6. `Stop` publishes an idle heartbeat; `SessionEnd` stays local-only.
+6. Each Claude Code session runs a small heartbeat. Every two minutes it tells the service that the session is alive, which ticket it is on and what its agents are doing. When the session's process disappears without an end, the heartbeat says so once and stops. A usage limit leaves a pause, not a crash.
+7. `SessionEnd` stays local-only.
 
 ## Manual escape hatches
 
@@ -51,13 +52,17 @@ anything else" below.
 - `/teamflow:repos add owner/repo`
 - `/teamflow:status`
 - `/teamflow:bind DAEMON-142` (also `ENG-42`, `#123`, `owner/repo#123` or an issue URL)
+- `/teamflow:work-on DAEMON-142` (the same bind, inside a git worktree)
 - `/teamflow:unbind`
 - `/teamflow:next` (take the top-priority open ticket, assign it in the tracker and bind it; `--dry-run` shows the order and the pick and changes nothing)
 - `/teamflow:sync`
 - `/teamflow:doctor`
+- `/teamflow:org` (which organisation this machine reports to; `org switch <id>` changes it)
+- `/teamflow:adhoc` (work with no ticket: mint an `ADHOC-` key, bind to it, and end it when the work is done)
+- `/teamflow:build` (run a plan: a pool of tickets in priority order, on the board as one run with its phases)
 - `/teamflow:admin-code` (superadmins only: `admin code create --email owner@acme.com --seats 5 --days 365`, `admin code list`, `admin code revoke TF-XXXX-XXXX`)
 
-All are manual-only skills except `/teamflow:next`, which a session with no ticket is told to run before it starts editing.
+The agent may run `/teamflow:next`, `/teamflow:adhoc` and `/teamflow:build` by itself. A session with no ticket is told to run `/teamflow:next` before it starts editing. The rest are manual-only.
 
 ## Configuration
 
@@ -86,7 +91,7 @@ Environment equivalents include `TEAMFLOW_SERVICE_URL`, `TEAMFLOW_ACTOR_ID`, `TE
 
 ### Non-interactive fallback
 
-`TEAMFLOW_API_KEY` is the last credential tried, for an environment that can neither open a browser nor mint an OIDC token. Legacy S3 reporting (`dataUri`, `tenantId`, `awsProfile`) still works when no service credential is available. See `docs/PLUGIN.md`.
+`teamflow login --no-browser` prints the consent page's address and a code, for a machine that cannot open a browser. Legacy S3 reporting (`dataUri`, `tenantId`, `awsProfile`) still works when no service credential is available. See `docs/PLUGIN.md`.
 
 A project may override config in `.teamflow.json` — but only the keys that
 describe the project. A file inside a repository may not decide where a
@@ -99,8 +104,7 @@ works.
 
 A credential is also sent only to the service that issued it, only over
 `https` unless the service is on `localhost`, and never across a redirect. A
-configured `apiKey` and a handed-in access token record no origin of their
-own, so they go
+handed-in access token records no origin of its own, so it goes
 only to TeamFlow, to `localhost`, or to an origin listed as `trustedOrigins` in
 `~/.config/teamflow/config.json` — the environment cannot add one, because
 inside an editor the environment is not reliably yours.

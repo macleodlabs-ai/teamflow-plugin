@@ -34,6 +34,7 @@ import {
   credentialKind,
   dataDirWritable,
   followKeyAliases,
+  askAboutTicketOnce,
   isAdHocKey,
   issuePayload,
   latestSessionForCwd,
@@ -76,6 +77,8 @@ export const TITLE_MAX = 180;
 
 export const TRACKER = 'teamflow';
 
+const TRACKER_WORDS = { linear: 'Linear', github: 'GitHub', jira: 'Jira' };
+
 export const USAGE = `teamflow adhoc — work that arrived without a ticket
 
   teamflow adhoc start "<what the work is>"
@@ -97,6 +100,11 @@ export const USAGE = `teamflow adhoc — work that arrived without a ticket
       the organisation's tracker, in the state its gate maps to. The
       card becomes the ticket everywhere, with its history, and later
       reports from this project land on the ticket.
+
+  teamflow adhoc ticket [<ADHOC-n>]
+      Make the item a ticket where your organisation's setting says: the
+      tracker it chose, in the project the work is in. Run it when the
+      person said yes.
 
   teamflow adhoc convert [<ADHOC-n>] --to <KEY> [--merge]
       Link the item to a ticket created elsewhere (a tracker MCP, by
@@ -365,15 +373,17 @@ export async function projectId(wanted, config = {}) {
  * machine: the alias is remembered, this directory's binding follows it,
  * and the local workflow copies are rewritten with the node renamed.
  */
-export async function convertItem(key, { project, to, merge = false } = {}, cwd = process.cwd(), config = {}) {
+export async function convertItem(key, { project, to, merge = false, setting = false } = {}, cwd = process.cwd(), config = {}) {
   const bound = boundAdHoc(cwd, config);
   const wanted = String(key || bound?.jiraKey || '').trim().toUpperCase();
   if (!isAdHocKey(wanted)) {
     throw new Error('Usage: teamflow adhoc convert [<ADHOC-n>] --project <project> | --to <KEY>. '
       + 'Nothing ad hoc is bound here, so name the item.');
   }
-  if (!project && !to) throw new Error('Say where the ticket goes: --project <project>, or --to <KEY> for one created elsewhere.');
-  const body = to ? { to: String(to).trim(), ...(merge ? { merge: true } : {}) } : { project: await projectId(project, config) };
+  if (!project && !to && !setting) throw new Error('Say where the ticket goes: --project <project>, or --to <KEY> for one created elsewhere.');
+  // `setting` (MACLEOD-642): the service picks the tracker and project.
+  const body = setting ? { setting: true }
+    : to ? { to: String(to).trim(), ...(merge ? { merge: true } : {}) } : { project: await projectId(project, config) };
   const sent = await member('POST', `/v1/members/cards/${encodeURIComponent(wanted)}/convert`, config, body);
   if (!sent.ok) throw new Error(`TeamFlow did not convert ${wanted}: ${sent.reason}`);
   const answer = sent.body || {};
@@ -425,6 +435,11 @@ export async function main(args = [], ctx = {}) {
     const started = await start(positional.join(' '), cwd, config, info);
     print(`TeamFlow minted ${started.key} — ${started.title}. ${sentLine(started.sent)}`);
     print('Every hook from here on reports against it, exactly as it would a ticket.');
+    // The organisation's setting for ad hoc work (MACLEOD-642).
+    const ticket = started.sent?.adhocTicket;
+    const ask = askAboutTicketOnce(ticket, config);
+    if (ask) print(ask);
+    else if (ticket?.mode === 'auto') print(`TeamFlow will make it a ticket in ${TRACKER_WORDS[ticket.tracker] || ticket.tracker}.`);
     return 0;
   }
 
@@ -449,6 +464,13 @@ export async function main(args = [], ctx = {}) {
     print(`${done.from} ${how} ${done.key}${done.url ? ` (${done.url})` : ''}.`
       + (done.state ? ` Status: ${done.state}.` : ''));
     print('The card, its history and every plan that held it follow the ticket; later reports land on it.');
+    return 0;
+  }
+
+  if (sub === 'ticket') {
+    const made = await convertItem(positional[0], { setting: true }, cwd, config);
+    print(`${made.from} ${made.already ? 'was already' : 'is now'} ${made.key}${made.url ? ` (${made.url})` : ''}.`
+      + (made.state ? ` Status: ${made.state}.` : ''));
     return 0;
   }
 

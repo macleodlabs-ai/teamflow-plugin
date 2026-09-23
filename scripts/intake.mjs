@@ -443,9 +443,15 @@ export async function intakePass(config = {}, {
   key: bound, cwd, timeoutMs = 5000, now = new Date().toISOString(), budget = budgetUntil(timeoutMs), doers = {},
 } = {}) {
   const none = { notices: [], performed: [], held: 0 };
+  let release;
   try {
     const enabled = intakeEnabled(config);
     const account = await accountName(config).catch(() => undefined);
+    // One round at a time on this machine: a hook and a session's
+    // heartbeat (MACLEOD-641) both run rounds, and the ledger is read,
+    // then written. The second one waits for the next round.
+    release = takeLock(account);
+    if (!release) return none;
     const ledger = readLedger(account);
     // Outcomes decided offline first: they are already taken and owed.
     for (const owed of [...ledger.owed]) {
@@ -517,7 +523,25 @@ export async function intakePass(config = {}, {
     return { notices, performed, held: still.length };
   } catch {
     return none;
+  } finally {
+    release?.();
   }
+}
+
+// A lock older than this was left by a round that died.
+const LOCK_STALE_MS = 30_000;
+
+/** The machine's intake lock, or undefined when another round holds it. Returns its release. */
+export function takeLock(account, now = Date.now()) {
+  const lock = `${ledgerPath(account)}.lock`;
+  fs.mkdirSync(path.dirname(lock), { recursive: true });
+  const take = () => { fs.writeFileSync(lock, String(process.pid), { flag: 'wx' }); return () => fs.rmSync(lock, { force: true }); };
+  try { return take(); } catch { /* held, or left behind */ }
+  let age;
+  try { age = now - fs.statSync(lock).mtimeMs; } catch { age = Infinity; }
+  if (age < LOCK_STALE_MS) return undefined;
+  fs.rmSync(lock, { force: true });
+  try { return take(); } catch { return undefined; }
 }
 
 /**

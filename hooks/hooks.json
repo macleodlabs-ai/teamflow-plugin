@@ -113,6 +113,31 @@
         ]
       }
     ],
+    "PreCompact": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node",
+            "args": ["${CLAUDE_PLUGIN_ROOT}/scripts/hook.mjs"],
+            "async": true
+          }
+        ]
+      }
+    ],
+    "StopFailure": [
+      {
+        "matcher": "rate_limit|billing_error",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node",
+            "args": ["${CLAUDE_PLUGIN_ROOT}/scripts/hook.mjs"],
+            "async": true
+          }
+        ]
+      }
+    ],
     "SessionEnd": [
       {
         "hooks": [

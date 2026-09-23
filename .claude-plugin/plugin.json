@@ -1,7 +1,7 @@
 {
   "name": "teamflow",
   "description": "Automatically reports Jira, Linear or GitHub issue-led Claude Code delivery progress to TeamFlow",
-  "version": "0.3.31",
+  "version": "0.3.32",
   "author": {
     "name": "MacleodLabs"
   },

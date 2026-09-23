@@ -327,6 +327,140 @@ adapter's `WORKFLOW_CARRIED` is the list of fields that survive a republish
 this way, and nothing about it lets a report *clear* a field it did not set —
 a value is only ever replaced by another value (MACLEOD-588).
 
+### The heartbeat (MACLEOD-641)
+
+`heartbeats/<sessionId>.json` is the fourth kind. A Claude Code session
+says it is alive, from a small background process the plugin starts beside
+it (`plugin/scripts/heartbeat.mjs`), so the service can tell a hang, a
+stall, a crash or an orphaned agent from quiet work.
+
+```text
+{ "kind": "heartbeat", "payload": {
+    "sessionId": "<12-hex digest>", "beatAt": "<ISO>", "sessionAlive": true,
+    "endedReason": "process_gone" | "session_end" | "handoff",   (last beat only)
+    "boundKey": "<issue key>",
+    "continues": "<12-hex digest>",          (a successor after a hand-off)
+    "repo": "<12-hex digest>",               (the repository's name, hashed)
+    "paused": { "reason": "rate_limit" | "billing", "until": "<ISO>", "estimated": true | false },
+    "agents": [ { "agentId", "name", "key", "stage", "status", "lastEventAt" } ] } }
+```
+
+- **One process per session.** The hook starts it on the session's first
+  event and checks it on every other one (a small file read and a
+  `kill(pid, 0)`). It is detached, runs no shell, ignores its output and
+  never holds the tool open. It beats once at start and then every 120
+  seconds.
+- **It watches the session's own process**: the hook's parent, which is the
+  Claude Code process (a shell in between is stepped over). When that
+  process is gone and no `SessionEnd` was recorded, it sends one last beat
+  with `sessionAlive: false, endedReason: "process_gone"` and exits. On
+  `SessionEnd` the hook only leaves a mark, because that event may not use
+  the network; the process sends the last beat with `endedReason:
+  "session_end"` and exits. It never runs longer than 24 hours.
+- **Derived state only.** `sessionId` is the digest `session.id` carries on
+  an issue report, never the raw id. An agent is the `id` and `name` its
+  `agent` block already carries, its bound key, its stage and status words
+  and the time of its last hook event; at most 50 agents, newest first.
+  No prompt, task line, path, command or text is a field, and the service's
+  `HEARTBEAT` table in `adapters/teamflow/schema.py` drops anything else.
+- **A usage limit is not a crash.** A turn that ends at a rate limit or a
+  billing error is a `StopFailure` (`error_type` `rate_limit` or
+  `billing_error`). The hook leaves two local marks. If the process then
+  stops, because a tool such as cc-rotate moves the conversation to another
+  account, the last beat says `endedReason: "handoff"`, even when a
+  `SessionEnd` ran during the stop. cc-rotate's own signal counts too:
+  `CC_ROTATE_ACTIVE=1` with `${CC_ROTATE_PIDFILE}.rotate` present. A
+  resumed session with a new id, in the same repository within ten
+  minutes, sends `continues`: the old session's digest, never its id or
+  its path. If the process stays alive, every beat carries `paused` until
+  the session's next hook event: the kind of limit and when it resets, from
+  the event's `rate_limit_reset_time`, else five hours from the stop with
+  `estimated: true`. Two minutes after the reset, with no event since, the
+  heartbeat runs a delivery round and shows a desktop notice with fixed
+  words ("ADHOC-24 is waiting. The usage limit has reset. Type continue in
+  Claude Code."), through `osascript` or `notify-send` with no shell.
+- **It delivers what was left for the machine.** After each beat the
+  process runs the same intake round a `Stop` hook runs (the actions queued
+  for this machine, by their typed kinds, under intake's done-marks and a
+  machine-wide lock, so no action runs twice) and the plan's own gate
+  deadlines with no reads. That is one request when nothing is queued.
+- **The resume snapshot stays on the machine.** Each session keeps
+  `<data>/resume/<digest>.json` (its key, its open plan runs and their
+  nodes, its open agents with their task line, the last step per card, its
+  pause), saved on Stop, SubagentStop, PreCompact and a limit's
+  StopFailure, and read back once into a resumed, compacted or successor
+  session's own context. No report or beat carries it. The only thing sent
+  when a limit nears (`teamflow statusline-tap`, 80 % of a statusline
+  `rate_limits` window or of the context window) is the workflow report the
+  plugin already sends for its runs.
+- **Several sessions on one project.** `repo` is a digest of the
+  repository's name (`owner/name`), the same on every machine, never a
+  path. The service stamps the credential's member as a digest
+  (`memberId`), never an address. The oldest live session on a card holds
+  it; when it ends, crashes or moves to another account, the next one holds
+  it. The beat's reply carries `others: [{key, who, since}]` (who holds the
+  cards this session works on and does not hold) and `holds: [key]`. The
+  plugin keeps both in the local heartbeat record, tells the person once at
+  a prompt ("ADHOC-24 is already being worked on in another session (Mad
+  Scientist, since 10:02 UTC). Pick another ticket or coordinate first."),
+  never blocks, and runs a card's queued actions only in the session that
+  holds it. Two live sessions in one folder, from the local records alone,
+  are each told once: "Another Claude Code session is working in this
+  folder. Use a worktree so your changes do not collide."
+- **Never queued, never retried.** A beat that fails is skipped; the next
+  one is two minutes away, and an old beat delivered late would say a dead
+  session was alive.
+- **Not a report for billing.** A heartbeat is never billed and never
+  counts as a report, on the usage line or in `reports_this_month`.
+- `TEAMFLOW_HEARTBEAT=off` turns it off. `teamflow status` says whether this
+  session's heartbeat is running.
+- **What the service keeps and serves.** The stored document adds `known[]`
+  (every agent the session showed, with `goneAt` once it left the beats),
+  `firstSeenAt`, `receivedAt` and `handled` (what TeamFlow already said
+  about each agent). It is never served. The bundle serves `liveness[]
+  {sessionId, agentId|null, key|null, state, lastBeatAt, lastEventAt,
+  reason}` instead, `state` one of `live | hung | crashed | quiet | ended`
+  and `reason` one plain sentence (`adapters/teamflow/liveness.py`).
+
+### The machine's inventory (MACLEOD-641)
+
+`inventories/<machine>--<repo>.json` is the fifth kind. With a session's
+first beat, and then every tenth (about every 20 minutes), the heartbeat
+sends everything its machine holds open on the repository, so the service
+can reconcile the board (`plugin/scripts/inventory.mjs`). It is its own
+kind, not a field on the beat: a beat speaks for one session every two
+minutes, and this lists every session's agents, the worktrees and the plan
+runs.
+
+```text
+{ "kind": "inventory", "payload": {
+    "machine": "<16-hex digest>", "repo": "<16-hex digest>", "at": "<ISO>",
+    "agents":    [ { "agentId", "name", "key", "stage", "status", "lastEventAt" } ],   (≤ 100)
+    "worktrees": [ { "path": "<digest>", "key", "branch": "<digest>", "dirty": true | false } ],   (≤ 30)
+    "runs":      [ { "id", "status", "nodes": [ { "key", "state" } ] } ],   (≤ 30, ≤ 100 nodes)
+    "sessions":  [ "<12-hex session digest>" ],   (≤ 50, those whose heartbeat runs)
+    "finished":  [ { "id", "status": "done" | "cancelled" | "archived" } ] } }   (≤ 100, last 7 days)
+```
+
+- **Digests, never names.** The machine is a digest of its id, the
+  repository a digest of its `owner/name` (else its root), a worktree a
+  digest of its path and branch. `dirty` is one yes-or-no from `git status
+  --porcelain`; no file name leaves. Only worktrees with a TeamFlow binding
+  are listed. git runs with no shell and a short timeout.
+- **Free and never queued**, like a heartbeat: never billed, never counted,
+  and a failed one waits for the next.
+- **What the service does with it** (`recover.reconcile`), only while it is
+  under 25 minutes old and one of its sessions still beats: a node the board
+  holds `running` that the machine lists done or skipped takes that state
+  ("Its computer says this work is finished."); a run the board holds open
+  that the machine finished takes its status ("Its computer closed this
+  run."); a `running` run of one of those sessions, for an agent the machine
+  no longer lists, ends ("The agent is no longer running on its computer.");
+  an agent the machine lists that no row speaks for reads `live`; a bound
+  worktree with uncommitted work and nobody on its card is noted once on the
+  card. A change on the board newer than the inventory is never undone. The
+  document keeps `handled` (the worktrees already noted) and is never served.
+
 ### A gate's lifecycle on the runtime sidecar (MACLEOD-639)
 
 A runtime sidecar is an execution: the same `id`, `kind`, `label`, `stage`,
@@ -769,7 +903,7 @@ Three service-owned files, none of which a reporter can write. Each names its wr
 
 **`issues/<KEY>/hygiene.json` — the reserved `hygiene` slot.** In `RESERVED_SLOTS` beside `tracker` and `pr`, so `POST /v1/report` refuses it (`reserved_slot`). Written by the nightly sweep (`delivery.sweep`, adapters/teamflow/hygiene.py) and by the card routes below, always under the ETag that was read, so a report or a delivery that lands in between makes the write a refused row rather than a lost update. It holds, per key:
 
-- `hygiene[] {at, action, by, role, reason, note?, kind?}` capped at 20. `action` and `note` are plain words for people and may be reworded; code matches `reason` and `kind` (`closed`: a run was stopped; absent on rows stored before MACLEOD-640, which read "closed …"). A run the sweep stopped for want of an answer carries `closedReason: "no_result"` beside its summary "No result after N". `by` is a member's address or `teamflow` for the sweep; `role` is `owner`, `member`, `viewer` or `service`; `reason` is one of `no_verdict | superseded | owner_request | deadline | tracker_done | snooze | ping | action | note | refused`; `note` is ≤ 120 characters through the one-line sanitiser. Recent Activity and a card's History print these rows.
+- `hygiene[] {at, action, by, role, reason, note?, kind?}` capped at 20. `action` and `note` are plain words for people and may be reworded; code matches `reason` and `kind` (`closed`: a run was stopped; absent on rows stored before MACLEOD-640, which read "closed …"). A run the sweep stopped for want of an answer carries `closedReason: "no_result"` beside its summary "No result after N". `by` is a member's address or `teamflow` for the sweep; `role` is `owner`, `member`, `viewer` or `service`; `reason` is one of `no_verdict | superseded | owner_request | deadline | tracker_done | snooze | ping | action | note | refused | agent_stopped | agent_hung | plan_fixed` (the last three MACLEOD-641: an agent on the card stopped or hung, or its plan node was set from the card); `note` is ≤ 120 characters through the one-line sanitiser. Recent Activity and a card's History print these rows.
 - `attention[] {key, rule, by, kind, snoozedUntil?, pingedAt?, escalatedBy?}` capped at 16 — org-visible marks so two leads do not chase one card. `kind` is `snooze | ping | escalate | action`, one mark per (rule, kind), so a ping never replaces a snooze; `rule` is one line of at most 40 characters, refused before anything is mailed; `escalatedBy` names who escalated when the developer was told by somebody else. Also served flat as the bundle's `attention[]`.
 - `decisions[]` and `policy` (WS-K, below) ride on the same sidecar and every hygiene writer keeps them.
 - `transitions[] {stage, at, by}` — the stage moves the SERVICE observed (a tracker's Done, a pull request event, the sweep's own migration), kept apart from the plugin's list on the issue document and merged at read.

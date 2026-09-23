@@ -48,11 +48,11 @@
 
 import { currentBinding, mint, TITLE_MAX, TRACKER } from './adhoc.mjs';
 import {
-  agentLabel, dataDir, isAgentTool, issuePayload, launchesPath, organisationScope, readJson, readWorkflows,
+  agentLabel, dataDir, isAdHocKey, isAgentTool, issuePayload, launchesPath, organisationScope, readJson, readWorkflows,
   reportScope, sendReport, workflowsPath, writeJson, writeWorkflows,
 } from './core.mjs';
 import { projectFor, projectsCachePath } from './project.mjs';
-import { addDispatched, autoCreate, liveRun, publish, stated } from './workflow.mjs';
+import { addDispatched, autoCreate, finishRun, liveRun, move, publish, stated } from './workflow.mjs';
 
 import fs from 'node:fs';
 import path from 'node:path';
@@ -402,6 +402,44 @@ export async function settle(config, { sessionId, launch, state = {}, cwd, info 
     }
   } catch { /* fails open: the launch stays pending and status counts it */ }
   return result;
+}
+
+/**
+ * Close the node minted for one agent (MACLEOD-641, audit K1 and K7).
+ *
+ * A node changed state only through `teamflow workflow ticket`, which an
+ * orchestrator has to remember to run, so a finished agent's node read
+ * "building" for a day. Now the agent's own end closes it: `done` when
+ * its last report passed, `rework` when it failed. `skipped` with a note
+ * when the agent went to work on another key instead.
+ *
+ * Only an ad hoc node the plugin put in a live run for a dispatch. A
+ * tracker ticket is never closed by an agent: an agent finishing is not
+ * the ticket finishing. Idempotent: a node already closed is left as it
+ * is. Under the runs lock; the run is published after. Never throws.
+ */
+export async function closeDispatched(config, { key, outcome = 'done', note } = {}) {
+  try {
+    if (!isAdHocKey(key)) return undefined;
+    const held = withRunsLock(() => {
+      const runs = readWorkflows(config);
+      const run = Object.values(runs.workflows || {})
+        .filter((wf) => !['done', 'cancelled', 'archived'].includes(wf.status))
+        .find((wf) => (wf.tickets || []).some((t) => t.key === key && t.addedBy === 'dispatch'));
+      const ticket = run?.tickets.find((t) => t.key === key);
+      if (!ticket || ['done', 'skipped', outcome].includes(ticket.state)) return undefined;
+      move(run, key, { state: outcome, ...(note ? { note } : {}) });
+      finishRun(run);
+      writeWorkflows(runs, config);
+      return run;
+    }, { waitMs: 1500 });
+    const run = held.locked ? held.value : undefined;
+    if (!run) return undefined;
+    try { await publish(run, config); } catch { /* the run is saved on this machine */ }
+    return { key, state: outcome };
+  } catch {
+    return undefined;
+  }
 }
 
 /** A launch with what was minted for it, as status and the agent's binding read it. */

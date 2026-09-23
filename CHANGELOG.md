@@ -3,6 +3,28 @@
 What changed in each published version of the TeamFlow plugin, newest first.
 Only what a person using it would notice.
 
+## 0.3.32
+
+- **A live heartbeat for every session.** Every two minutes the plugin tells
+  TeamFlow which agents are still working and on what. When Claude Code stops
+  without ending, one last message says so. The board then shows stopped,
+  stuck and offline agents as they are, not as "building".
+- **An agent's end closes its plan item.** The item becomes done, or rework
+  when the agent failed.
+- **Account switches and usage limits.** A switch to another account (for
+  example with claude-sessions) counts as the same session carrying on. When
+  a usage limit stops a turn, the board says when it resets. After the reset
+  the plugin checks the work and shows a desktop notice if it has not carried
+  on.
+- **Resume notes.** Before a compaction or a limit, the plugin saves where
+  the session was. A resumed session gets a short note of what it was doing.
+- **Several sessions.** You are told once when another session already works
+  on your ticket, or in the same folder.
+- **Ad hoc work into tickets.** When your organisation turns it on, the
+  plugin asks you, or TeamFlow makes the ticket for you. New command:
+  `teamflow adhoc ticket ADHOC-12`.
+- `teamflow status` shows the heartbeat and the last resume note.
+
 ## 0.3.31
 
 - **Merged work reaches Done.** When you merge a branch, the tickets of the

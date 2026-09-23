@@ -1099,6 +1099,48 @@ export function recordKeyAlias(from, to, config = {}, { tracker } = {}) {
   }
 }
 
+// --- ad hoc work into tickets (MACLEOD-642) ---------------------------
+//
+// The organisation may turn ad hoc work into tickets: automatically, which
+// the service does on its own, or after the person says yes. For "ask
+// first" the report's answer carries `adhoc_ticket: {mode, tracker, key}`
+// and the session hears one line, once per item: this file remembers which
+// items it was said for, keyed by organisation like aliases.json.
+
+const TRACKER_WORDS = { linear: 'Linear', github: 'GitHub', jira: 'Jira' };
+
+export function adhocAskedPath() {
+  return path.join(dataDir(), 'adhoc-asked.json');
+}
+
+/** The one line the coding agent reads. Words for a person, a command to run on a yes. */
+export function adhocTicketLine(key, tracker) {
+  const word = TRACKER_WORDS[tracker] || tracker;
+  return `This work has no ticket. Ask the person whether to make one in ${word}. `
+    + `If they agree, run \`teamflow adhoc ticket ${key}\`.`;
+}
+
+/**
+ * The line for an "ask first" answer, the first time only; undefined after,
+ * for any other answer, and when this machine cannot remember it said it
+ * (a line it cannot stop repeating is worse than none).
+ */
+export function askAboutTicketOnce(answer, config = {}) {
+  if (answer?.mode !== 'ask' || !isAdHocKey(answer.key) || !TRACKER_WORDS[answer.tracker]) return undefined;
+  const key = String(answer.key).toUpperCase();
+  const all = readJson(adhocAskedPath(), {}) || {};
+  const scope = workflowScope(config);
+  if (all[scope]?.[key]) return undefined;
+  all[scope] = { ...(all[scope] || {}), [key]: new Date().toISOString() };
+  try {
+    fs.mkdirSync(path.dirname(adhocAskedPath()), { recursive: true });
+    writeJson(adhocAskedPath(), all);
+  } catch {
+    return undefined;
+  }
+  return adhocTicketLine(key, answer.tracker);
+}
+
 /**
  * Rename `from` to `to` in one workflow, in place. True when anything moved.
  *
@@ -1505,6 +1547,71 @@ export function trace(input, options = {}, env = process.env) {
   } catch {
     return false;
   }
+}
+
+/**
+ * An agent actor that never started (MACLEOD-641, audit K4): made by a
+ * `SubagentStop` for an agent this machine never saw begin. No task, no
+ * type, the placeholder name, still at BACKLOG, and a start and end
+ * under a second apart.
+ * The hook no longer writes these; older plugins wrote thousands.
+ */
+export function isPhantomAgent(actor) {
+  const agent = actor?.agent;
+  if (!actor?.agentKey || !agent || agent.task || agent.type) return false;
+  // It did no work: a phantom is made at BACKLOG and never leaves it.
+  if (actor.stage && actor.stage !== 'BACKLOG') return false;
+  if (agent.name && agent.name !== 'Agent') return false;
+  const start = Date.parse(agent.startedAt || '');
+  const end = Date.parse(agent.endedAt || '');
+  return Number.isFinite(start) && Number.isFinite(end) && Math.abs(end - start) < 1000;
+}
+
+const PURGED = '.purged-phantom-agents';
+
+/**
+ * Once per data folder, delete the phantom agent files an older plugin
+ * wrote, and with them the ends they still owed (MACLEOD-641). The
+ * adoptOldData pattern: a marker makes it once, and it never throws.
+ * Returns how many it removed, or false when it did not run.
+ */
+export function purgePhantomAgents(dir = dataDir()) {
+  try {
+    if (fs.existsSync(path.join(dir, PURGED))) return false;
+    const sessions = path.join(dir, 'sessions');
+    let removed = 0;
+    for (const name of fs.existsSync(sessions) ? fs.readdirSync(sessions) : []) {
+      if (!name.endsWith('.json') || !isPhantomAgent(readJson(path.join(sessions, name)))) continue;
+      fs.rmSync(path.join(sessions, name), { force: true });
+      removed += 1;
+    }
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path.join(dir, PURGED), new Date().toISOString());
+    return removed;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Whether an owed end is older than a report this machine has since made
+ * on the same key (MACLEOD-641, audit K5). Sent a day late, such an end
+ * put an old stage back on the card; the newer report already said more.
+ */
+export function supersededEnd(actor, actors = []) {
+  const key = actor?.binding?.key;
+  const at = Date.parse(actor?.updatedAt || '') || 0;
+  return Boolean(key) && actors.some((other) => other.binding?.key === key
+    && (other.sessionId !== actor.sessionId || other.agentKey !== actor.agentKey)
+    && (Date.parse(other.lastPublishedAt || '') || 0) > at);
+}
+
+/** Every actor file on this machine. Local files only. */
+export function allActors() {
+  const dir = path.join(dataDir(), 'sessions');
+  if (!fs.existsSync(dir)) return [];
+  return fs.readdirSync(dir).filter((name) => name.endsWith('.json'))
+    .map((name) => readJson(path.join(dir, name))).filter(Boolean);
 }
 
 /**
@@ -5172,11 +5279,17 @@ async function postEnvelope(endpoint, envelope, idempotencyKey, config, account 
     status,
     replay: Boolean(body?.replay),
     droppedFields: Array.isArray(body?.dropped_fields) ? body.dropped_fields : [],
+    // A heartbeat's reply (MACLEOD-641): other sessions on this session's
+    // cards, and the cards it holds.
+    ...(Array.isArray(body?.others) ? { others: body.others } : {}),
+    ...(Array.isArray(body?.holds) ? { holds: body.holds } : {}),
     // The key this report was sent under became a ticket (ADHOC-15):
     // the service wrote it under `convertedTo`, and the session follows.
     ...(isAdHocKey(body?.converted_from) && typeof body?.converted_to === 'string'
       ? { convertedFrom: String(body.converted_from).toUpperCase(), convertedTo: body.converted_to, convertedTracker: body.converted_tracker }
       : {}),
+    // The organisation's ad hoc setting for this item (MACLEOD-642).
+    ...(body?.adhoc_ticket && typeof body.adhoc_ticket === 'object' ? { adhocTicket: body.adhoc_ticket } : {}),
   });
 }
 
@@ -5471,6 +5584,31 @@ export async function sendReport(kind, slot, payload, config, { account, flush =
    */
   if (result.ok && flush) await flushOutbox(config);
   return result;
+}
+
+/**
+ * POST one heartbeat (MACLEOD-641). Never queued and never retried: a
+ * beat that could not go out is replaced by the next one two minutes
+ * later, and a queue of old beats would say a dead session was alive.
+ * The payload is heartbeat.mjs's own allowlist, built field by field.
+ */
+export async function sendHeartbeat(payload, config) {
+  if (!credentialKind(config)) return { ok: false, skipped: true, reason: 'no service credential configured' };
+  const envelope = { kind: 'heartbeat', payload };
+  const idempotencyKey = crypto.createHash('sha256').update(JSON.stringify(envelope)).digest('hex');
+  return postEnvelope(`${serviceUrl(config)}/v1/report`, envelope, idempotencyKey, config, reportScope(config));
+}
+
+/**
+ * One inventory (MACLEOD-641): everything this machine holds open on one
+ * repository, so the service can reconcile. Free like a beat, and never
+ * queued: the next one is about twenty minutes away.
+ */
+export async function sendInventory(payload, config) {
+  if (!credentialKind(config)) return { ok: false, skipped: true, reason: 'no service credential configured' };
+  const envelope = { kind: 'inventory', payload };
+  const idempotencyKey = crypto.createHash('sha256').update(JSON.stringify(envelope)).digest('hex');
+  return postEnvelope(`${serviceUrl(config)}/v1/report`, envelope, idempotencyKey, config, reportScope(config));
 }
 
 export async function fetchAccount(config) {
@@ -5868,6 +6006,9 @@ export async function publishState(state, config, info, { force = false, keepTen
     recordKeyAlias(issueResult.convertedFrom, issueResult.convertedTo, config, { tracker: issueResult.convertedTracker });
     followKeyAliases(state, state.cwd, config);
   }
+  // "Ask first" (MACLEOD-642): said on the next prompt, once per item.
+  const ask = askAboutTicketOnce(issueResult.adhocTicket, config);
+  if (ask) state.intakePending = [...(state.intakePending || []), ask].slice(-8);
   if (issueResult.ok || issueResult.queued) {
     state.lastPublishHash = hash;
     state.lastPublishedAt = now;
