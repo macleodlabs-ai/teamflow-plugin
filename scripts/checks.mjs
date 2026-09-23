@@ -36,6 +36,8 @@ const COMMAND_MAX = 200;
 export const CHECKS_MAX = 16;
 // Names a connector owns; a repository may not claim one.
 const RESERVED = new Set(['tracker', 'pr', 'sonarqube', 'hygiene']);
+// Checks the plugin writes into checks.json itself (check-presets.mjs).
+export const PRESET_GATES = new Set(['lint', 'playwright']);
 
 function fold(command) {
   return String(command ?? '').trim().replace(/\s+/g, ' ');
@@ -147,13 +149,17 @@ export function gateLines(pipeline, checks = {}, stage = 'BACKLOG') {
     const before = [...gates.slice(0, index)].reverse().find((g) => g.stages?.length)?.label || 'the start';
     const after = gates.slice(index + 1).find((g) => g.stages?.length)?.label;
     const place = after ? `between ${before} and ${after}` : `after ${before}`;
+    const note = typeof gate.note === 'string' && gate.note.trim()
+      ? ` Your organisation's instructions: "${gate.note.trim().slice(0, 500).replace(/"/g, "'")}"` : '';
     if (gate.kind === 'check') {
-      lines.push(checks[gate.id]
+      lines.push((checks[gate.id]
         ? `${gate.label}: this repository's "${gate.id}" check must pass, ${place}.`
-        : `${gate.label}: not set up in this repository. Add "${gate.id}" to ${CHECKS_FILE}. It does not stop the card.`);
+        : PRESET_GATES.has(gate.id)
+          ? `${gate.label}: not set up yet. TeamFlow sets it up in this repository. It does not stop the card.`
+          : `${gate.label}: not set up in this repository. Add "${gate.id}" to ${CHECKS_FILE}. It does not stop the card.`) + note);
     } else {
       const tool = gate.external?.system === 'sonarqube' ? 'SonarQube' : 'an outside tool';
-      lines.push(`${gate.label}: TeamFlow asks ${tool} for a pass, ${place}.`);
+      lines.push(`${gate.label}: TeamFlow asks ${tool} for a pass, ${place}.${note}`);
     }
   });
   return lines;

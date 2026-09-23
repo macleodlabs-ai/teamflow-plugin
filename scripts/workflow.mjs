@@ -101,11 +101,20 @@ export const USAGE = `teamflow workflow — the pool of tickets a run works thro
       One ticket waits on another. Re-levels the phases, because an edge
       a team found mid-build moves tickets between them.
 
+  teamflow workflow depends <KEY> --on <KEY> --remove [--reason <why>]
+                            [--found planning|build] [--to <name>]
+      Remove a wrong edge: <KEY> does not wait on the other ticket.
+      Re-levels the phases the same way. If that edge is not in the
+      workflow, TeamFlow says so and changes nothing. \`workflow show\`
+      lists the edges you removed.
+
   teamflow workflow depends --batch [--found planning|build] [--to <name>]
       The whole graph at once, as JSON on stdin: an array of
       {"from","on","reason","found"}, or {"dependencies": [...]}. This is
       what planning uses — one call, one levelling, one report, instead of
-      one subprocess per edge. A malformed entry refuses the batch.
+      one subprocess per edge. Add "remove": true to an entry to remove
+      that edge. A malformed entry, or a removal of an edge that is not
+      there, refuses the batch.
 
   teamflow workflow ready [--to <name>]
       What the current phase has open. This is what a run starts next.
@@ -1229,6 +1238,14 @@ export function render(workflow, state) {
     out.push('  found while building:');
     for (const d of found) out.push(`    ${d.from} waits on ${d.on}${d.reason ? ` — ${d.reason}` : ''}`);
   }
+  for (const [where, label] of [['planning', 'planning'], ['build', 'building']]) {
+    const gone = (workflow.removed || []).filter((d) => d.found === where);
+    if (!gone.length) continue;
+    out.push(`  removed while ${label}:`);
+    for (const d of gone) {
+      out.push(`    ${d.from} does not wait on ${d.on}${d.reason ? ` — ${d.reason}` : ''}`);
+    }
+  }
   // Archived runs leave the pickers (MACLEOD-601). They stay readable
   // by name and by id -- nothing is destroyed -- but a listing that
   // offered 144 empty runs nobody ever filled is a listing nobody reads.
@@ -1451,13 +1468,28 @@ export async function main(args, {
       const edges = dependsBatch(target, await readJson(stdin), { found: flag(rest, 'found') });
       save(state, config);
       await publish(target, config);
-      print(`TeamFlow recorded ${edges.length} dependenc${edges.length === 1 ? 'y' : 'ies'} `
+      const gone = edges.filter((e) => e.removed).length;
+      const added = edges.length - gone;
+      print(`TeamFlow recorded ${added} dependenc${added === 1 ? 'y' : 'ies'}`
+        + `${gone ? ` and removed ${gone}` : ''} `
         + `in "${target.name}", now ${target.phases.length} phase`
         + `${target.phases.length === 1 ? '' : 's'}.`);
       print(render(target, state));
       return 0;
     }
     const positional = rest.filter((a) => !a.startsWith('--'));
+    if (rest.includes('--remove')) {
+      const edge = undepend(target, positional[0], flag(rest, 'on'), {
+        reason: flag(rest, 'reason'),
+        found: flag(rest, 'found') || 'planning',
+      });
+      save(state, config);
+      await publish(target, config);
+      print(`${edge.from} no longer waits on ${edge.on}.`);
+      print(`"${target.name}" is now ${target.phases.length} phase`
+        + `${target.phases.length === 1 ? '' : 's'}.`);
+      return 0;
+    }
     const edge = depends(target, positional[0], flag(rest, 'on'), {
       reason: flag(rest, 'reason'),
       found: flag(rest, 'found') || 'planning',
@@ -1835,6 +1867,46 @@ function recordEdge(workflow, from, on, { reason, found = 'planning' } = {}) {
   edge.found = found;
   if (!existing) edges.push(edge);
   workflow.dependencies = edges;
+  // An edge put back is no longer a removal.
+  if (workflow.removed) {
+    workflow.removed = workflow.removed.filter((d) => !(d.from === a && d.on === b));
+  }
+  return edge;
+}
+
+/**
+ * Remove one edge, without re-levelling. The removal is kept on this
+ * machine in `workflow.removed` (never published: the board draws the
+ * edges that are there) so `workflow show` can say what was taken out.
+ * An edge that is not there is refused: removing nothing is a typo.
+ */
+function removeEdge(workflow, from, on, { reason, found = 'planning' } = {}) {
+  const a = String(from || '').trim();
+  const b = String(on || '').trim();
+  if (!a || !b) throw new Error('Usage: teamflow workflow depends <KEY> --on <KEY> --remove');
+  if (!['planning', 'build'].includes(found)) {
+    throw new Error('--found must be planning or build');
+  }
+  const edges = workflow.dependencies || [];
+  const index = edges.findIndex((d) => d.from === a && d.on === b);
+  if (index < 0) {
+    throw new Error(`${a} does not wait on ${b} in "${workflow.name}". Nothing was removed.`);
+  }
+  edges.splice(index, 1);
+  workflow.dependencies = edges;
+  const gone = { from: a, on: b, found };
+  if (reason) gone.reason = String(reason).slice(0, 180);
+  workflow.removed = (workflow.removed || [])
+    .filter((d) => !(d.from === a && d.on === b))
+    .concat(gone)
+    .slice(-CAPS.dependencies);
+  return { ...gone, removed: true };
+}
+
+/** Record that one ticket no longer waits on another. */
+export function undepend(workflow, from, on, options = {}) {
+  const edge = removeEdge(workflow, from, on, options);
+  relevel(workflow);
   return edge;
 }
 
@@ -1867,12 +1939,13 @@ export function dependsBatch(workflow, entries, { found } = {}) {
     throw new Error('A batch is a JSON array of edges, or an object with a "dependencies" array.');
   }
   const already = (workflow.dependencies || []).length;
-  if (already + list.length > CAPS.dependencies) {
+  const adding = list.filter((e) => !(e && e.remove === true)).length;
+  if (already + adding > CAPS.dependencies) {
     // The service caps this list and `published` truncates to the same
     // number. Refusing is the honest answer: a silently trimmed graph
     // levels into phases that are missing gates nobody can see are gone.
     throw new Error(`A workflow holds at most ${CAPS.dependencies} dependencies; `
-      + `this batch would make ${already + list.length}.`);
+      + `this batch would make ${already + adding}.`);
   }
   // Validated in full before anything is written.
   const wanted = list.map((entry, index) => {
@@ -1887,9 +1960,23 @@ export function dependsBatch(workflow, entries, { found } = {}) {
     if (!['planning', 'build'].includes(where)) {
       throw new Error(`Edge ${index + 1}: found must be planning or build.`);
     }
-    return { from, on, reason: entry.reason, found: where };
+    return { from, on, reason: entry.reason, found: where, remove: entry.remove === true };
   });
-  const edges = wanted.map((edge) => recordEdge(workflow, edge.from, edge.on, edge));
+  // A removal must name an edge that is there when its turn comes, in
+  // the order given. Checked before anything is written.
+  const present = new Set((workflow.dependencies || []).map((d) => `${d.from}\u0000${d.on}`));
+  wanted.forEach((edge, index) => {
+    const id = `${edge.from}\u0000${edge.on}`;
+    if (!edge.remove) { present.add(id); return; }
+    if (!present.has(id)) {
+      throw new Error(`Edge ${index + 1}: ${edge.from} does not wait on ${edge.on}. `
+        + 'Nothing was changed.');
+    }
+    present.delete(id);
+  });
+  const edges = wanted.map((edge) => (edge.remove
+    ? removeEdge(workflow, edge.from, edge.on, edge)
+    : recordEdge(workflow, edge.from, edge.on, edge)));
   relevel(workflow);
   return edges;
 }

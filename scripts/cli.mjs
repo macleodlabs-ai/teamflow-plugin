@@ -158,33 +158,9 @@ async function trackerConnections(config) {
   }
 }
 
-/**
- * The pipeline this repository's project draws (ADHOC-20), as
- * `GET /v1/members/pipeline?project=<id>` resolves it: the project's own
- * copy, else the organisation's, else the default. Undefined when it
- * cannot be asked; a person is then told nothing rather than something
- * wrong.
- */
-async function fetchPipeline(config, projectId) {
-  const cred = await credential(config);
-  if (!cred) return undefined;
-  try {
-    const query = projectId ? `?project=${encodeURIComponent(projectId)}` : '';
-    const response = await fetch(`${serviceUrl(config)}/v1/members/pipeline${query}`, {
-      headers: { [cred.header]: cred.value },
-      redirect: 'error',
-      signal: AbortSignal.timeout(Number(config.serviceTimeoutMs || 5000)),
-    });
-    if (!response.ok) return undefined;
-    const body = await response.json();
-    return Array.isArray(body?.pipeline?.gates) ? body.pipeline : undefined;
-  } catch {
-    return undefined;
-  }
-}
-
 /** The custom gates this card still has to pass, in plain words. */
 async function gatesToPass(state, project) {
+  const { fetchPipeline } = await import('./check-presets.mjs');
   const pipeline = await fetchPipeline(config, project?.id);
   if (!pipeline) return undefined;
   const { gateLines } = await import('./checks.mjs');

@@ -815,6 +815,30 @@ export async function handleEvent(input = {}) {
     await reconcileOnHook(config, { network: event === 'Stop', sessionId });
   }
 
+  /*
+   * Check gates the plugin sets up itself (MACLEOD-639): a Lint column the
+   * organisation added gets its command written into this repository's
+   * `.teamflow/checks.json`, from the plugin's own table and never from the
+   * service. On `Stop`, which may use the network; the main checkout only,
+   * like the CLAUDE.md rule above; at most every six hours. Fails open.
+   */
+  if (event === 'Stop' && !agentKey && boundToTeamflow(cwd, config, state, info?.repository)
+    && !isLinkedWorktree(cwd)) {
+    const { fetchPipeline, syncPresets } = await import('./check-presets.mjs');
+    const { dataDir } = await import('./core.mjs');
+    let stampDir;
+    try { stampDir = dataDir(); } catch { stampDir = undefined; }
+    await syncPresets({
+      cwd,
+      config,
+      stampDir,
+      load: async (cfg, _project, timeoutMs) => {
+        const project = await resolveProject(info?.repository, cfg, { timeoutMs: 1500 });
+        return fetchPipeline(cfg, project?.id, timeoutMs);
+      },
+    });
+  }
+
   // After the publish, never before: the board's last word on the item
   // is the state above, and forgetting the key first would have
   // published nothing at all. It never reopens -- a new request is a
@@ -867,6 +891,14 @@ export async function handleEvent(input = {}) {
     if (local.performed.length) state.actions = [...(state.actions || []), ...local.performed].slice(-16);
     notices = local.notices;
     if (local.performed.length) saveSession(state);
+    // The organisation's check columns (MACLEOD-639): the command that
+    // counts and its note, in its own words, read from the cache the last
+    // `Stop` sync wrote. File reads only: this is the fast path.
+    try {
+      const { columnLines } = await import('./check-presets.mjs');
+      const { dataDir } = await import('./core.mjs');
+      notices = [...notices, ...columnLines({ cwd, stampDir: dataDir() })];
+    } catch { /* nothing to say is said */ }
   }
   if (FAST.includes(event) && state.intakePending?.length) {
     notices = [...state.intakePending, ...notices];

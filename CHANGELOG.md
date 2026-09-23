@@ -3,6 +3,24 @@
 What changed in each published version of the TeamFlow plugin, newest first.
 Only what a person using it would notice.
 
+## 0.3.29
+
+- **A lint step sets itself up.** When your organisation adds the lint
+  step, the plugin adds the lint command to `.teamflow/checks.json` in
+  your repository. It uses your own `npm run lint` if you have one, and
+  MegaLinter if not. It never changes a command you already chose.
+- **A Playwright step sets itself up too.** When your organisation adds it,
+  the plugin adds `npx playwright test` to `.teamflow/checks.json`, if your
+  repository has a Playwright config. If the step asks for a video, the
+  plugin writes `playwright.teamflow.config.ts` beside your config, with
+  video on, and uses that. It never writes over a file it did not write.
+- **Instructions reach your agent.** At the start of a session, the agent
+  reads each custom step's command, or the tool it waits for, and your
+  organisation's instructions for it. `teamflow gates` shows them too.
+- **Remove a link between two tickets in a plan.**
+  `teamflow workflow depends <KEY> --on <KEY> --remove` takes it off the
+  board.
+
 ## 0.3.28
 
 - **Integrations live in Organisation settings.** `teamflow trackers connect`

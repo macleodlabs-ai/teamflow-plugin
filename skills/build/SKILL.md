@@ -367,6 +367,10 @@ The phases re-level immediately and the ticket moves. Work already done is
 kept. `show` calls these out separately from the ones planning found,
 because one is the plan and the other is news.
 
+An edge that turns out to be wrong comes out the same way, with `--remove`
+(or `"remove": true` on a `--batch` entry). The phases re-level again, and
+`show` lists the removal. Removing an edge that is not there is refused.
+
 ## 5. Finish
 
 Reconcile, exactly as at the end of a phase: `--dry-run` first, then the
