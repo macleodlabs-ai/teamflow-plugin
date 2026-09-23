@@ -342,6 +342,7 @@ export function safeExec(command, args = [], options = {}) {
       input: options.input,
       encoding: 'utf8',
       timeout: options.timeout ?? 3000,
+      ...(options.maxBuffer ? { maxBuffer: options.maxBuffer } : {}),
       stdio: ['pipe', 'pipe', 'pipe'],
       env: options.env || process.env,
     });
@@ -5738,6 +5739,19 @@ export async function sendHeartbeat(payload, config) {
 export async function sendInventory(payload, config) {
   if (!credentialKind(config)) return { ok: false, skipped: true, reason: 'no service credential configured' };
   const envelope = { kind: 'inventory', payload };
+  const idempotencyKey = crypto.createHash('sha256').update(JSON.stringify(envelope)).digest('hex');
+  return postEnvelope(`${serviceUrl(config)}/v1/report`, envelope, idempotencyKey, config, reportScope(config));
+}
+
+/**
+ * What this repository's git history proves merged (MACLEOD-726):
+ * `{ repo, at, merged: [{ key, merged, mergedAt, via }] }`, from the
+ * inventory pass and `teamflow reconcile --merged`. Free like an
+ * inventory, and never queued.
+ */
+export async function sendMerged(payload, config) {
+  if (!credentialKind(config)) return { ok: false, skipped: true, reason: 'no service credential configured' };
+  const envelope = { kind: 'merged', payload };
   const idempotencyKey = crypto.createHash('sha256').update(JSON.stringify(envelope)).digest('hex');
   return postEnvelope(`${serviceUrl(config)}/v1/report`, envelope, idempotencyKey, config, reportScope(config));
 }

@@ -1,0 +1,326 @@
+// Proof from git that a ticket's work is merged (MACLEOD-726, census fix 2).
+//
+// Agents dispatched to worktrees often never report under their own
+// ticket key, so the board has no evidence the work landed and keeps the
+// card open for a person. This machine does have the evidence: the
+// branch names, the commit subjects, the worktree bindings. This module
+// asks the local repository, and nothing else, one question per key:
+// is a branch or a commit that names it merged into the default branch?
+//
+// - Local only. git runs with no shell, fixed arguments and a timeout.
+//   A key or a branch name is used only after it passes a strict pattern,
+//   and a key that came from the service is only ever compared with text
+//   git printed; it is never an argument to git.
+// - A branch counts when its name, its worktree's binding or the node
+//   minted for the agent sent to that worktree carries the key, and its tip
+//   arrived on the default branch through a merge. A
+//   branch that was only created from the default branch, with no work
+//   on it, is not a merge: its tip is on the default branch's own line.
+// - A commit counts when its subject names the key and it arrived on the
+//   default branch through a merge: reachable from it, but not on its own
+//   first-parent line. A commit made straight on the default branch never
+//   counts, however many name the key: in a repository whose main session
+//   commits to main, the key is in every subject while the work goes on.
+//   A worktree whose branch was deleted after the merge still counts.
+// - `mergedAt` is when the work arrived on the default branch: the time
+//   of the first commit on the default branch's own line that holds it.
+//
+// What leaves the machine is one derived fact per key:
+// `{ key, merged: true, mergedAt, via: 'branch' | 'commit' }`.
+// Never a branch name, a commit message, an id or a diff.
+import fs from 'node:fs';
+import path from 'node:path';
+
+import * as core from './core.mjs';
+
+export const FACTS_MAX = 200;
+const COMMITS_MAX = 20000;
+// A tracker key: `MACLEOD-688`, `ADHOC-10`. Upper case once read.
+const KEY = /^[A-Z][A-Z0-9]{0,19}-[0-9]{1,9}$/;
+const KEY_IN_TEXT = /(?<![A-Za-z0-9])([A-Za-z][A-Za-z0-9]{0,19}-[0-9]{1,9})(?![0-9])/g;
+// git's own rules, narrowed: no `..`, no `//`, no leading `-` or `/`,
+// no `.lock` end, no space or control character, at most 200 characters.
+const BRANCH = /^(?![-/.])(?!.*\.\.)(?!.*\/\/)(?!.*@\{)(?!.*\.lock$)(?!.*[/.]$)[A-Za-z0-9._/-]{1,200}$/;
+const SHA = /^[0-9a-f]{40}$/;
+
+/** The key upper-cased when it is a tracker key, else undefined. */
+export function keyOk(value) {
+  const key = String(value ?? '').trim().toUpperCase();
+  return KEY.test(key) ? key : undefined;
+}
+
+/** Whether `name` is a branch name this module will hand to git. */
+export function branchOk(name) {
+  return typeof name === 'string' && BRANCH.test(name);
+}
+
+/** Every tracker key named in a line of text, upper-cased. */
+export function keysIn(text) {
+  const out = new Set();
+  for (const match of String(text ?? '').matchAll(KEY_IN_TEXT)) out.add(match[1].toUpperCase());
+  return out;
+}
+
+function git(root, args) {
+  return core.safeExec(process.env.TEAMFLOW_GIT_BIN || 'git', ['-C', root, ...args],
+    { cwd: root, timeout: 15000, maxBuffer: 64 * 1024 * 1024 });
+}
+
+/** The default branch's ref: local first, then origin's copy. */
+export function defaultRef(root, run = git) {
+  const head = run(root, ['symbolic-ref', '--quiet', '--short', 'refs/remotes/origin/HEAD']);
+  const names = [...new Set([...(head.ok ? [head.stdout.replace(/^origin\//, '')] : []), 'main', 'master'])];
+  for (const name of names.filter(branchOk)) {
+    for (const ref of [`refs/heads/${name}`, `refs/remotes/origin/${name}`]) {
+      if (run(root, ['rev-parse', '--verify', '--quiet', `${ref}^{commit}`]).ok) return ref;
+    }
+  }
+  return undefined;
+}
+
+/**
+ * The default branch's history in one git call: for every commit, when
+ * it arrived on the default branch, and for every key its subject
+ * names, the newest such arrival.
+ */
+export function historyOf(root, ref, run = git) {
+  const got = run(root, ['log', ref, `--max-count=${COMMITS_MAX}`, '--format=%H %P%x09%ct%x09%s']);
+  const commits = new Map();
+  const order = [];
+  for (const line of got.ok ? got.stdout.split('\n') : []) {
+    const [ids, time, subject = ''] = line.split('\t');
+    const [sha, ...parents] = String(ids || '').split(' ').filter(Boolean);
+    if (!SHA.test(sha || '')) continue;
+    commits.set(sha, { parents, time: Number(time) * 1000, subject });
+    order.push(sha);
+  }
+  // The default branch's own line: its tip, then each first parent.
+  const line = [];
+  for (let at = order[0]; at && commits.has(at); at = commits.get(at).parents[0]) line.push(at);
+  const arrival = new Map();
+  for (const main of line.reverse()) {
+    const when = commits.get(main).time;
+    const stack = [main];
+    while (stack.length) {
+      const sha = stack.pop();
+      if (arrival.has(sha) || !commits.has(sha)) continue;
+      arrival.set(sha, when);
+      const { parents } = commits.get(sha);
+      // The line's own first parent arrived earlier; it is not this merge's.
+      stack.push(...(sha === main ? parents.slice(1) : parents));
+    }
+  }
+  const onLine = new Set(line);
+  const byKey = new Map();
+  for (const [sha, { subject }] of commits) {
+    const when = arrival.get(sha);
+    // Only work that arrived through a merge: a commit made straight on
+    // the default branch names its ticket while the work goes on.
+    if (when === undefined || onLine.has(sha)) continue;
+    for (const key of keysIn(subject)) byKey.set(key, Math.max(byKey.get(key) ?? 0, when));
+  }
+  return { arrival, line: onLine, byKey };
+}
+
+/** Local branches with their tips; a name that fails the pattern is skipped. */
+export function branchesOf(root, run = git) {
+  const got = run(root, ['for-each-ref', 'refs/heads', '--format=%(refname:short)%09%(objectname)']);
+  const out = [];
+  for (const row of got.ok ? got.stdout.split('\n') : []) {
+    const [name, sha] = row.split('\t');
+    if (branchOk(name) && SHA.test(sha || '')) out.push({ name, sha, keys: keysIn(name) });
+  }
+  return out;
+}
+
+/** `{ worktree path: branch name }`, from `git worktree list --porcelain`. */
+export function worktreeBranches(root, run = git) {
+  const got = run(root, ['worktree', 'list', '--porcelain']);
+  const out = new Map();
+  let dir;
+  for (const line of got.ok ? got.stdout.split('\n') : []) {
+    if (line.startsWith('worktree ')) dir = line.slice(9);
+    else if (dir && line.startsWith('branch refs/heads/') && branchOk(line.slice(18))) out.set(dir, line.slice(18));
+  }
+  return out;
+}
+
+/**
+ * The keys each branch works on, by branch name, from what this machine
+ * wrote itself: a worktree's `work-on` binding, and the node minted for
+ * an agent sent to a worktree (the agent's own record names the minted
+ * key and the folder it worked in). A worktree removed since is found by
+ * the branch name Claude Code gives it, `worktree-<folder>`, when that
+ * branch is still here.
+ */
+export function boundBranches(root, run = git, { branches = [] } = {}) {
+  const trees = worktreeBranches(root, run);
+  const names = new Set(branches.map((b) => b.name));
+  const out = new Map();
+  const add = (name, key) => {
+    if (!name || !key) return;
+    if (!out.has(name)) out.set(name, new Set());
+    out.get(name).add(key);
+  };
+  for (const [dir, name] of trees) {
+    const held = core.readJson(path.join(dir, '.teamflow', 'binding.json'));
+    add(name, keyOk(held?.jiraKey ?? held?.key));
+  }
+  const sessions = path.join(core.dataDir(), 'sessions');
+  let files = [];
+  try { files = fs.readdirSync(sessions).filter((n) => n.endsWith('.json')); } catch { /* no sessions here */ }
+  for (const file of files) {
+    const actor = core.readJson(path.join(sessions, file));
+    const key = keyOk(actor?.dispatch?.key);
+    if (!key || actor.dispatch.nested || typeof actor.cwd !== 'string') continue;
+    const guess = `worktree-${path.basename(actor.cwd)}`;
+    add(trees.get(actor.cwd) || (names.has(guess) ? guess : undefined), key);
+  }
+  return out;
+}
+
+/**
+ * `{ ADHOC-n: TICKET-m }` from an alias map shaped like the service's
+ * (`{ 'ADHOC-10': { to: 'MACLEOD-688' } }`), keys checked.
+ */
+export function aliasTargets(aliases = {}) {
+  const out = new Map();
+  for (const [from, alias] of Object.entries(aliases || {})) {
+    const a = keyOk(from);
+    const b = keyOk(alias?.to);
+    if (a && b && a !== b) out.set(a, b);
+  }
+  return out;
+}
+
+/**
+ * The merged facts for `keys`, one per ticket. An ad hoc key that became
+ * a ticket reports as the ticket, and the ticket's evidence includes the
+ * ad hoc key's (ADHOC-10's merge counts for MACLEOD-688).
+ */
+export function mergedFacts(keys, { root, run = git, aliases = {} } = {}) {
+  const became = aliasTargets(aliases);
+  const wanted = new Set();
+  for (const raw of keys || []) {
+    const key = keyOk(raw);
+    if (key) wanted.add(became.get(key) || key);
+  }
+  if (!wanted.size || !root) return [];
+  const ref = defaultRef(root, run);
+  if (!ref) return [];
+  const history = historyOf(root, ref, run);
+  const branches = branchesOf(root, run);
+  const bound = boundBranches(root, run, { branches });
+  const facts = [];
+  for (const key of [...wanted].sort()) {
+    const names = new Set([key, ...[...became].filter(([, to]) => to === key).map(([from]) => from)]);
+    let best;
+    const take = (at, via) => { if (at && (!best || at > best.at)) best = { at, via }; };
+    for (const name of names) take(history.byKey.get(name), 'commit');
+    for (const branch of branches) {
+      const says = [...branch.keys, ...(bound.get(branch.name) || [])].some((k) => names.has(k));
+      if (says && !history.line.has(branch.sha)) take(history.arrival.get(branch.sha), 'branch');
+    }
+    if (best) facts.push({ key, merged: true, mergedAt: new Date(best.at).toISOString(), via: best.via });
+    if (facts.length >= FACTS_MAX) break;
+  }
+  return facts;
+}
+
+/** The merged facts as one report payload, or undefined when there are none. */
+export function mergedPayload(facts, { repo, now = Date.now() } = {}) {
+  if (!facts.length) return undefined;
+  return { ...(repo ? { repo } : {}), at: new Date(now).toISOString(), merged: facts.slice(0, FACTS_MAX) };
+}
+
+/**
+ * The keys an inventory holds open: nodes of open runs not yet done or
+ * skipped, bound worktrees and open agents. The board decides which of
+ * them are still unfinished; this only offers what the machine has seen.
+ */
+export function openKeys(inventory = {}) {
+  const keys = new Set();
+  for (const run of inventory.runs || []) {
+    for (const node of run.nodes || []) if (!['done', 'skipped'].includes(node.state)) keys.add(node.key);
+  }
+  for (const tree of inventory.worktrees || []) keys.add(tree.key);
+  for (const agent of inventory.agents || []) keys.add(agent.key);
+  return [...keys].filter(Boolean);
+}
+
+// --- `teamflow reconcile --merged`: the backfill -------------------------
+//
+// Agents already dispatched never report again, so the heartbeat's pass
+// alone cannot reach the cards they left. This runs the same check once,
+// for every card the board lists as open for this organisation. The board
+// is read with the report credential (the dashboard's own bundle route);
+// its keys are used as keys only: each passes the key pattern and is only
+// compared with what git printed. Nothing received is ever run.
+
+const OPEN_RUNS = new Set(['planning', 'running', 'blocked', 'stalled']);
+
+/** The open keys and the alias map from a board bundle. */
+export function boardKeys(bundle = {}) {
+  const docs = bundle?.documents || {};
+  const keys = new Set();
+  for (const [key, issue] of Object.entries(docs.issues || {})) {
+    const stage = String(issue?.stage || '');
+    if (!issue?.deliveredAt && !['DONE', 'READY_PROD'].includes(stage)) keys.add(key);
+  }
+  for (const run of Object.values(docs.workflows || {})) {
+    if (!OPEN_RUNS.has(run?.status)) continue;
+    for (const node of run.tickets || []) if (!['done', 'skipped'].includes(node?.state)) keys.add(node?.key);
+  }
+  return { keys: [...keys].map(keyOk).filter(Boolean), aliases: docs.aliases || {} };
+}
+
+export const RECONCILE_USAGE = 'Usage: teamflow reconcile --merged [--dry-run]';
+
+/** The command. 0 when it ran, 1 when the board could not be read, 2 on a bad argument. */
+export async function main(args = [], ctx = {}) {
+  const { config = {}, cwd = process.cwd() } = ctx;
+  const print = ctx.print || ((line) => process.stdout.write(`${line}\n`));
+  const fail = ctx.fail || ((line) => process.stderr.write(`${line}\n`));
+  if (!args.includes('--merged') || args.some((a) => !['--merged', '--dry-run'].includes(a))) {
+    fail(RECONCILE_USAGE);
+    return 2;
+  }
+  const read = ctx.read || core.fetchState;
+  const result = await read('bundle', { ...config, serviceTimeoutMs: Math.max(Number(config.serviceTimeoutMs) || 0, 30000) });
+  if (!result?.ok || !result.document) {
+    fail(`TeamFlow could not read your board: ${result?.missing ? 'the service has nothing for this organisation yet' : result?.reason}.`);
+    return 1;
+  }
+  const { keys, aliases } = boardKeys(result.document);
+  const root = core.repositoryRoot(cwd);
+  const facts = mergedFacts(keys, { root, run: ctx.run, aliases });
+  if (!facts.length) {
+    print(`The board has ${keys.length} open cards. Git shows none of them merged into main.`);
+    return 0;
+  }
+  for (const fact of facts) print(`${fact.key}: merged into main at ${fact.mergedAt}.`);
+  if (args.includes('--dry-run')) {
+    print(`${facts.length} cards can finish. TeamFlow sent nothing.`);
+    return 0;
+  }
+  const repository = (ctx.info || core.gitInfo)(cwd)?.repository;
+  const out = await (ctx.send || core.sendMerged)(
+    mergedPayload(facts, { repo: repository ? core.digest(repository) : undefined, now: ctx.now }), config);
+  if (!out?.ok) {
+    fail(`TeamFlow could not send the ${facts.length} merged cards: ${out?.reason || 'the service did not answer'}.`);
+    return 1;
+  }
+  print(`TeamFlow sent ${facts.length} merged cards. The board finishes each one nobody still works on.`);
+  return 0;
+}
+
+/** Check `keys` against git and send what is merged. Returns how many facts went. */
+export async function reportMerged(keys, {
+  root, config = {}, run, aliases = core.readKeyAliases(config), repo, now = Date.now(), send = core.sendMerged,
+} = {}) {
+  const facts = mergedFacts(keys, { root, run, aliases });
+  const payload = mergedPayload(facts, { repo, now });
+  if (!payload) return { ok: true, sent: 0 };
+  const out = await send(payload, config);
+  return { ok: Boolean(out?.ok), sent: facts.length };
+}

@@ -463,6 +463,48 @@ runs.
   card. A change on the board newer than the inventory is never undone. The
   document keeps `handled` (the worktrees already noted) and is never served.
 
+### What git proves merged (MACLEOD-726)
+
+The sixth kind. Agents sent to worktrees often never report under their own
+ticket key, so the board had no proof their work landed. The machine does:
+right after each inventory the heartbeat asks its own repository which of
+the keys the inventory holds open (open plan nodes, bound worktrees, open
+agents) are merged into the default branch (`plugin/scripts/merged.mjs`).
+`teamflow reconcile --merged` asks the same question once for every key the
+board lists as open for the organisation.
+
+```text
+{ "kind": "merged", "payload": {
+    "repo": "<16-hex digest>" (optional), "at": "<ISO>",
+    "merged": [ { "key", "merged": true, "mergedAt": "<ISO>", "via": "branch" | "commit" } ] } }   (≤ 200)
+```
+
+- **One derived fact per key.** Never a branch name, a commit message, a
+  commit id, an author or a diff. `mergedAt` is when the work arrived on the
+  default branch (the first commit on its own line that holds it). `via`
+  says which evidence: a branch whose name, worktree binding or dispatched
+  agent's minted node carries the key and whose tip arrived through a merge, or a commit whose subject names
+  the key and that arrived through a merge: reachable from the default
+  branch but not on its first-parent line. A commit made straight on the
+  default branch never counts, because work in progress names its key too. A branch only created
+  from the default branch, with no work of its own, is not a merge.
+- **Local only.** git runs with no shell, fixed arguments and a timeout. A
+  key from the board is checked against a key pattern and only compared with
+  text git printed; it is never an argument to git. Branch names pass a
+  strict pattern before use.
+- **The alias applies.** An ad hoc key that became a ticket reports as the
+  ticket, on the machine and again on the service, so ADHOC-10's merge
+  counts for MACLEOD-688.
+- **Free and never queued**, like an inventory; stored under no path of its
+  own.
+- **What the service does with it** (`recover.apply_merged`): it finishes
+  the card the way a Merge step does. A MERGE move at `mergedAt` goes on the
+  card's history (the hygiene sidecar's `transitions`), its open plan nodes
+  are set done, and the card gets one History line: "Its work is merged into
+  main." Only when the card's current step then reads Done: a card already
+  finished, one somebody still works on, or one with new work after the
+  merge is left alone. Sent again, it writes nothing.
+
 ### A gate's lifecycle on the runtime sidecar (MACLEOD-639)
 
 A runtime sidecar is an execution: the same `id`, `kind`, `label`, `stage`,
@@ -1037,6 +1079,26 @@ features without the clock, so the same facts are asked once. At the bar
 (0.7), `done` and `rework` set the plan node and write one History line;
 below it the row is `mode: watch` and nothing moves. A card's
 `autonomy_off` wins over any answer.
+
+**Thinking or stuck, and show or keep (MACLEOD-726, L1 and S10).** No
+report carries anything new for these either. Both questions are on watch:
+the answer is kept and graded, and nothing acts on it. The repair pass
+marks a card a live agent holds that has said nothing for the idle band,
+and the decide job asks `progress_kind` (`thinking`, `stuck`,
+`waiting_outside`) from `status`, `gateKind` (`none` or the running gate's
+kind), `deadlineClass` (`none`, `ci`, `deploy`, `test`, `audit`),
+`livenessState` (`none` or the liveness row's state), `minutesSinceEvent`,
+`minutesSinceBeat` (0 to 10080), `eventsLastWindow` (moves and runs in the
+idle band, 0 to 1000) and `retry` (the gate's attempt, 0 to 100). Every card
+the decide job decides on that had something to decide is asked
+`should_show` (`show_now`, `keep_in_history`, `fold_into_day`) from
+`criticality`, `status`, `rework` (the open rework count), `liveOwner` and
+`autonomyOn` (flags), `workOutcome` (the last `work_outcome` answer, or
+`none`) and `minutesSinceEvent`. Never a key, a name, a title or any text;
+one organisation per slice. The rows are kept on the hygiene sidecar's
+`watchAnswers[]` (at most 12 rows of `{at, question, digest, features,
+rules, chosen, confidence, by, decider_version?}`); `digest` is the question
+and its features without the clocks, so the same facts are asked once.
 
 ### What the SERVICE writes beside a card (MACLEOD-639, WS-D)
 

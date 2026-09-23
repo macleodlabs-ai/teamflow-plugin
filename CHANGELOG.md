@@ -3,6 +3,17 @@
 What changed in each published version of the TeamFlow plugin, newest first.
 Only what a person using it would notice.
 
+## 0.3.38
+
+- **Finished work is closed from git.** When a ticket's work is merged into
+  main, the plugin tells TeamFlow, and the card closes. Only work that came in
+  through a merge counts. A commit made straight on main does not.
+- **`teamflow reconcile --merged`** does the same for cards that were left
+  open before this version. `--dry-run` lists them first.
+- **`teamflow continue status` says why** the last stop did not carry on, for
+  example "an agent this session sent out was still working".
+- An agent that moved to another ticket closes its old card.
+
 ## 0.3.37
 
 - **TeamFlow keeps your agents going.** When a session in a plan stops,

@@ -345,6 +345,40 @@ export function fingerprint(actors, runs) {
 }
 
 /** How many automatic continues this session has had, in total. */
+/**
+ * Why the last stop of a main session did not continue, in words a person
+ * reads. Without it a person who types "continue" by hand cannot tell a
+ * broken hook from one that held back on purpose (MACLEOD-726).
+ */
+export const HELD_WORDS = {
+  'background work': 'an agent this session sent out was still working',
+  'scheduled wake-up': 'the session had a wake-up set',
+  'not in a plan': "this session's ticket is in no running plan",
+  'person typing': 'you typed less than a minute before',
+  question: 'the session asked you a question',
+  error: 'the session ended on an error',
+  limit: 'a usage limit was in force',
+  'plan mode': 'the session was in plan mode',
+  'setting off': 'it is turned off',
+  'nothing to do': 'the plan had nothing for this session',
+  'nothing ready': 'no item in the plan was ready',
+  waiting: 'the work waits for other work to finish',
+  streak: 'it had already continued 5 times in a row',
+  'no change': 'nothing changed since the last time',
+  'another hook': 'another hook was keeping the session going',
+};
+
+function heldPath(sessionId) {
+  return path.join(core.dataDir(), 'continue', `${core.digest(sessionId)}.held.json`);
+}
+
+/** Keep why a main session's stop was not continued; only reasons a person can act on. */
+export function noteHeld(sessionId, why, { now = Date.now() } = {}) {
+  if (!sessionId || !HELD_WORDS[why]) return false;
+  core.writeJson(heldPath(sessionId), { why, at: new Date(now).toISOString() });
+  return true;
+}
+
 export function continuesOf(sessionId) {
   if (!sessionId) return 0;
   return Number(core.readJson(streakPath(sessionId))?.total) || 0;
@@ -414,6 +448,7 @@ export function decide(input = {}, { now = Date.now(), setting = settingOf(), re
 export function record(decision, { now = Date.now(), lock } = {}) {
   const { direction, file, held, print, streak, config } = decision;
   const at = new Date(now).toISOString();
+  if (!decision.agentKey && decision.sessionId) fs.rmSync(heldPath(decision.sessionId), { force: true });
   core.writeJson(file, {
     streak: streak + 1,
     total: (Number(held.total) || 0) + 1,
@@ -512,5 +547,7 @@ export function blockOutput(direction) {
 export function continueLine(sessionId, setting = settingOf()) {
   const said = setting === 'on' ? 'on' : setting === 'off' ? 'off' : 'on for plan runs (the default)';
   const n = continuesOf(sessionId);
-  return `${said}. ${count(n, 'automatic continue', 'automatic continues')} in this session.`;
+  const held = sessionId ? core.readJson(heldPath(sessionId)) : undefined;
+  const last = held && HELD_WORDS[held.why] ? ` At the last stop it did not continue: ${HELD_WORDS[held.why]}.` : '';
+  return `${said}. ${count(n, 'automatic continue', 'automatic continues')} in this session.${last}`;
 }

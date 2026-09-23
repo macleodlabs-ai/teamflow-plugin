@@ -22,6 +22,8 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 
 import * as core from './core.mjs';
+import { settleMovedAgents } from './dispatch.mjs';
+import { openKeys, reportMerged } from './merged.mjs';
 
 // heartbeat.mjs hands in its own row and key checks (`helpers`), so the
 // inventory and the beat say an agent the same way. They are passed in,
@@ -87,15 +89,20 @@ export function worktreeRows(trees, config, { run = git, keyOf }) {
   return rows;
 }
 
-/** Every open agent this machine has on this repository, newest first. */
-export function openAgents(roots, agentRow) {
+/** Every agent record this machine has on this repository, as written. */
+export function actorsOn(roots) {
   const dir = path.join(core.dataDir(), 'sessions');
   let names = [];
   try { names = fs.readdirSync(dir).filter((n) => n.endsWith('.json')); } catch { return []; }
   return names
     .map((name) => core.readJson(path.join(dir, name)))
-    .filter((one) => one?.agentKey && one.agent?.startedAt && !one.agent.endedAt && !one.ended && !one.absorbedInto
-      && roots.has(one.cwd))
+    .filter((one) => one?.agentKey && roots.has(one.cwd));
+}
+
+/** Every open agent this machine has on this repository, newest first. */
+export function openAgents(roots, agentRow) {
+  return actorsOn(roots)
+    .filter((one) => one.agent?.startedAt && !one.agent.endedAt && !one.ended && !one.absorbedInto)
     .sort((a, b) => (Date.parse(b.updatedAt) || 0) - (Date.parse(a.updatedAt) || 0))
     .map(agentRow)
     .filter(Boolean)
@@ -179,10 +186,27 @@ export function buildInventory({
 }
 
 /** Build and send one inventory. Never throws. */
-export async function sendInventory({ cwd = process.cwd(), send = core.sendInventory, ...rest }) {
+export async function sendInventory({
+  cwd = process.cwd(), send = core.sendInventory, sendMerged = core.sendMerged, settle = settleMovedAgents, ...rest
+}) {
   try {
     const config = core.loadConfig(cwd);
-    return await send(buildInventory({ cwd, config, ...rest }), config);
+    const inventory = buildInventory({ cwd, config, ...rest });
+    const out = await send(inventory, config);
+    // The same pass asks git which of those keys are merged (MACLEOD-726).
+    try {
+      await reportMerged(openKeys(inventory), {
+        root: core.repositoryRoot(cwd), config, run: rest.run, repo: inventory.repo, now: rest.now, send: sendMerged,
+      });
+    } catch { /* the next pass is twenty minutes away */ }
+    // An agent that moved to another ticket and then went quiet never
+    // settles its own node; this pass does it for it (MACLEOD-713).
+    try {
+      const root = core.repositoryRoot(cwd);
+      const roots = new Set([root, ...worktreesOf(root, { run: rest.run }).map((t) => t.path)]);
+      await settle(config, { actors: actorsOn(roots) });
+    } catch { /* the next pass is twenty minutes away */ }
+    return out;
   } catch {
     return { ok: false };
   }

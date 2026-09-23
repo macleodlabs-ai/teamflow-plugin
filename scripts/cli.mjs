@@ -92,7 +92,10 @@ const USAGE = `teamflow \u2014 delivery reporting for TeamFlow
   teamflow sync                    publish the current state now
   teamflow tidy [--dry-run]        repair every divergence between the runs, the
                                    cards, the executions and the trackers
-  teamflow doctor                  transport, account, tracker MCP and connections
+  teamflow reconcile --merged [--dry-run]
+                                   finish the open cards whose work this
+                                   repository shows merged into main
+  teamflow doctor                 transport, account, tracker MCP and connections
   teamflow config set intake on|off
                                    whether this machine shows fixes a lead writes
                                    on your ticket (on by default)
@@ -1018,6 +1021,12 @@ try {
       // (MACLEOD-603), so this end only prints them.
       announce: (lines) => { for (const line of lines) print(line); },
     })));
+  }
+  else if (command === 'reconcile') {
+    // What this repository proves merged, for every open card on the board
+    // (MACLEOD-726). Keys from the board are only compared, never run.
+    const { main } = await import('./merged.mjs');
+    process.exit(await main(args, { cwd, config }));
   }
   else if (command === 'config') {
     // `teamflow config set intake on|off`: whether this machine takes

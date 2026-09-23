@@ -13,7 +13,7 @@
 // Any error prints nothing a tool could act on and exits 0: the session
 // stops as it always did.
 import { failOpen, readStdin } from './hook-core.mjs';
-import { blockOutput, decide, logDirection, noteDirection, record, recordWait, runsFor, watch } from './continue.mjs';
+import { blockOutput, decide, logDirection, noteDirection, noteHeld, record, recordWait, runsFor, watch } from './continue.mjs';
 import { loadConfig, readJson, sessionActors, sessionPath } from './core.mjs';
 import { acquireLock, runsLockPath } from './dispatch.mjs';
 
@@ -40,6 +40,7 @@ await failOpen(async () => {
   }
   const decision = decide(input);
   if (!decision.continue) {
+    if (input.hook_event_name === 'Stop') noteHeld(input.session_id, decision.why);
     // Nothing ready, or waiting: what it waits for goes in the run's log.
     if (decision.direction) logDirection(decision.direction, decision.config, { lock });
     if (decision.direction?.kind === 'wait') {

@@ -49,8 +49,9 @@
 import { currentBinding, mint, TITLE_MAX, TRACKER } from './adhoc.mjs';
 import { title } from './words.mjs';
 import {
-  agentLabel, dataDir, isAdHocKey, isAgentTool, isWorkflowTool, issuePayload, launchesPath, launchFields, organisationScope,
-  readJson, readWorkflows, reportScope, sendReport, sessionActors, workflowsPath, writeJson, writeWorkflows,
+  agentLabel, dataDir, followKeyAliases, isAdHocKey, isAgentTool, isWorkflowTool, issuePayload, launchesPath, launchFields,
+  organisationScope, readJson, readWorkflows, reportScope, saveSession, sendReport, sessionActors, workflowsPath, writeJson,
+  writeWorkflows,
 } from './core.mjs';
 import { projectFor, projectsCachePath } from './project.mjs';
 import { launchRole, roleBlock } from './launch-role.mjs';
@@ -535,6 +536,39 @@ export async function closeDispatched(config, { key, was, outcome = 'done', note
   } catch {
     return undefined;
   }
+}
+
+/**
+ * The move a dispatched agent's own next event would settle, settled by
+ * the heartbeat's inventory pass instead (MACLEOD-726, MACLEOD-713).
+ *
+ * An agent that reported under its minted node and was then bound to
+ * another ticket (`work-on`) moves the node to `skipped, moved to KEY`
+ * on its next hook event. An agent that goes quiet, or finishes before
+ * another event, never sends one, so its node stayed `running` on the
+ * board, and its heartbeat row names the new ticket, not the card its
+ * node holds. Only actors whose node is still unsettled are touched;
+ * the alias is followed first, so a node converted to a ticket closes
+ * too. Returns how many moved.
+ */
+export async function settleMovedAgents(config, { actors = [], close = closeDispatched } = {}) {
+  let settled = 0;
+  for (const held of actors) {
+    const dispatch = held?.dispatch;
+    if (!held?.agentKey || !held.sessionId || !dispatch?.key || dispatch.nested || !dispatch.bound
+      || dispatch.moved || held.ended) continue;
+    const state = { ...held, dispatch: { ...dispatch }, binding: held.binding ? { ...held.binding } : undefined };
+    followKeyAliases(state, undefined, config);
+    const to = state.binding?.key;
+    if (!to || to === state.dispatch.key) continue;
+    const moved = await close(config, {
+      key: state.dispatch.key, was: state.dispatch.was, outcome: 'skipped', note: `moved to ${to}`, movedTo: to,
+    });
+    if (!moved) continue;
+    saveSession({ ...held, dispatch: { ...state.dispatch, moved: true } });
+    settled += 1;
+  }
+  return settled;
 }
 
 /** A launch with what was minted for it, as status and the agent's binding read it. */
