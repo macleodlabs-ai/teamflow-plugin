@@ -70,7 +70,12 @@ export function dispatchOf(event, input = {}) {
   // first event; Bash after it ran, on the async path, because a
   // synchronous hook on every shell command is a cost every command
   // would pay and neither of these needs to be first.
-  if (event === 'PreToolUse' && isAgentTool(tool)) {
+  //
+  // The `Agent` tool's PostToolUse too (MACLEOD-640): its PreToolUse has
+  // two seconds and a busy machine can miss them, and then the launch
+  // was never recorded and `status` said "0 agents dispatched". The hook
+  // plans on PostToolUse only a launch its PreToolUse did not record.
+  if ((event === 'PreToolUse' || event === 'PostToolUse') && isAgentTool(tool)) {
     const given = input.tool_input || {};
     return {
       kind: 'agent',

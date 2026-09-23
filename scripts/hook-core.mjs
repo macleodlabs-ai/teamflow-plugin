@@ -280,7 +280,9 @@ export function withAgentIdentity(event, input, state, sessionId, agentKey, laun
     return launch ? { ...state, launched: true } : state;
   }
   if (event === 'PostToolUse' && isAgentTool(tool) && !agentKey) {
-    claimLaunch(sessionId, parseAgentId(input.tool_response), input.tool_input?.subagent_type);
+    // Planned just now because the PreToolUse recorded nothing (MACLEOD-640).
+    if (state.represented) recordLaunch(sessionId, input.tool_input || {}, undefined, state.represented, input.tool_use_id);
+    claimLaunch(sessionId, parseAgentId(input.tool_response), input.tool_input?.subagent_type, input.tool_use_id);
     return { ...state, launched: true };
   }
   // An agent launching an agent (MACLEOD-639): recorded like the
@@ -291,7 +293,8 @@ export function withAgentIdentity(event, input, state, sessionId, agentKey, laun
     return state;
   }
   if (event === 'PostToolUse' && isAgentTool(tool) && agentKey && state.agent) {
-    claimLaunch(sessionId, parseAgentId(input.tool_response), input.tool_input?.subagent_type);
+    if (state.represented) recordLaunch(sessionId, input.tool_input || {}, state.agent.id, state.represented, input.tool_use_id);
+    claimLaunch(sessionId, parseAgentId(input.tool_response), input.tool_input?.subagent_type, input.tool_use_id);
     return state;
   }
   if (!agentKey) return state;
@@ -648,7 +651,14 @@ export async function handleEvent(input = {}) {
   // session itself, or a named agent launching another. An unnamed
   // actor's launch is not recorded, so a node minted for it would be
   // nobody's.
-  const dispatching = !agentKey || state.agent ? dispatchOf(event, resolved) : undefined;
+  let dispatching = !agentKey || state.agent ? dispatchOf(event, resolved) : undefined;
+  // An `Agent` PostToolUse is a dispatch only when its PreToolUse left no
+  // launch for this tool call (MACLEOD-640); a payload with no call id
+  // cannot be told from one that did, so it records nothing twice.
+  if (dispatching?.kind === 'agent' && event === 'PostToolUse'
+      && (!input.tool_use_id || findLaunch(sessionId, launchId(input.tool_use_id)))) {
+    dispatching = undefined;
+  }
   if (dispatching) {
     const shown = planLaunch(config, {
       state, dispatch: dispatching, cwd, info, nested: Boolean(agentKey && state.agent),

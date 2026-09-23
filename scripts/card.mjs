@@ -116,7 +116,7 @@ export function cardFor(ticket = {}) {
       stage,
       status: 'success',
       summary: stage === 'DEV_VERIFIED'
-        ? 'Verified by the run'
+        ? 'Done in the plan'
         : `Past the ${where}`,
     };
   }

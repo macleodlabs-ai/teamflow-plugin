@@ -3,6 +3,19 @@
 What changed in each published version of the TeamFlow plugin, newest first.
 Only what a person using it would notice.
 
+## 0.3.31
+
+- **Merged work reaches Done.** When you merge a branch, the tickets of the
+  work it brings in are marked merged: the ticket the merged worktree was
+  working on, and the ticket keys in its commits. Ad hoc work merged from
+  another session no longer stays stuck at its last step.
+- **Dispatched agents show on the board.** `teamflow status` counts the agents
+  a session sends out, and each one joins the run you are working in.
+- **Your runs stay where you left them.** Runs and bindings made from the
+  command line before this version move, once, to where the plugin keeps its
+  data. Nothing already there is overwritten.
+- **Plans say "Done in the plan"** instead of "Verified by the run".
+
 ## 0.3.30
 
 - **Playwright videos go on the ticket.** When your organisation's Playwright

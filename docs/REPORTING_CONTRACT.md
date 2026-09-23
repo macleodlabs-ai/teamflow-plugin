@@ -508,7 +508,7 @@ team. It is off for every connection until somebody turns it on
 **Exactly one sentence leaves the machine, and this is it:**
 
 ```
-Verified on dev by TeamFlow at <updatedAt>: <summary>
+Deployed to dev by TeamFlow at <updatedAt>: <summary>
 Delivered by TeamFlow at <updatedAt>: <summary>
 ```
 
@@ -769,7 +769,7 @@ Three service-owned files, none of which a reporter can write. Each names its wr
 
 **`issues/<KEY>/hygiene.json` — the reserved `hygiene` slot.** In `RESERVED_SLOTS` beside `tracker` and `pr`, so `POST /v1/report` refuses it (`reserved_slot`). Written by the nightly sweep (`delivery.sweep`, adapters/teamflow/hygiene.py) and by the card routes below, always under the ETag that was read, so a report or a delivery that lands in between makes the write a refused row rather than a lost update. It holds, per key:
 
-- `hygiene[] {at, action, by, role, reason, note?}` capped at 20. `by` is a member's address or `teamflow` for the sweep; `role` is `owner`, `member`, `viewer` or `service`; `reason` is one of `no_verdict | superseded | owner_request | deadline | tracker_done | snooze | ping | action | note | refused`; `note` is ≤ 120 characters through the one-line sanitiser. Recent Activity and a card's History print these rows.
+- `hygiene[] {at, action, by, role, reason, note?, kind?}` capped at 20. `action` and `note` are plain words for people and may be reworded; code matches `reason` and `kind` (`closed`: a run was stopped; absent on rows stored before MACLEOD-640, which read "closed …"). A run the sweep stopped for want of an answer carries `closedReason: "no_result"` beside its summary "No result after N". `by` is a member's address or `teamflow` for the sweep; `role` is `owner`, `member`, `viewer` or `service`; `reason` is one of `no_verdict | superseded | owner_request | deadline | tracker_done | snooze | ping | action | note | refused`; `note` is ≤ 120 characters through the one-line sanitiser. Recent Activity and a card's History print these rows.
 - `attention[] {key, rule, by, kind, snoozedUntil?, pingedAt?, escalatedBy?}` capped at 16 — org-visible marks so two leads do not chase one card. `kind` is `snooze | ping | escalate | action`, one mark per (rule, kind), so a ping never replaces a snooze; `rule` is one line of at most 40 characters, refused before anything is mailed; `escalatedBy` names who escalated when the developer was told by somebody else. Also served flat as the bundle's `attention[]`.
 - `decisions[]` and `policy` (WS-K, below) ride on the same sidecar and every hygiene writer keeps them.
 - `transitions[] {stage, at, by}` — the stage moves the SERVICE observed (a tracker's Done, a pull request event, the sweep's own migration), kept apart from the plugin's list on the issue document and merged at read.

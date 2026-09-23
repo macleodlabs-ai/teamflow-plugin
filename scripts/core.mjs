@@ -394,8 +394,117 @@ function mergeConfig(...configs) {
 }
 
 export function dataDir() {
-  return process.env.CLAUDE_PLUGIN_DATA ||
-    path.join(userHome(), '.local', 'share', 'teamflow');
+  return process.env.CLAUDE_PLUGIN_DATA
+    || (process.env.TEAMFLOW_TEST_SANDBOX ? undefined : claudePluginData(process.env))
+    || path.join(userHome(), '.local', 'share', 'teamflow');
+}
+
+let pluginDataSeen = {};
+
+/**
+ * The directory Claude Code gives this plugin's hooks, for a process
+ * Claude Code started without telling it (MACLEOD-640).
+ *
+ * Claude Code sets CLAUDE_PLUGIN_DATA for a plugin's hooks and not for
+ * its Bash tool, so `node cli.mjs status` run by the session that
+ * dispatched three agents read ~/.local/share/teamflow while the hooks
+ * had recorded the launches under <config>/plugins/data/teamflow-*: it
+ * said "0 agents dispatched", and the lead's `workflow create` went into
+ * one file while the dispatched agents went into an older auto run in
+ * the other. Only inside Claude Code (CLAUDECODE=1), so another tool's
+ * hooks keep the directory they always had; the newest such directory
+ * when a person has installed the plugin from two marketplaces.
+ * Never inside the test sandbox, where CLAUDE_CONFIG_DIR is the real one.
+ */
+export function claudePluginData(env = {}) {
+  if (env.CLAUDECODE !== '1') return undefined;
+  const root = path.join(env.CLAUDE_CONFIG_DIR || path.join(userHome(), '.claude'), 'plugins', 'data');
+  // Asked on every path this process builds, so answered once per root.
+  if (pluginDataSeen.root === root) return pluginDataSeen.dir;
+  let dir;
+  try {
+    dir = fs.readdirSync(root)
+      .filter((name) => /^teamflow-[\w.-]+$/.test(name))
+      .map((name) => ({ dir: path.join(root, name), at: fs.statSync(path.join(root, name)).mtimeMs }))
+      .sort((a, b) => b.at - a.at)[0]?.dir;
+  } catch { /* no plugin data here: the old directory answers */ }
+  pluginDataSeen = { root, dir };
+  if (dir) adoptOldData(path.join(userHome(), '.local', 'share', 'teamflow'), dir);
+  return dir;
+}
+
+const ADOPTED = '.adopted-local-share';
+
+/**
+ * Once, bring what the CLI wrote to the old directory into the plugin's
+ * (MACLEOD-640). Before the fix above, commands run from Claude Code's Bash
+ * tool wrote runs and bindings to ~/.local/share/teamflow while the hooks
+ * used the plugin directory; reading only the plugin's now would lose those
+ * runs. Files the plugin directory lacks are copied; the two run files are
+ * merged by run id, the newer copy of a run winning, and each organisation's
+ * current run is the one a person made over one the plugin made, else the
+ * one touched last. Nothing already in
+ * the plugin directory is overwritten otherwise. A marker makes it once.
+ * Never throws: at worst the old runs stay where they were.
+ */
+export function adoptOldData(oldDir, newDir) {
+  try {
+    if (!oldDir || !newDir || path.resolve(oldDir) === path.resolve(newDir)) return false;
+    if (fs.existsSync(path.join(newDir, ADOPTED)) || !fs.existsSync(oldDir)) return false;
+    const walk = (rel) => {
+      for (const entry of fs.readdirSync(path.join(oldDir, rel), { withFileTypes: true })) {
+        const from = path.join(oldDir, rel, entry.name);
+        const to = path.join(newDir, rel, entry.name);
+        if (entry.isDirectory()) { walk(path.join(rel, entry.name)); continue; }
+        if (!entry.isFile()) continue;
+        if (!fs.existsSync(to)) {
+          fs.mkdirSync(path.dirname(to), { recursive: true });
+          fs.copyFileSync(from, to);
+        } else if (rel === '' && entry.name === 'workflows.json') {
+          fs.writeFileSync(to, JSON.stringify(mergeRunFiles(readJsonFile(to), readJsonFile(from)), null, 2), { mode: 0o600 });
+        }
+      }
+    };
+    walk('');
+    fs.writeFileSync(path.join(newDir, ADOPTED), new Date().toISOString());
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function readJsonFile(file) {
+  try { return JSON.parse(fs.readFileSync(file, 'utf8')); } catch { return {}; }
+}
+
+const stampOf = (run) => Date.parse(run?.updatedAt || run?.createdAt || '') || 0;
+
+/** Two run files, one per organisation: runs joined by id, the newer copy of each, the latest current run. */
+export function mergeRunFiles(kept, other) {
+  const out = { ...(kept || {}) };
+  for (const [tenant, theirs] of Object.entries(other || {})) {
+    const mine = out[tenant];
+    if (!mine || typeof mine !== 'object') { out[tenant] = theirs; continue; }
+    const list = (held) => (Array.isArray(held?.workflows) ? held.workflows : Object.values(held?.workflows || {}));
+    const byId = new Map();
+    for (const run of [...list(mine), ...list(theirs)]) {
+      if (!run?.id) continue;
+      const seen = byId.get(run.id);
+      if (!seen || stampOf(run) > stampOf(seen)) byId.set(run.id, run);
+    }
+    const runs = [...byId.values()];
+    const currentOf = (held) => runs.find((run) => run.id === held?.current);
+    const a = currentOf(mine);
+    const b = currentOf(theirs);
+    // A run somebody made wins over one the plugin made for them; otherwise the newer.
+    const byPerson = (run) => (run?.origin === 'auto' ? 0 : 1);
+    const pick = a && b
+      ? (byPerson(a) !== byPerson(b) ? (byPerson(a) > byPerson(b) ? a : b) : (stampOf(b) > stampOf(a) ? b : a))
+      : (a || b);
+    const current = pick?.id ?? mine.current ?? theirs.current;
+    out[tenant] = { ...mine, workflows: Array.isArray(mine.workflows) ? runs : Object.fromEntries(runs.map((run) => [run.id, run])), current };
+  }
+  return out;
 }
 
 export function projectId(cwd) {
@@ -1753,15 +1862,23 @@ function pruneLaunches(sessionId) {
  * actually has to work.
  */
 export function parseAgentId(response) {
+  // A background launch answers with an object (`{ status:
+  // 'async_launched', agentId, … }`) rather than text, whose JSON puts a
+  // quote on each side of the colon (MACLEOD-640).
   const text = typeof response === 'string' ? response : JSON.stringify(response ?? '');
-  return /(?:^|[^A-Za-z])agentId:\s*([A-Za-z0-9_-]{1,80})/.exec(text)?.[1];
+  return /(?:^|[^A-Za-z])agentId"?:\s*"?([A-Za-z0-9_-]{1,80})/.exec(text)?.[1];
 }
 
 /** Attach an id to the newest launch that has none, so a Start can find it by id. */
-export function claimLaunch(sessionId, agentId, type = undefined) {
+export function claimLaunch(sessionId, agentId, type = undefined, toolUseId = undefined) {
   if (!agentId) return undefined;
-  const candidates = launchFiles(sessionId)
-    .filter((entry) => !isClaimed(entry.name))
+  const unclaimed = launchFiles(sessionId).filter((entry) => !isClaimed(entry.name));
+  // The launch of this very tool call, when the payload names it
+  // (MACLEOD-640): three agents dispatched at once are three PostToolUse
+  // events in any order, and "the newest" would swap their names.
+  const own = toolUseId ? unclaimed.find((entry) => entry.name === `${launchId(toolUseId)}.json`) : undefined;
+  if (own) return claimFile(own, agentId);
+  const candidates = unclaimed
     .filter((entry) => !type || !entry.launch.type || entry.launch.type === type)
     .reverse();                              // newest first: this is the one just started
   for (const entry of candidates) {
@@ -2144,7 +2261,10 @@ export function mergeSources(command) {
   if (!found) return [];
   const takesValue = new Set(['-m', '-s', '-X', '-S', '-F',
     '--strategy', '--strategy-option', '--message', '--file', '--gpg-sign', '--into-name']);
-  const tokens = found[1].trim().split(/\s+/).filter(Boolean);
+  // A quoted message is one token (MACLEOD-640): `-m "merge: copy for
+  // DEMO-7"` split on spaces made `copy`, `for` and `DEMO-7"` refs, and
+  // a key named only in the message a merged branch.
+  const tokens = found[1].match(/"[^"]*"?|'[^']*'?|\S+/g) || [];
   const sources = [];
   for (let i = 0; i < tokens.length; i += 1) {
     const token = tokens[i];
@@ -2218,6 +2338,85 @@ export function mergedBranchKey(command) {
   }
   if (keys.size !== 1) return undefined;
   return { key: [...keys][0], branch: String(branch).slice(0, 200) };
+}
+
+/*
+ * May a merge be credited to this key? (MACLEOD-640.) A key TeamFlow
+ * minted always may: it is nobody's release branch. Any other `WORD-1`
+ * is a key by shape only — `git merge hotfix-3`, "bump next-15" — so it
+ * must be of the bound ticket's own project, or of a prefix this machine
+ * already knows (the configured prefixes, the tickets of its runs):
+ * a merge never puts on the board a card no tracker of this organisation
+ * holds. A GitHub tenant's keys are `repo#N`, which neither a branch nor
+ * this rule reads, so only its ad hoc keys are credited.
+ */
+function creditable(key, state = {}, config = {}) {
+  if (isAdHocKey(key)) return true;
+  const tracker = state.binding?.tracker || trackerOf(config);
+  if (tracker === 'github') return false;
+  if (state.binding?.key && issueProject(key, tracker) === issueProject(state.binding.key, tracker)) return true;
+  const seen = [];
+  try {
+    for (const workflow of Object.values(readWorkflows(config).workflows)) {
+      for (const ticket of workflow.tickets || []) seen.push(ticket.key);
+    }
+  } catch { /* an unreadable runs file teaches nothing */ }
+  return Boolean(knownPrefixes(config, seen)?.has(key.split('-')[0].toUpperCase()));
+}
+
+// At most this many tickets are credited by one merge.
+const MERGE_KEYS_MAX = 20;
+
+/**
+ * The tickets whose work a successful `git merge` just landed on the
+ * trunk (MACLEOD-640).
+ *
+ * Twenty ad hoc cards sat at their last step because nothing ever
+ * reported their merge: the main session merges agent branches named
+ * `worktree-agent-…`, which carry no key, and a key of another project
+ * than the session's was dropped. The work says whose it is in two
+ * places, and both are read: the keys its commit messages name, over
+ * exactly the range this merge moved HEAD (the reflog entry it wrote,
+ * so a merge that was already up to date credits nothing), and the
+ * binding a worktree of this repository holds for the merged branch.
+ *
+ * On the trunk only: a merge into a work branch is a sync, not a
+ * delivery. Keys only, never a message: nothing read here is kept.
+ * Capped, deduplicated, and empty on any error.
+ */
+export function landedKeys(command, input = {}, state = {}, config = {}) {
+  try {
+    const cwd = input.cwd;
+    if (!cwd || /already up[ -]to[ -]date/i.test(JSON.stringify(input.tool_response ?? ''))) return [];
+    const trunks = new Set([...TRUNK_NAMES, defaultBranchName(cwd, config)]);
+    if (!trunks.has(git(cwd, ['branch', '--show-current']).stdout.trim())) return [];
+    const sources = mergeSources(command);
+    // The entry this merge wrote reads `merge <ref>: …`.
+    const moved = git(cwd, ['reflog', '-1', '--format=%gs']).stdout.trim();
+    if (!/^merge /.test(moved) || (sources.length && !sources.some((ref) => moved.startsWith(`merge ${ref}:`)))) return [];
+    const found = new Map();
+    const note = (key, branch) => {
+      if (key && !found.has(key) && found.size < MERGE_KEYS_MAX) found.set(key, { key, branch });
+    };
+    // The merged worktree's own binding: a person's or a dispatch's word.
+    const worktrees = git(cwd, ['worktree', 'list', '--porcelain']).stdout.split(/\n\n+/);
+    for (const block of worktrees) {
+      const dir = /^worktree (.+)$/m.exec(block)?.[1];
+      const branch = /^branch refs\/heads\/(.+)$/m.exec(block)?.[1];
+      if (dir && branch && sources.includes(branch)) {
+        note(normalizeIssueKey(readJson(localBindingPath(dir))?.jiraKey), branch);
+      }
+    }
+    const branch = sources.length === 1 ? String(sources[0]).slice(0, 200) : undefined;
+    const log = git(cwd, ['log', '--format=%B', '-n', '200', 'HEAD@{1}..HEAD']).stdout;
+    for (const match of log.matchAll(ISSUE_ALL_RE)) {
+      const key = match[1].toUpperCase();
+      if (creditable(key, state, config)) note(key, branch);
+    }
+    return [...found.values()];
+  } catch {
+    return [];
+  }
 }
 
 /**
@@ -3117,6 +3316,11 @@ export function classifyTool(input, state, config) {
     // is the bound ticket's own (MACLEOD-639).
     if (PR_MERGE_RE.test(command)) return MERGED;
     const merged = mergedBranchKey(command);
+    // The other tickets whose work this merge landed (MACLEOD-640),
+    // credited beside whichever ticket the merge itself is.
+    const skip = new Set([state.binding?.key, merged?.key]);
+    const landed = landedKeys(command, input, state, config).filter((one) => !skip.has(one.key));
+    const also = landed.length ? { alsoFor: landed } : {};
     /*
      * The merged branch names another ticket: that ticket is the one
      * merged, not the one this session is bound to. The transition is
@@ -3126,19 +3330,19 @@ export function classifyTool(input, state, config) {
      */
     if (merged && state.binding?.key && merged.key !== state.binding.key) {
       /*
-       * Only a key of the bound ticket's own project. Any `WORD-1` in a
-       * branch name is a key by shape — `git merge hotfix-3` would
+       * Only a key `creditable` allows: of the bound ticket's own
+       * project, of a prefix this machine knows, or ad hoc. Any `WORD-1`
+       * in a branch name is a key by shape — `git merge hotfix-3` would
        * otherwise put a HOTFIX-3 card on the board that no tracker
        * holds — and a GitHub tenant's keys are `repo#N`, which a branch
-       * name never carries, so nothing is attributed there rather than
-       * a ghost.
+       * name never carries, so nothing but an ad hoc key is attributed
+       * there rather than a ghost.
        */
-      const tracker = state.binding.tracker || trackerOf(config);
-      const same = tracker !== 'github'
-        && issueProject(merged.key, tracker) === issueProject(state.binding.key, tracker);
-      if (same) return { stage: 'MERGE', status: 'success', summary: 'Merged', forKey: merged.key, forBranch: merged.branch };
+      if (creditable(merged.key, state, config)) {
+        return { stage: 'MERGE', status: 'success', summary: 'Merged', forKey: merged.key, forBranch: merged.branch, ...also };
+      }
     }
-    return MERGED;
+    return { ...MERGED, ...also };
   }
 
   if (PR_RE.test(command)) {
@@ -3194,7 +3398,9 @@ const WAITING_ON = new Set(['review', 'ci', 'deploy', 'human', 'dependency']);
 const REWORK_MAX = 16;
 const REWORK_SUMMARY_MAX = 120;
 const TRANSITIONS_MAX = 32;
-const ATTRIBUTIONS_MAX = 8;
+// One merge may credit MERGE_KEYS_MAX tickets; the rest is room for a
+// second merge before the next publish sends them.
+const ATTRIBUTIONS_MAX = 24;
 // After either of these a ticket's loops are over: the next failure
 // starts a new cycle and counts from one.
 const CYCLE_CLOSING_STAGES = new Set(['DEV_VERIFIED', 'DONE']);
@@ -3316,6 +3522,34 @@ export function refreshReworkCycle(state, config = {}) {
   return state;
 }
 
+/*
+ * The reports a transition owes other tickets: `forKey`, the ticket a
+ * merged branch is named for, and `alsoFor`, the tickets whose work the
+ * merge landed (MACLEOD-640). One entry per key, newest wins; nothing
+ * at all when the transition owes none.
+ */
+function attributionsAfter(state, transition, at) {
+  const credits = [
+    ...(transition.forKey ? [{ key: transition.forKey, branch: transition.forBranch }] : []),
+    ...(transition.alsoFor || []),
+  ];
+  if (!credits.length) return {};
+  const keys = new Set(credits.map((one) => one.key));
+  const others = (state.attributions || []).filter((one) => !keys.has(one.key));
+  const by = actedBy(state);
+  return {
+    attributions: [...others, ...credits.map((one) => ({
+      key: one.key,
+      branch: one.branch,
+      stage: transition.stage,
+      status: transition.status,
+      summary: transition.summary,
+      at,
+      by,
+    }))].slice(-ATTRIBUTIONS_MAX),
+  };
+}
+
 export function applyTransition(state, transition) {
   if (!transition) return state;
   const updatedAt = new Date().toISOString();
@@ -3325,26 +3559,14 @@ export function applyTransition(state, transition) {
    * ticket moves nowhere; the merged ticket's report is carried by the
    * next publish. One entry per key, newest wins.
    */
-  if (transition.forKey) {
-    const others = (state.attributions || []).filter((one) => one.key !== transition.forKey);
-    return {
-      ...state,
-      attributions: [...others, {
-        key: transition.forKey,
-        branch: transition.forBranch,
-        stage: transition.stage,
-        status: transition.status,
-        summary: transition.summary,
-        at: updatedAt,
-        by: actedBy(state),
-      }].slice(-ATTRIBUTIONS_MAX),
-    };
-  }
+  const credited = attributionsAfter(state, transition, updatedAt);
+  if (transition.forKey) return { ...state, ...credited };
   const cleared = clearsRework(state, transition);
   const evidence = transition.evidence?.length ? transition.evidence : state.evidence;
   const history = withHistory(state, transition, updatedAt, cleared);
   return {
     ...state,
+    ...credited,
     stage: transition.stage || state.stage,
     status: transition.status || state.status,
     summary: transition.summary || state.summary,
