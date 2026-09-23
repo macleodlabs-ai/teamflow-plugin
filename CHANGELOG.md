@@ -3,6 +3,10 @@
 What changed in each published version of the TeamFlow plugin, newest first.
 Only what a person using it would notice.
 
+## 0.3.35
+
+- **Trial ended** links to the new pricing page, https://codercat.io/pricing/.
+
 ## 0.3.34
 
 - **Trial ended.** When a trial ends, the plugin says so and links to the
