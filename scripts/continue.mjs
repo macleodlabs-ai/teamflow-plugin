@@ -23,8 +23,9 @@
 // - the last turn did not end with a question to the person;
 // - nobody typed in the last minute (the person is driving);
 // - no usage limit is in force, and the turn did not end on an error;
-// - nothing is running in the background, and the session is not in
-//   plan mode;
+// - the session is not in plan mode. While its own agents still run in
+//   the background, it continues only with a ready plan item that none
+//   of them holds (the owner's ruling, 2026-09-23);
 // - at most five in a row, and never twice with no change in the work;
 // - Claude Code's `stop_hook_active`: set by another hook's block, this
 //   one does not stack on it.
@@ -37,6 +38,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 
 import * as core from './core.mjs';
+import { launchesOf } from './dispatch.mjs';
 import { keyOf, pauseOf } from './heartbeat.mjs';
 import { STEP } from './resume.mjs';
 import { BRANCH } from './workflow.mjs';
@@ -141,7 +143,7 @@ function checkWord(stage) {
  * `waiting` direction that says what blocks it; it is logged, never sent
  * as a continue, because there is nothing to do but wait.
  */
-export function directionFor(actor, { runs = [], steps = {}, subagent = false } = {}) {
+export function directionFor(actor, { runs = [], steps = {}, subagent = false, skip = new Set() } = {}) {
   const key = keyOf(actor?.binding?.key);
   const run = runs.find((r) => key && (r.tickets || []).some((t) => t.key === key)) || runs[0];
   const node = key ? run?.tickets?.find((t) => t.key === key) : undefined;
@@ -160,11 +162,14 @@ export function directionFor(actor, { runs = [], steps = {}, subagent = false } 
     const step = stepOf(steps[key] || actor.stage);
     return { kind: 'finish', key, run, reason: `TeamFlow: carry on with ${key}${step ? ` at ${step}` : ''}. Its item in the plan '${plan}' is not done. When it is done, mark it done in the plan. ${itemsLeft(leftOf(run))}` };
   }
-  const { phase, open: ready } = readyOf(run);
+  const { phase, open: inPhase } = readyOf(run);
+  const ready = inPhase.filter((t) => !skip.has(t.key));
   if (ready.length) {
     const next = ready[0];
     const step = stepOf(steps[next.key]);
-    const why = next.state === 'rework' ? 'it failed a check and goes first' : `it is first in phase ${phase.n} of the plan`;
+    const first = next === inPhase[0];
+    const why = next.state === 'rework' ? `it failed a check and goes ${first ? 'first' : 'next'}`
+      : first ? `it is first in phase ${phase.n} of the plan` : `it is the next free item in phase ${phase.n} of the plan`;
     return { kind: 'next', key: next.key, run, reason: `TeamFlow: continue with the plan '${plan}'. Next is ${next.key}${step ? ` at ${step}` : ''}, because ${why}. ${itemsLeft(leftOf(run))}` };
   }
   if (!leftOf(run)) return undefined;
@@ -404,8 +409,8 @@ export function decide(input = {}, { now = Date.now(), setting = settingOf(), re
   if (endedOnError(input.last_assistant_message)) return no('error');
   const paused = pauseOf(sessionId, now);
   if (paused && now < Date.parse(paused.until)) return no('limit');
-  if ((input.background_tasks || []).some((t) => !['completed', 'failed', 'killed', 'stopped'].includes(String(t?.status)))) return no('background work');
-  if ((input.session_crons || []).length) return no('scheduled wake-up');
+  const busy = (input.background_tasks || []).some((t) => !['completed', 'failed', 'killed', 'stopped'].includes(String(t?.status)));
+  if ((input.session_crons || []).length) return no(busy ? 'background work' : 'scheduled wake-up');
 
   const agentKey = subagent ? String(input.agent_id || '').trim().slice(0, 80) : undefined;
   if (subagent && !agentKey) return no('no agent');
@@ -428,9 +433,23 @@ export function decide(input = {}, { now = Date.now(), setting = settingOf(), re
   // that is done, and when it is not, record what it waits for.
   const waited = waitOf(actor, runs, { main, subagent, now, remoteHead, paused });
   if (waited && !waited.over) return no('waiting', { direction: waited.direction, agentKey, config });
-  const direction = waited?.direction || directionFor(actor, { runs, steps, subagent });
-  if (!direction) return no('nothing to do');
-  if (direction.kind === 'waiting') return no('nothing ready', { direction, config });
+  let direction;
+  if (busy) {
+    // Background work still runs (the owner's ruling, 2026-09-23): go on
+    // only with plan work that nothing of this session holds, never with
+    // the session's own ticket, which its agent may be working on.
+    const holds = heldOf(sessionId, runs);
+    const start = waited?.direction;
+    // A start is the actor's own key: held when anything but the actor holds it.
+    if (start && heldOf(sessionId, runs, agentKey || '').keys.has(start.key)) return no('background work');
+    direction = start || directionFor(actor, { runs, steps, subagent, skip: holds.keys });
+    if (!direction || !['next', 'start'].includes(direction.kind)) return no('background work');
+    direction = { ...direction, reason: direction.reason.replace(/^TeamFlow: /, `TeamFlow: ${stillRunning(holds.agents)} Meanwhile, `) };
+  } else {
+    direction = waited?.direction || directionFor(actor, { runs, steps, subagent });
+    if (!direction) return no('nothing to do');
+    if (direction.kind === 'waiting') return no('nothing ready', { direction, config });
+  }
 
   const file = streakPath(sessionId, agentKey);
   const held = core.readJson(file) || {};
@@ -442,6 +461,33 @@ export function decide(input = {}, { now = Date.now(), setting = settingOf(), re
   if (streak >= STREAK_MAX) return no('streak');
   if (input.stop_hook_active && held.last?.print === print) return no('no change');
   return { continue: true, direction, file, held, print, streak, config, sessionId, agentKey };
+}
+
+/**
+ * The plan items this session holds while its background work runs: a
+ * key any live actor of the session is bound to, a node whose state is
+ * running, or a key a dispatch record of the session points at. `agents`
+ * is what its agents work on, for the words. `without` leaves one actor
+ * out: '' the main session, or an agent's id.
+ */
+export function heldOf(sessionId, runs = [], without = undefined) {
+  const live = core.sessionActors(sessionId)
+    .filter((a) => !a.ended && !a.absorbedInto && (without === undefined || (a.agentKey || '') !== without));
+  const bound = live.map((a) => keyOf(a.binding?.key)).filter(Boolean);
+  const agents = new Set(live.filter((a) => a.agentKey).map((a) => keyOf(a.binding?.key)).filter(Boolean));
+  const launched = launchesOf(sessionId).map((l) => keyOf(l.key)).filter(Boolean);
+  const byKey = new Map(runs.flatMap((r) => r.tickets || []).map((t) => [t.key, t]));
+  for (const key of launched) if (!['done', 'skipped'].includes(byKey.get(key)?.state)) agents.add(key);
+  const running = [...byKey.values()].filter((t) => t.state === 'running').map((t) => t.key);
+  return { keys: new Set([...bound, ...launched, ...running]), agents: [...agents] };
+}
+
+/** What still runs, in words: the agents' keys, or the plain fact. */
+function stillRunning(keys) {
+  if (!keys.length) return 'your background work is still running.';
+  const named = keys.slice(0, 3);
+  const list = named.length === 1 ? named[0] : `${named.slice(0, -1).join(', ')} and ${named.at(-1)}`;
+  return `${keys.length === 1 ? 'your agent is' : 'your agents are'} still working on ${list}.`;
 }
 
 /** Record one continue: the streak on this machine, the direction on the run. */

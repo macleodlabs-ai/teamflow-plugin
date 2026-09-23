@@ -534,7 +534,7 @@ The workflow document's `status` gains `stalled`: a running run whose ticket sta
 
 ### What a lead asked, and what came of it
 
-`actions[]` on the issue document: `id`, `kind` (`fix`, `bump`, `rerun_gate`, `resume_plan`, `skip_gate`), `by`, `at`, `outcome` (`done`, `refused`, `failed`), `reason` (≤ 120), capped at 16. A lead acts from the dashboard; the service holds the intent for the machine that has the ticket (`GET /v1/members/actions?for=<machineId>`, answered per action at `POST /v1/members/actions/{id}/outcome`); the plugin performs what it can and this is its record. **The action's text never travels back**: a `fix` is shown to the agent on the machine and what the report carries is that it was shown; `reason` is the plugin's own sentence ("deploy runs only from the main session"). Nothing here is a queued command, and nothing here is executed from text.
+`actions[]` on the issue document: `id`, `kind` (`fix`, `bump`, `rerun_gate`, `resume_plan`, `skip_gate`), `by`, `at`, `outcome` (`done`, `refused`, `failed`, `not_needed`: a fix or re-run whose step passed, or whose card moved on or finished, before it was shown, MACLEOD-726), `reason` (≤ 120), capped at 16. A lead acts from the dashboard; the service holds the intent for the machine that has the ticket (`GET /v1/members/actions?for=<machineId>`, answered per action at `POST /v1/members/actions/{id}/outcome`); the plugin performs what it can and this is its record. **The action's text never travels back**: a `fix` is shown to the agent on the machine and what the report carries is that it was shown; `reason` is the plugin's own sentence ("deploy runs only from the main session"). Nothing here is a queued command, and nothing here is executed from text.
 
 ### The project document
 
@@ -1152,8 +1152,10 @@ The sidecar's slot is in `RESERVED_SLOTS`, so `/v1/report` refuses it by name; o
 Also service-written, never reported. `adapters/teamflow/autonomy.py`
 consumes `policy` and may queue, as actor `teamflow` with role
 `autonomous`, one of `bump`, `resume_plan` or a `fix` whose text is only
-"`<gate>` failed again the same way, reported as "`<words>`". Take a
-different approach before retrying.", where `<words>` is
+"`<step>` failed again with the same error: "`<words>`". Try a different
+fix before the next run.", where `<step>` is the step in plain words
+(`words.step`, "Local tests"; a rework stage names the step that failed)
+and `<words>` is
 `lastFailure.summary` made inert (control characters, backticks, quotes,
 `$`, pipes, semicolons, redirects and ampersands removed, no leading
 prompt marker, one line, ≤ 120) and quoted as the report's own -- never `skip_gate`, never a ping,

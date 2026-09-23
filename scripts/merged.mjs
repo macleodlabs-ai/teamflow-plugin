@@ -248,6 +248,45 @@ export function openKeys(inventory = {}) {
   return [...keys].filter(Boolean);
 }
 
+/**
+ * How many facts go in one request. The service settles each card in the
+ * request, and 122 in one request ran past its time limit on this
+ * repository (2026-09-23). Ten stays well inside it.
+ */
+export const FACTS_PER_SEND = 10;
+
+/** Send facts in batches. Stops at the first batch that fails; returns how many went. */
+export async function sendInBatches(facts, { repo, now = Date.now(), send = core.sendMerged, config = {} } = {}) {
+  let sent = 0;
+  for (let i = 0; i < facts.length; i += FACTS_PER_SEND) {
+    const batch = facts.slice(i, i + FACTS_PER_SEND);
+    const out = await send(mergedPayload(batch, { repo, now }), config);
+    if (!out?.ok) return { ok: false, sent, reason: out?.reason };
+    sent += batch.length;
+  }
+  return { ok: true, sent };
+}
+
+/** Where this machine keeps the facts it already sent, so a pass sends only what is new. */
+function sentPath() {
+  return path.join(core.dataDir(), 'merged-sent.json');
+}
+
+/** The facts not sent before with the same `mergedAt`. */
+export function unsent(facts) {
+  const held = core.readJson(sentPath()) || {};
+  return facts.filter((fact) => held[fact.key] !== fact.mergedAt);
+}
+
+/** Remember facts the service took. The file keeps the newest 2000 keys. */
+export function markSent(facts) {
+  const held = core.readJson(sentPath()) || {};
+  for (const fact of facts) held[fact.key] = fact.mergedAt;
+  const keys = Object.keys(held);
+  const kept = Object.fromEntries(keys.slice(Math.max(0, keys.length - 2000)).map((k) => [k, held[k]]));
+  core.writeJson(sentPath(), kept);
+}
+
 // --- `teamflow reconcile --merged`: the backfill -------------------------
 //
 // Agents already dispatched never report again, so the heartbeat's pass
@@ -304,13 +343,18 @@ export async function main(args = [], ctx = {}) {
     return 0;
   }
   const repository = (ctx.info || core.gitInfo)(cwd)?.repository;
-  const out = await (ctx.send || core.sendMerged)(
-    mergedPayload(facts, { repo: repository ? core.digest(repository) : undefined, now: ctx.now }), config);
-  if (!out?.ok) {
-    fail(`TeamFlow could not send the ${facts.length} merged cards: ${out?.reason || 'the service did not answer'}.`);
+  const out = await sendInBatches(facts, {
+    repo: repository ? core.digest(repository) : undefined, now: ctx.now, send: ctx.send || core.sendMerged, config,
+  });
+  markSent(facts.slice(0, out.sent));
+  if (!out.ok) {
+    const why = out.reason || 'the service did not answer';
+    fail(out.sent
+      ? `TeamFlow sent ${out.sent} of ${facts.length} merged cards, then stopped: ${why}. Run it again to send the rest.`
+      : `TeamFlow could not send the ${facts.length} merged cards: ${why}.`);
     return 1;
   }
-  print(`TeamFlow sent ${facts.length} merged cards. The board finishes each one nobody still works on.`);
+  print(`TeamFlow sent ${facts.length} merged cards. Within five minutes, the board finishes each one nobody still works on.`);
   return 0;
 }
 
@@ -318,9 +362,9 @@ export async function main(args = [], ctx = {}) {
 export async function reportMerged(keys, {
   root, config = {}, run, aliases = core.readKeyAliases(config), repo, now = Date.now(), send = core.sendMerged,
 } = {}) {
-  const facts = mergedFacts(keys, { root, run, aliases });
-  const payload = mergedPayload(facts, { repo, now });
-  if (!payload) return { ok: true, sent: 0 };
-  const out = await send(payload, config);
-  return { ok: Boolean(out?.ok), sent: facts.length };
+  const facts = unsent(mergedFacts(keys, { root, run, aliases }));
+  if (!facts.length) return { ok: true, sent: 0 };
+  const out = await sendInBatches(facts, { repo, now, send, config });
+  markSent(facts.slice(0, out.sent));
+  return { ok: out.ok, sent: out.sent };
 }

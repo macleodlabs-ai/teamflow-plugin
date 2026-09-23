@@ -3,6 +3,16 @@
 What changed in each published version of the TeamFlow plugin, newest first.
 Only what a person using it would notice.
 
+## 0.3.39
+
+- **TeamFlow keeps the session busy while your agent works.** It gives the
+  session other ready plan work that no agent has.
+- **Old fixes are dropped.** A fix from TeamFlow is never shown after its
+  tests pass. The card's History says the fix was not needed.
+- **Fixes name the step in plain words**, for example "the local tests".
+- **Merged cards close within five minutes.** `teamflow reconcile --merged`
+  no longer times out on a large board.
+
 ## 0.3.38
 
 - **Finished work is closed from git.** When a ticket's work is merged into

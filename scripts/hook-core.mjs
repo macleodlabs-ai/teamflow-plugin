@@ -1182,14 +1182,16 @@ export async function handleEvent(input = {}) {
     const { intakePass } = await import('./intake.mjs');
     const { budgetUntil, tick } = await import('./selfheal.mjs');
     const budget = budgetUntil(ROUND_BUDGET_MS);
-    const got = await intakePass(config, { key: state.binding?.key, cwd, budget });
+    // A fix is shown at the next prompt, so it is answered then (MACLEOD-726).
+    const got = await intakePass(config, { key: state.binding?.key, local: state, later: true, cwd, budget });
     const mine = got.performed.filter((row) => state.binding?.key && row.key === state.binding.key)
       .map(({ key: _key, ...row }) => row);
     if (mine.length) state.actions = [...(state.actions || []), ...mine].slice(-16);
     const healed = await tick(config, { budget }).catch(() => ({ lines: [] }));
     const heard = [...got.notices, ...healed.lines];
     if (heard.length) state.intakePending = [...(state.intakePending || []), ...heard].slice(-8);
-    if (mine.length || heard.length) saveSession(state);
+    if (got.later?.length) state.intakeFixes = [...(state.intakeFixes || []), ...got.later].slice(-8);
+    if (mine.length || heard.length || got.later?.length) saveSession(state);
   }
   if (event === 'SessionStart') {
     const local = await sessionStartLines(config, state);
@@ -1215,6 +1217,21 @@ export async function handleEvent(input = {}) {
   if (FAST.includes(event) && state.intakePending?.length) {
     notices = [...state.intakePending, ...notices];
     delete state.intakePending;
+    saveSession(state);
+  }
+  /*
+   * The fixes a round kept for this prompt (MACLEOD-726). Checked once
+   * more against this session's own last result: a fix whose step has
+   * passed since it was queued is dropped, never shown, and the service
+   * is told it was not needed. The rest are shown once, first.
+   */
+  if (FAST.includes(event) && state.intakeFixes?.length) {
+    const { showHeld } = await import('./intake.mjs');
+    const shown = await showHeld(config, state.intakeFixes, state);
+    const mine = shown.performed.filter((row) => row.key === state.binding?.key).map(({ key: _key, ...row }) => row);
+    if (mine.length) state.actions = [...(state.actions || []), ...mine].slice(-16);
+    notices = [...shown.notices, ...notices];
+    delete state.intakeFixes;
     saveSession(state);
   }
   /*
@@ -1301,7 +1318,7 @@ export async function sessionStartLines(config, state = {}, { now = Date.now() }
   try {
     const { intakeLocal } = await import('./intake.mjs');
     const { lastPassLines } = await import('./selfheal.mjs');
-    const held = await intakeLocal(config, { key: state.binding?.key, now: new Date(now).toISOString() });
+    const held = await intakeLocal(config, { key: state.binding?.key, local: state, now: new Date(now).toISOString() });
     return {
       notices: [...held.notices, ...lastPassLines({ now })],
       performed: held.performed.map(({ key: _key, ...row }) => row),

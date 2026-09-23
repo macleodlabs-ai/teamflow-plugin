@@ -203,15 +203,18 @@ export async function deliverRound(sessionId, { cwd = process.cwd(), intake, hea
   const bound = keyOf(state?.binding?.key);
   // Another session that holds the card runs its actions; here they wait.
   const key = bound && holdsKey(sessionId, bound) ? bound : undefined;
-  const got = await intakePass(config, { key, cwd, budget });
+  // A fix is shown at the next prompt, so it is answered then (MACLEOD-726).
+  const got = await intakePass(config, { key, local: key ? state : undefined, later: Boolean(state), cwd, budget });
   const healed = await tick(config, { budget, reads: 0 }).catch(() => ({ lines: [] }));
   const mine = got.performed.filter((row) => key && row.key === key).map(({ key: _key, ...row }) => row);
   const heard = [...got.notices, ...healed.lines];
-  if (state && (mine.length || heard.length)) {
+  const later = got.later || [];
+  if (state && (mine.length || heard.length || later.length)) {
     // Said at the session's next prompt, like a hook's round.
     const fresh = core.readJson(core.sessionPath(sessionId)) ?? state;
     if (mine.length) fresh.actions = [...(fresh.actions || []), ...mine].slice(-16);
     if (heard.length) fresh.intakePending = [...(fresh.intakePending || []), ...heard].slice(-8);
+    if (later.length) fresh.intakeFixes = [...(fresh.intakeFixes || []), ...later].slice(-8);
     core.saveSession(fresh);
   }
   return { performed: got.performed.length, heard: heard.length };

@@ -14,6 +14,8 @@
  *   candidates(raw)  every title `title` could have chosen, best first.
  *   about(raw)       one plain sentence saying what the work is, or "".
  *   check(text)      the problems in a text: { rule, sentence, found, plain }.
+ *   step(gate, from) the step a check or stage id names, as a person says it:
+ *                    "Local tests". A rework stage is the step that failed.
  *   GLOSSARY         internal word -> plain word.
  *
  * Deterministic and cheap: no model, no network, no file.
@@ -174,6 +176,29 @@ export function sentence(parts) {
   }
   text = upperFirst(text);
   return '?!'.includes(text[text.length - 1]) ? text : `${text}.`;
+}
+
+/*
+ * The step a check or stage id names (MACLEOD-726). A rework stage is
+ * never a step: it names the step that sent the card back (`from`), or
+ * the side it happened on when nothing says which.
+ */
+export const STEPS = {
+  LOCAL_DEV: 'Local dev', LOCAL_TEST: 'Local tests', LOCAL_AUDIT: 'Local audit', MERGE: 'Merge',
+  CI_BUILD: 'CI/CD', DEPLOY_DEV: 'Deploy to dev', DEV_TEST: 'Dev tests', DEV_AUDIT: 'Dev audit',
+  DEV_VERIFIED: 'Deployed', DONE: 'Done', LOCAL_REWORK: 'Local checks', DEV_REWORK: 'Dev checks',
+  test: 'Tests', ci: 'CI', build: 'Build', audit: 'Audit', 'audit-local': 'Local audit',
+  deploy: 'Deploy', sonarqube: 'SonarQube',
+};
+const REWORK = ['LOCAL_REWORK', 'DEV_REWORK'];
+
+/** The step `gate` names, in words: `step('LOCAL_REWORK', 'LOCAL_TEST')` is "Local tests". */
+export function step(gate, from) {
+  const id = String(gate ?? '').trim();
+  if (REWORK.includes(id) && from && !REWORK.includes(String(from))) return step(from);
+  if (Object.hasOwn(STEPS, id)) return STEPS[id];
+  const plain = squash(plainer(id.replace(/_/g, ' '))).slice(0, 40);
+  return plain ? upperFirst(plain) : 'The check';
 }
 
 /** Several facts as a short list, one "- " line each. */

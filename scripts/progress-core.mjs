@@ -781,7 +781,7 @@ var PASSIVE = /* @__PURE__ */ new Set(["idle", "unfinished", "agent_offline", "a
 var FOLLOW_KINDS = /* @__PURE__ */ new Set(["fix", "bump", "rerun_gate", "resume_plan", "skip_gate"]);
 function followUpOf(row, card, now) {
   const began = now - row.ageMs;
-  const queued = (card.ticket.actionQueue ?? []).filter((entry) => FOLLOW_KINDS.has(entry.kind) && time3(entry.at) >= began - 6e4);
+  const queued = (card.ticket.actionQueue ?? []).filter((entry) => FOLLOW_KINDS.has(entry.kind) && entry.status !== "not_needed" && time3(entry.at) >= began - 6e4);
   const last = queued[queued.length - 1];
   const quiet = row.tier === "need" && !card.run && PASSIVE.has(row.cause) && row.ageMs > OLDER_AFTER_MS;
   if (!last) return quiet ? { ...row, quiet } : row;

@@ -34,7 +34,8 @@
 // treated as authority over the rules a session already has.
 //
 // **What goes back is an outcome and the plugin's own sentence.**
-// `done`, `refused` or `failed`, and a reason of at most 120 characters
+// `done`, `refused`, `failed` or `not_needed` (a fix whose step passed
+// before it could be shown, MACLEOD-726), and a reason of at most 120 characters
 // in this module's words ("deploy runs only from the main session").
 // Never the action's text.
 //
@@ -55,9 +56,10 @@ import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import {
-  accountName, credential, dataDir, globalConfigPath, isWorktree, machineId, readJson, readKeyAliases, reportScope,
-  sendReport, serviceUrl, writeJson,
+  STAGE_ORDER, accountName, credential, dataDir, globalConfigPath, isWorktree, machineId, readJson, readKeyAliases,
+  reportScope, sendReport, serviceUrl, writeJson,
 } from './core.mjs';
+import { step } from './words.mjs';
 import {
   GATE_SLOTS, gateDeadlinesOf, gateReports, gateSaid, hygieneRow, load, move, publish, ready, restall, save,
 } from './workflow.mjs';
@@ -166,16 +168,27 @@ function clock(at) {
   return `${String(d.getUTCHours()).padStart(2, '0')}:${String(d.getUTCMinutes()).padStart(2, '0')}`;
 }
 
+/** "Local tests" -> "local tests"; "CI/CD" and "SonarQube" keep their capitals. */
+function lower(text) {
+  const rest = text.split(' ')[0].slice(1);
+  return /[a-z]/.test(rest) && rest === rest.toLowerCase() ? text[0].toLowerCase() + text.slice(1) : text;
+}
+
+/** The step a gate id names, as the words writer says it, for a sentence's middle. */
+const stepOf = (gate, local) => lower(step(gate, local?.reworkFrom || local?.lastFailure?.stage));
+
 /**
  * The sentence the agent reads for a `fix`: `Fix from Steve, 10:12:
  * re-run the tests; the flaky one is fixed on main`, or `Fix from Steve
- * for the failed test gate, 10:12: ...` when the action names the gate.
- * A person's name and a time, so it reads as a message from someone.
+ * for the local tests, 10:12: ...` when the action names the step, in
+ * the words writer's words: never a stage id, and never "rework", which
+ * is where a card waits and not a step (MACLEOD-726). A person's name
+ * and a time, so it reads as a message from someone.
  */
-export function noticeFor(action = {}) {
+export function noticeFor(action = {}, local) {
   const by = oneLine(action.by, 80) || 'a lead';
   const gate = oneLine(action.args?.gate, 40);
-  const failure = gate ? ` for the failed ${gate} check` : '';
+  const failure = gate ? ` for the ${stepOf(gate, local)}` : '';
   const when = clock(action.at);
   const text = oneLine(action.args?.text);
   if (!text) return undefined;
@@ -183,6 +196,62 @@ export function noticeFor(action = {}) {
 }
 
 const said = (outcome, reason) => ({ outcome, reason: oneLine(reason, REASON_MAX) });
+
+// --- a fix that is not needed any more -------------------------------------------
+
+/*
+ * A fix or a re-run is about one step. Once that step passed after it was
+ * queued, or the card moved past the step or finished, it is not needed:
+ * a live fix reached an agent three hours late and told it to change an
+ * approach that had passed three times since (MACLEOD-726). The service
+ * drops such a fix in its five-minute pass (card_actions.lapse_reason,
+ * the same rule); this machine checks again at the moment it would show
+ * one, from its own last result, and answers `not_needed`, which is
+ * never a failure.
+ */
+export const LAPSE_KINDS = new Set(['fix', 'bump']);
+export const FINISHED_WORDS = 'the card is finished';
+export const MOVED_WORDS = 'the card moved past that step';
+const REWORK_STAGES = ['LOCAL_REWORK', 'DEV_REWORK'];
+const FINISHED = ['DONE', 'READY_PROD'];
+
+/** Why this step's fix is not needed: "the local tests passed after it". */
+export const passedWords = (gate) => `the ${stepOf(gate)} passed after it`;
+
+/**
+ * The step an action is about. An older action can name a rework stage;
+ * the step is the one whose failure sent the card back before it was
+ * queued, else the last failure's.
+ */
+export function lapseGate(action = {}, local = {}, since = Infinity) {
+  const gate = String(action.args?.gate || '');
+  if (!REWORK_STAGES.includes(gate)) return gate;
+  const before = (local.reworkLog || []).filter((e) => e?.gate && !(Date.parse(e.at || '') > since));
+  return before[before.length - 1]?.gate || local.lastFailure?.stage || gate;
+}
+
+/**
+ * Why a queued fix or bump is not needed any more, from this session's own
+ * state for the key (`local`: its stage, status, rework log), or
+ * undefined when it still is or this machine cannot tell. Pure.
+ */
+export function lapsed(action = {}, local) {
+  if (!LAPSE_KINDS.has(String(action.kind)) || !local) return undefined;
+  const since = Date.parse(action.at || '');
+  if (!Number.isFinite(since)) return undefined;
+  if (FINISHED.includes(local.stage)) return FINISHED_WORDS;
+  const gate = lapseGate(action, local, since);
+  // Another system's check: the service reads its result, not this machine.
+  if (!STAGE_ORDER.includes(gate)) return undefined;
+  const after = (at) => Date.parse(at || '') > since;
+  const cleared = (local.reworkLog || []).some((e) => e?.gate === gate && after(e.clearedAt));
+  if (cleared || (local.stage === gate && local.status === 'success' && after(local.updatedAt))) return passedWords(gate);
+  if (STAGE_ORDER.indexOf(local.stage) > STAGE_ORDER.indexOf(gate)) return MOVED_WORDS;
+  return undefined;
+}
+
+/** This session's state, only when it is on `key`: another ticket's results say nothing here. */
+const localFor = (local, key) => (local?.binding?.key && local.binding.key === key ? local : undefined);
 
 // --- the service ------------------------------------------------------------------
 
@@ -333,7 +402,7 @@ export const HOLD_MAX_MS = 24 * 60 * 60 * 1000;
  * key.
  */
 export async function perform(action, {
-  config = {}, state, bound, cwd = process.cwd(), at = new Date().toISOString(), budget,
+  config = {}, state, bound, local, cwd = process.cwd(), at = new Date().toISOString(), budget,
   spawnGate = spawnDetached, publishRun = publish, inWorktree = isWorktree, delivery = userDelivery(),
   deadlines = gateDeadlinesOf({ delivery }), env = process.env,
 } = {}) {
@@ -342,9 +411,13 @@ export async function perform(action, {
   const by = oneLine(action.by, 80) || 'a lead';
   if (!KINDS.has(kind)) return { ...said('refused', `unknown action kind ${kind}`) };
 
+  const mine = bound === key ? localFor(local, key) : undefined;
+  const gone = lapsed(action, mine);
+  if (gone) return { ...said('not_needed', gone) };
+
   if (kind === 'fix') {
     if (bound !== key) return { hold: true };
-    const notice = noticeFor(action);
+    const notice = noticeFor(action, mine);
     if (!notice) return { ...said('refused', 'a fix with no text') };
     return { ...said('done', `shown to the session on ${key}`), notice };
   }
@@ -450,12 +523,20 @@ const row = (action, result, at) => ({
  *
  * `performed[]` is what the ticket's report records (`CardAction`);
  * `notices[]` is what the session is shown, fixes first; `held` is how
- * many wait for a session bound to their key.
+ * many wait for a session bound to their key. `local` is the session's
+ * own state, which says whether a fix is still needed (MACLEOD-726).
+ *
+ * `later`: the round runs where nothing can speak to the agent (a hook's
+ * `Stop`, the heartbeat), so a fix is shown at the next prompt, which can
+ * be hours away. Such a fix is not answered here: it comes back in
+ * `later[]`, and `showHeld` answers it when the prompt comes, after
+ * checking once more that its step has not passed since.
  */
 export async function intakePass(config = {}, {
-  key: bound, cwd, timeoutMs = 5000, now = new Date().toISOString(), budget = budgetUntil(timeoutMs), doers = {},
+  key: bound, local, later: showLater = false, cwd, timeoutMs = 5000, now = new Date().toISOString(),
+  budget = budgetUntil(timeoutMs), doers = {},
 } = {}) {
-  const none = { notices: [], performed: [], held: 0 };
+  const none = { notices: [], performed: [], held: 0, later: [] };
   let release;
   try {
     const enabled = intakeEnabled(config);
@@ -488,6 +569,7 @@ export async function intakePass(config = {}, {
     const state = load(config);
     const notices = [];
     const performed = [];
+    const later = [];
     const still = [];
     let done = 0;
     for (let i = 0; i < queue.length; i += 1) {
@@ -510,7 +592,7 @@ export async function intakePass(config = {}, {
         const unreached = queue.slice(i + 1).filter((a) => pendingIds.has(String(a.id)));
         writeLedger(account, { handled: ledger.handled, pending: [...still, ...unreached], owed: ledger.owed });
         try {
-          result = await perform(action, { config, state, bound, cwd, at: now, budget, ...doers });
+          result = await perform(action, { config, state, bound, local, cwd, at: now, budget, ...doers });
         } catch (error) {
           result = said('failed', `the plugin could not perform it: ${error?.message || error}`);
         }
@@ -524,6 +606,12 @@ export async function intakePass(config = {}, {
         }
       }
       done += 1;
+      if (showLater && result.notice && action.kind === 'fix' && result.outcome === 'done') {
+        later.push({
+          id, kind: 'fix', key: String(action.key), by: action.by, at: action.at, ...(action.args ? { args: action.args } : {}),
+        });
+        continue;
+      }
       performed.push(row(action, result, now));
       if (result.notice) notices.push(result.notice);
       const told = remainingMs(budget) > 0
@@ -534,11 +622,44 @@ export async function intakePass(config = {}, {
     writeLedger(account, { handled: ledger.handled, pending: still, owed: ledger.owed });
     // Fixes first: a person's words before anything the tool says.
     notices.sort((a, b) => (b.startsWith('Fix from ') ? 1 : 0) - (a.startsWith('Fix from ') ? 1 : 0));
-    return { notices, performed, held: still.length };
+    return { notices, performed, held: still.length, later };
   } catch {
     return none;
   } finally {
     release?.();
+  }
+}
+
+/**
+ * The fixes a round kept for the next prompt, answered now that the prompt
+ * came (MACLEOD-726). One whose step passed since, or whose card moved on,
+ * is dropped and answered `not_needed`; the rest are shown once and
+ * answered `done`. Either way the answer is owed to the service and the
+ * next round tells it. No network call.
+ */
+export async function showHeld(config = {}, held = [], local, { now = new Date().toISOString() } = {}) {
+  const none = { notices: [], performed: [] };
+  try {
+    const list = (Array.isArray(held) ? held : []).filter((a) => a && a.id && a.kind === 'fix');
+    if (!list.length) return none;
+    const account = await accountName(config).catch(() => undefined);
+    const ledger = readLedger(account);
+    const notices = [];
+    const performed = [];
+    for (const action of list) {
+      const key = followedKey(String(action.key || ''), config);
+      const mine = localFor(local, key);
+      const gone = lapsed(action, mine);
+      const notice = gone ? undefined : noticeFor(action, mine);
+      const result = gone ? said('not_needed', gone) : said('done', `shown to the session on ${key}`);
+      ledger.owed.push({ id: String(action.id), outcome: result.outcome, reason: result.reason });
+      performed.push(row(action, result, now));
+      if (notice) notices.push(notice);
+    }
+    writeLedger(account, ledger);
+    return { notices, performed };
+  } catch {
+    return none;
   }
 }
 
@@ -565,7 +686,7 @@ export function takeLock(account, now = Date.now()) {
  * that needs a session to speak to and nothing else -- and only for the
  * bound key. Everything else waits for the `Stop` round.
  */
-export async function intakeLocal(config = {}, { key: bound, now = new Date().toISOString() } = {}) {
+export async function intakeLocal(config = {}, { key: bound, local, now = new Date().toISOString() } = {}) {
   const none = { notices: [], performed: [] };
   try {
     if (!bound || !intakeEnabled(config)) return none;
@@ -575,9 +696,13 @@ export async function intakeLocal(config = {}, { key: bound, now = new Date().to
     if (!mine.length) return none;
     const notices = [];
     const performed = [];
+    const here = localFor(local, bound);
     for (const action of mine) {
-      const notice = noticeFor(action);
-      const result = notice ? { ...said('done', `shown to the session on ${bound}`), notice } : said('refused', 'a fix with no text');
+      // Its step may have passed while it waited here (MACLEOD-726).
+      const gone = lapsed(action, here);
+      const notice = gone ? undefined : noticeFor(action, here);
+      const result = gone ? said('not_needed', gone)
+        : notice ? { ...said('done', `shown to the session on ${bound}`), notice } : said('refused', 'a fix with no text');
       ledger.handled.push(String(action.id));
       ledger.owed.push({ id: String(action.id), outcome: result.outcome, reason: result.reason });
       performed.push(row(action, result, now));

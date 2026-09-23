@@ -292,7 +292,7 @@ async function status() {
    * seen. Guidance for the reader, never something this command runs.
    */
   const { intakePass } = await import('./intake.mjs');
-  const asked = await intakePass(config, { key: state?.binding?.key, cwd });
+  const asked = await intakePass(config, { key: state?.binding?.key, local: state, cwd });
   for (const line of asked.notices) print(`TeamFlow: ${line}`);
   for (const row of asked.performed) print(`TeamFlow ${row.outcome} ${row.kind} on ${row.key}${row.reason ? `: ${row.reason}` : ''}`);
   // The open failure points on the bound card (ADHOC-19): the checklist a
