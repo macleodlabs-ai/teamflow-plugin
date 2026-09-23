@@ -776,6 +776,22 @@ export async function handleEvent(input = {}) {
     // the card exists first. Its own slot, `check-<name>`; the service
     // places it where the organisation put the check. Fails open.
     if (transition?.check) await reportCheck(state.binding.key, transition.check, config);
+    // A passing Playwright run's video, onto the ticket (MACLEOD-639), when
+    // the organisation's step asks. In the background: an upload never holds
+    // the session up, and what happened is said at the next session start.
+    if (transition?.check?.name === 'playwright' && transition.check.passed) {
+      try {
+        const { attachWanted } = await import('./check-presets.mjs');
+        const { dataDir } = await import('./core.mjs');
+        if (attachWanted({ cwd, stampDir: dataDir() })) {
+          const { spawn } = await import('node:child_process');
+          const script = new URL('./video-evidence.mjs', import.meta.url).pathname;
+          const since = String(Date.now() - 30 * 60 * 1000);
+          spawn(process.execPath, [script, state.binding.key, cwd, since],
+            { cwd, detached: true, stdio: 'ignore', shell: false }).unref();
+        }
+      } catch { /* the video stays on the machine */ }
+    }
   }
 
   // Once a turn, on the event that already forces a publish. Anything on
@@ -898,6 +914,8 @@ export async function handleEvent(input = {}) {
       const { columnLines } = await import('./check-presets.mjs');
       const { dataDir } = await import('./core.mjs');
       notices = [...notices, ...columnLines({ cwd, stampDir: dataDir() })];
+      const { takeNotices } = await import('./video-evidence.mjs');
+      notices = [...notices, ...takeNotices(dataDir())];
     } catch { /* nothing to say is said */ }
   }
   if (FAST.includes(event) && state.intakePending?.length) {

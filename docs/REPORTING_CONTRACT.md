@@ -30,6 +30,17 @@ Answers: 2xx accepted (`replay: true` when it was a repeat); 402 the organisatio
 
 The legacy transport writes the same documents straight to S3 at the paths below with AWS credentials, and is selected when `dataUri` is configured and no service credential is available.
 
+### Video evidence never passes through the service (MACLEOD-639)
+
+When an organisation's Playwright step asks for videos on tickets, the plugin
+sends a passing run's `.webm` from the machine **straight to the tracker**:
+GitHub through the developer's own `gh issue comment --attach`, Linear through
+a pre-signed upload link. The service only answers where the ticket lives
+(`POST /v1/evidence/video/start`) and, for Linear, writes the one comment that
+links the upload (`POST /v1/evidence/video/done`, with a signed, hour-long
+receipt). No video, frame or file name beyond the one uploaded is stored by
+TeamFlow; the check's own report is unchanged.
+
 ## Discovery and tenant paths
 
 One rule for everything a tenant holds (MACLEOD-548):

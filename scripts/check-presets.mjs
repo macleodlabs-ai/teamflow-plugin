@@ -234,6 +234,18 @@ export function columnLines({ cwd, stampDir }) {
   }
 }
 
+/** Whether the cached Playwright step asks for the video on the ticket. */
+export function attachWanted({ cwd, stampDir }) {
+  try {
+    const root = repoRoot(cwd);
+    if (!root || !stampDir) return false;
+    const columns = (readJson(path.join(stampDir, COLUMNS_FILE)) || {})[root] || [];
+    return columns.some((column) => column.id === 'playwright' && column.video && column.attach);
+  } catch {
+    return false;
+  }
+}
+
 function stampFile(dir) {
   return dir ? path.join(dir, 'check-presets.json') : undefined;
 }

@@ -3,6 +3,14 @@
 What changed in each published version of the TeamFlow plugin, newest first.
 Only what a person using it would notice.
 
+## 0.3.30
+
+- **Playwright videos go on the ticket.** When your organisation's Playwright
+  step asks for it, a passing run's video goes from your machine to the
+  ticket: on GitHub through your own `gh` (2.99 or later), on Linear through
+  a one-time upload link. It runs in the background, and the next session
+  says whether it worked. TeamFlow never keeps the video.
+
 ## 0.3.29
 
 - **A lint step sets itself up.** When your organisation adds the lint
