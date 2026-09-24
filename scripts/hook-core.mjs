@@ -69,7 +69,7 @@ import {
 } from './review.mjs';
 import { REVIEW_NEXT_MS, batchSize, changesFiles, reviewStartOf, stripMark, teamLeanOf } from './launch-role.mjs';
 import {
-  boundToTeamflow, closeDispatched, dispatchOf, launchesOf, planLaunch, publishOwed, settle, withMint,
+  boundToTeamflow, closeDispatched, dispatchOf, launchesOf, planLaunch, publishOwed, replanUnbound, settle, withMint,
 } from './dispatch.mjs';
 
 /** Whether a launch in this session was claimed by this agent id. Local files only. */
@@ -1085,6 +1085,8 @@ export async function handleEvent(input = {}) {
   // A card minted for an agent whose first publish was lost (MACLEOD-641,
   // tracking gap 3): tried again once a turn, a few at a time.
   if (event === 'Stop' || event === 'SubagentStop') await publishOwed(config, { sessionId, state, cwd, info });
+  // An agent sent before the repository was on TeamFlow gets its node now (MACLEOD-761).
+  if (event === 'Stop' && !agentKey) await replanUnbound(config, { sessionId, state, cwd, info });
   // The directions auto-continue put on a run (MACLEOD-726): its hook
   // may not wait on the network, so this turn's end sends them.
   if (event === 'Stop' || event === 'SubagentStop') await publishDirections(config);

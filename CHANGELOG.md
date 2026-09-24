@@ -3,6 +3,17 @@
 What changed in each published version of the TeamFlow plugin, newest first.
 Only what a person using it would notice.
 
+## 0.3.40
+
+- **Each session keeps its own plan.** Two Claude Code sessions on one
+  computer no longer share a plan. An agent joins only a plan its work
+  fits. `teamflow workflow use` and `teamflow workflow move` put work in
+  the right plan, and the tidy-up moves misplaced work by itself.
+- **No agent is left without a card.** A session that made or chose a
+  plan counts as bound, so its agents always reach a card.
+- **Ad hoc work turns into a ticket only in its own project.** When no
+  project holds its repository, the card stays ad hoc.
+
 ## 0.3.39
 
 - **TeamFlow keeps the session busy while your agent works.** It gives the

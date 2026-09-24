@@ -1050,7 +1050,7 @@ export function adoptWorkflow(id, config = {}, { from } = {}) {
  * not do the re-keying; reading another key would take another
  * organisation's run. This organisation's bucket, and nothing else.
  */
-export function readWorkflows(config = {}) {
+export function readWorkflows(config = {}, where = undefined) {
   const all = readJson(workflowsPath(), {}) || {};
   const mine = all[workflowScope(config)] || {};
   const workflows = mine.workflows || {};
@@ -1060,7 +1060,93 @@ export function readWorkflows(config = {}) {
   if (Object.keys(aliases).length) {
     for (const workflow of Object.values(workflows)) applyKeyAliases(workflow, aliases);
   }
-  return { current: mine.current || null, workflows };
+  const place = runPlace(where);
+  const { current, via } = currentRun(mine, workflows, place);
+  return { current, workflows, place, via, readCurrent: current, repos: { ...(mine.repos || {}) } };
+}
+
+// --- which run is current, per session (MACLEOD-761) ------------------
+//
+// One `current` per organisation for the whole machine let a second
+// Claude Code session, in another repository, take over the first one's
+// run: its `workflow create` became current and every agent the first
+// session dispatched afterwards joined it. The current run is now kept
+// per session and per repository, beside the old field:
+//
+//   { current, workflows, sessions: { <session id>: { run, at } },
+//     repos: { <owner/repo, else the root>: run } }
+//
+// `current` is still written, so an older plugin on the same machine
+// keeps reading a run. This version reads it only for a run from before
+// this change (no `repo` of its own) whose filter does not rule this
+// repository out. A run made now carries its `repo`, and is never
+// another repository's by way of `current`.
+
+const SESSION_POINTERS = 200;
+
+/** Where a command or a hook runs: its session, its repository and, when known, its project. */
+export function runPlace(where) {
+  if (!where || typeof where !== 'object') return undefined;
+  let repo = typeof where.repository === 'string' && where.repository.trim()
+    ? where.repository.trim().toLowerCase() : undefined;
+  if (!repo && where.cwd) { try { repo = repositoryRoot(where.cwd); } catch { repo = undefined; } }
+  const place = {};
+  if (where.sessionId) place.session = String(where.sessionId);
+  if (repo) place.repo = repo;
+  if (typeof where.project === 'string' && where.project.trim()) place.project = where.project.trim();
+  return Object.keys(place).length ? place : undefined;
+}
+
+const sameName = (a, b) => String(a || '').trim().toLowerCase() === String(b || '').trim().toLowerCase();
+
+/**
+ * Whether work from `place` belongs in `run`: the run's project (its
+ * filter's, else the one it was made in) when both are known, else its
+ * repository. Anything unknown fits: a guard that refused on a guess
+ * would split one person's plan in two.
+ */
+export function fitsRun(run, place) {
+  if (!run || !place) return true;
+  const wanted = run.filter?.project || run.project;
+  if (wanted && place.project) return sameName(wanted, place.project);
+  if (run.repo && place.repo) return run.repo === place.repo;
+  return true;
+}
+
+function currentRun(mine, workflows, place) {
+  const held = (id) => (id && workflows[id] ? id : null);
+  if (!place) return { current: held(mine.current), via: mine.current ? 'legacy' : null };
+  const bySession = place.session ? held(mine.sessions?.[place.session]?.run) : null;
+  if (bySession) return { current: bySession, via: 'session' };
+  const byRepo = place.repo ? held(mine.repos?.[place.repo]) : null;
+  if (byRepo) return { current: byRepo, via: 'repo' };
+  const legacy = held(mine.current);
+  if (legacy && !workflows[legacy].repo && fitsRun(workflows[legacy], place)) return { current: legacy, via: 'legacy' };
+  return { current: null, via: null };
+}
+
+/**
+ * The pointers as they will be written. This place's are set when its
+ * current run changed, or was already its own; a run it only inherited
+ * from the old field is not claimed by being read.
+ */
+function pointersFor(mine, state) {
+  const sessions = { ...(mine.sessions || {}) };
+  const repos = { ...(mine.repos || {}) };
+  const place = state.place;
+  const chosen = state.current && (state.current !== state.readCurrent || (state.via && state.via !== 'legacy'));
+  if (place && chosen) {
+    if (place.session) sessions[place.session] = { run: state.current, at: new Date().toISOString() };
+    if (place.repo) repos[place.repo] = state.current;
+  }
+  const kept = Object.entries(sessions)
+    .filter(([, v]) => v && typeof v === 'object' && v.run)
+    .sort((a, b) => String(b[1].at || '').localeCompare(String(a[1].at || '')))
+    .slice(0, SESSION_POINTERS);
+  const out = {};
+  if (kept.length) out.sessions = Object.fromEntries(kept);
+  if (Object.keys(repos).length) out.repos = repos;
+  return out;
 }
 
 // --- converted ad hoc items (MACLEOD-639, ADHOC-15) -------------------
@@ -1266,7 +1352,12 @@ export function followKeyAliases(state, cwd, config = {}) {
 export function writeWorkflows(state, config = {}) {
   const all = readJson(workflowsPath(), {}) || {};
   const scope = workflowScope(config);
-  all[scope] = { current: state.current, workflows: state.workflows };
+  const mine = all[scope] || {};
+  // The pointers survive every writer (MACLEOD-761): a caller that read
+  // without a place must not wipe each session's current run. `current`
+  // stays the last run anybody chose, for an older plugin.
+  const legacy = state.place && !state.current ? (mine.current || null) : (state.current ?? mine.current ?? null);
+  all[scope] = { current: legacy, workflows: state.workflows, ...pointersFor(mine, state) };
   fs.mkdirSync(path.dirname(workflowsPath()), { recursive: true });
   writeJson(workflowsPath(), all);
 }

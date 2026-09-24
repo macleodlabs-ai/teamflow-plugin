@@ -65,10 +65,13 @@ import {
   TRIGGER_STAGES, cardFor, publishCard, readTracker, readWriteBack, trackerAskLines,
 } from './card.mjs';
 import {
-  dataDir, isOver, organisationScope, readJson, readWorkflows, saveSession, sessionPath,
+  dataDir, fitsRun, isOver, organisationScope, readJson, readWorkflows, saveSession, sessionPath,
   writeJson, writeWorkflows,
 } from './core.mjs';
-import { cardOwed, cardSaid, openTickets, publish } from './workflow.mjs';
+import { projectFor, projectsCachePath } from './project.mjs';
+import {
+  autoCreate, cardOwed, cardSaid, homeRun, moveNode, openTickets, publish,
+} from './workflow.mjs';
 
 /**
  * How long a run may say nothing before it is drawn as ended.
@@ -254,6 +257,7 @@ function repairId(repair) {
   if (repair.kind === 'card') return `card:${repair.key}`;
   if (repair.kind === 'execution') return `execution:${repair.sessionId}:${repair.agentKey || ''}`;
   if (repair.kind === 'binding') return `binding:${repair.file}`;
+  if (repair.kind === 'misfiled') return `misfiled:${repair.workflowId}:${repair.key}`;
   return `${repair.kind}:${repair.workflowId}`;
 }
 
@@ -309,6 +313,7 @@ export function planSilentActors(actors = [], { now = Date.now(), idleMs = IDLE_
 export function planRepairs({
   workflows = {}, actors = [], bindings = [], now = Date.now(),
   idleMs = IDLE_MS, emptyMs = EMPTY_RUN_MS, deep = false, exceptSession,
+  repos = {}, homes = new Map(),
 } = {}) {
   const repairs = [];
   const held = ticketsByKey(workflows);
@@ -388,7 +393,75 @@ export function planRepairs({
     });
   }
 
+  // 5. A node in a run of another project (MACLEOD-761): an agent of one
+  //    repository that joined the run another session made. Only a node
+  //    whose home is known, and only an open one.
+  repairs.push(...planMisfiled({ workflows, repos, homes }));
+
   return repairs.map((repair) => ({ ...repair, id: repairId(repair) }));
+}
+
+const LIVE = (w) => Boolean(w) && !['done', 'cancelled', 'archived'].includes(w.status);
+
+/**
+ * Where each open node's work comes from: the repository and project
+ * stamped on it when it was dispatched, else the one repository every
+ * actor reporting under its key is in. Unknown when they disagree.
+ */
+export function ticketHomes(workflows = {}, actors = [], projects = []) {
+  const homes = new Map();
+  const seen = new Map();
+  for (const actor of actors) {
+    const key = actor?.binding?.key;
+    const repo = String(actor?.reportedRepository || '').trim().toLowerCase();
+    if (!key || !repo) continue;
+    if (!seen.has(key)) seen.set(key, new Set());
+    seen.get(key).add(repo);
+  }
+  const projectOf = (repo) => {
+    try { return projectFor(repo, projects)?.name; } catch { return undefined; }
+  };
+  for (const workflow of Object.values(workflows)) {
+    for (const ticket of workflow.tickets || []) {
+      if (homes.has(ticket.key)) continue;
+      if (ticket.repo || ticket.project) {
+        homes.set(ticket.key, { repo: ticket.repo, project: ticket.project || projectOf(ticket.repo) });
+        continue;
+      }
+      const repos = seen.get(ticket.key);
+      if (repos?.size !== 1) continue;
+      const [repo] = repos;
+      homes.set(ticket.key, { repo, project: projectOf(repo) });
+    }
+  }
+  return homes;
+}
+
+/** Each open node whose home does not fit its run, and the run it goes to. */
+export function planMisfiled({ workflows = {}, repos = {}, homes = new Map() } = {}) {
+  const out = [];
+  for (const run of Object.values(workflows)) {
+    if (!LIVE(run)) continue;
+    for (const ticket of run.tickets || []) {
+      if (['done', 'skipped'].includes(ticket.state)) continue;
+      const home = homes.get(ticket.key);
+      if (!home || fitsRun(run, home)) continue;
+      const holding = Object.values(workflows).find((w) => w.id !== run.id && LIVE(w)
+        && fitsRun(w, home) && (w.tickets || []).some((t) => t.key === ticket.key));
+      const to = holding || homeRun({ workflows, repos }, home, { except: run.id });
+      const where = home.project || home.repo;
+      out.push({
+        kind: 'misfiled',
+        key: ticket.key,
+        workflowId: run.id,
+        toId: to?.id,
+        home,
+        what: to ? `${ticket.key} goes from "${run.name}" to "${to.name}"`
+          : `${ticket.key} goes from "${run.name}" to a new run for ${where}`,
+      });
+    }
+  }
+  return out;
 }
 
 // --- reading what this organisation holds ------------------------------
@@ -527,9 +600,14 @@ export async function reconcile(config = {}, {
    */
   const carried = deep ? {} : (held.quarantined || {});
 
+  const actors = ownActors(config);
+  let projects = [];
+  try { projects = readJson(projectsCachePath(config))?.projects || []; } catch { /* no cache: homes by stamp only */ }
   const all = planRepairs({
     workflows: state.workflows,
-    actors: ownActors(config),
+    actors,
+    repos: state.repos,
+    homes: ticketHomes(state.workflows, actors, projects),
     bindings: deep ? ownBindings(config) : [],
     now,
     idleMs,
@@ -730,6 +808,26 @@ async function pay(repair, state, config, { at, deep }) {
     // it has already been done.
     workflow.status = was;
     return { landed: false, ...notLanded(sent) };
+  }
+
+  if (repair.kind === 'misfiled') {
+    if (!workflow || !(workflow.tickets || []).some((t) => t.key === repair.key)) return { landed: false };
+    let to = state.workflows[repair.toId];
+    if (!to) {
+      // A run of its own for that repository, made by the plugin; the
+      // machine's old `current` is left where it was.
+      const was = state.current;
+      to = autoCreate(state, `${repair.home?.project || 'Unplanned'} run`, workflow.actor);
+      state.current = was;
+      if (repair.home?.repo) to.repo = repair.home.repo;
+      if (repair.home?.project) to.project = repair.home.project;
+      repair.toId = to.id;
+    }
+    moveNode(workflow, to, repair.key, { at });
+    // The move is made on this machine; a publish that does not land is
+    // sent again with the run's next change.
+    for (const run of [workflow, to]) { try { await publish(run, config, { flush: false }); } catch { /* saved here */ } }
+    return { landed: true };
   }
 
   if (repair.kind === 'binding') {

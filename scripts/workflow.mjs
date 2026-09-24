@@ -24,9 +24,10 @@
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import {
-  actor, actorsForKey, adoptWorkflow, fetchState, readWorkflows, reportScope, resolveGithubRepo, saveSession,
-  sendReport, trackerOf, unclaimedWorkflows, workflowsPath, writeWorkflows,
+  actor, actorsForKey, adoptWorkflow, fetchState, fitsRun, latestSessionForCwd, readWorkflows, reportScope,
+  resolveGithubRepo, saveSession, sendReport, trackerOf, unclaimedWorkflows, workflowsPath, writeWorkflows,
 } from './core.mjs';
+import { projectFor, projectsCachePath } from './project.mjs';
 import {
   POINT_TEXT_MAX, POINTS_MAX, POINTS_PER_ROUND_MAX, advance, pointLine,
 } from './points.mjs';
@@ -75,6 +76,14 @@ export const USAGE = `teamflow workflow — the pool of tickets a run works thro
 
   teamflow workflow show [<name>]
       The plan: phases, tickets and what waits on what.
+
+  teamflow workflow use <name>
+      Make a run this session's and this repository's current run. Each
+      session has its own; another session on this machine keeps its.
+
+  teamflow workflow move <KEY> --to <name> [--from <name>]
+      Take a ticket out of the run it is in and put it in another, with
+      its state. Links to it in the old run are removed.
 
   teamflow workflow adopt [--yes <id>] [--from <bucket>]
       Workflows started before 0.3.14, when this machine filed them by
@@ -641,6 +650,11 @@ export function create(name, args, state, owner) {
   // Local only. Never copied into `published`.
   const order = flag(args, 'order-text');
   if (order) workflow.order = order;
+  // Where it was made (MACLEOD-761), local only: another repository's
+  // session never takes it as its current run, and a dispatch from
+  // another project is kept out of it.
+  if (state.place?.repo) workflow.repo = state.place.repo;
+  if (state.place?.project) workflow.project = state.place.project;
   state.workflows[workflow.id] = workflow;
   state.current = workflow.id;
   return workflow;
@@ -1286,7 +1300,7 @@ async function readJson(stream) {
 }
 
 export async function main(args, {
-  config = {}, info = {}, stdin = process.stdin,
+  config = {}, info = {}, stdin = process.stdin, cwd, sessionId,
   print = (s) => process.stdout.write(`${s}\n`),
 } = {}) {
   const [sub = 'show', ...rest] = args;
@@ -1295,7 +1309,8 @@ export async function main(args, {
     return 0;
   }
 
-  const state = load(config);
+  // This session's current run, not the machine's (MACLEOD-761).
+  const state = load(config, cwd || sessionId ? placeFor({ config, cwd, info, sessionId }) : undefined);
 
   if (sub === 'create') {
     const name = rest.filter((a) => !a.startsWith('--'))[0];
@@ -1385,6 +1400,58 @@ export async function main(args, {
       announce: (lines) => { for (const line of lines) print(line); },
     });
     print(renderPass(pass));
+    return 0;
+  }
+
+  /*
+   * One session's current run, chosen by hand (MACLEOD-761). Another
+   * session on this machine keeps its own.
+   */
+  if (sub === 'use') {
+    const wanted = rest.filter((a) => !a.startsWith('--'))[0];
+    const run = find(state, wanted);
+    if (!wanted || !run) {
+      print(wanted ? `There is no run called "${wanted}". \`teamflow workflow show\` lists them.`
+        : 'Say which run: teamflow workflow use <name>.');
+      return 1;
+    }
+    state.current = run.id;
+    state.via = 'use';
+    save(state, config);
+    print(`This session's work now goes into "${run.name}".`);
+    return 0;
+  }
+
+  /*
+   * A ticket in the wrong run, put in the right one (MACLEOD-761). The
+   * run it leaves is found by the key, or named with --from when two
+   * live runs hold it. `reconcile` does the same for a node whose
+   * project is not its run's.
+   */
+  if (sub === 'move') {
+    const key = rest.filter((a) => !a.startsWith('--'))[0];
+    const to = find(state, flag(rest, 'to'));
+    if (!key || !to) {
+      print(!key ? 'Usage: teamflow workflow move <KEY> --to <name>.'
+        : `There is no run called "${flag(rest, 'to') || ''}". \`teamflow workflow show\` lists them.`);
+      return 1;
+    }
+    const fromName = flag(rest, 'from');
+    const holding = fromName
+      ? [find(state, fromName)].filter(Boolean)
+      : Object.values(state.workflows).filter((w) => w.id !== to.id && isLive(w)
+        && (w.tickets || []).some((t) => t.key === String(key).trim()));
+    if (holding.length !== 1) {
+      print(holding.length
+        ? `${key} is in ${holding.length} runs: ${holding.map((w) => `"${w.name}"`).join(', ')}. Say which with --from.`
+        : `${key} is in no other open run${fromName ? ` called "${fromName}"` : ''}.`);
+      return 1;
+    }
+    const [from] = holding;
+    const moved = moveNode(from, to, key);
+    save(state, config);
+    for (const run of [from, to]) { try { await publish(run, config); } catch { /* saved on this machine */ } }
+    print(moveLine(moved, from, to));
     return 0;
   }
 
@@ -2013,13 +2080,84 @@ export function dependsBatch(workflow, entries, { found } = {}) {
  * `blocked` and `stalled` -- because a plan somebody is still writing is
  * still the plan this work belongs to.
  */
-export function liveRun(state = {}) {
-  const live = (w) => w && !['done', 'cancelled', 'archived'].includes(w.status);
+export function liveRun(state = {}, place = state.place) {
   const current = state.workflows?.[state.current];
-  if (live(current)) return current;
+  if (isLive(current) && fitsRun(current, place)) return current;
+  if (place) return homeRun(state, place);
   return Object.values(state.workflows || {})
-    .filter(live)
+    .filter(isLive)
     .sort((a, b) => String(b.createdAt || '').localeCompare(String(a.createdAt || '')))[0] || null;
+}
+
+const isLive = (w) => Boolean(w) && !['done', 'cancelled', 'archived'].includes(w.status);
+const sameName = (a, b) => String(a || '').trim().toLowerCase() === String(b || '').trim().toLowerCase();
+
+/**
+ * The live run work from `place` belongs in, when its session has none
+ * (MACLEOD-761): the run this repository was last pointed at, else the
+ * newest made in this repository or named for this project. Never a run
+ * of another repository just because it is newer -- that is how one
+ * session's agents joined another's plan. Null when there is none; a
+ * dispatch then makes one.
+ */
+export function homeRun(state = {}, place = state.place, { except } = {}) {
+  if (!place) return null;
+  const fits = (w) => isLive(w) && w.id !== except && fitsRun(w, place);
+  const pointed = place.repo ? state.workflows?.[state.repos?.[place.repo]] : undefined;
+  if (fits(pointed)) return pointed;
+  return Object.values(state.workflows || {})
+    .filter(fits)
+    .filter((w) => (place.repo && w.repo === place.repo)
+      || (place.project && sameName(w.filter?.project || w.project, place.project)))
+    .sort((a, b) => String(b.createdAt || '').localeCompare(String(a.createdAt || '')))[0] || null;
+}
+
+/**
+ * Where a command or a hook stands (MACLEOD-761): its session, its
+ * repository and the project that repository is in, from the local
+ * project cache. The session is the one named, else the newest in this
+ * repository. Never throws; what cannot be read is left out.
+ */
+export function placeFor({ config = {}, cwd, info = {}, sessionId } = {}) {
+  let session = sessionId || process.env.TEAMFLOW_SESSION_ID || undefined;
+  if (!session && cwd) { try { session = latestSessionForCwd(cwd, config)?.sessionId; } catch { /* none */ } }
+  let project;
+  try {
+    const cached = JSON.parse(fs.readFileSync(projectsCachePath(config), 'utf8'));
+    project = info.repository ? projectFor(info.repository, cached?.projects)?.name : undefined;
+  } catch { /* no cache: the project is unknown */ }
+  return { sessionId: session, cwd, repository: info.repository, project };
+}
+
+/**
+ * Take one ticket out of `from` and put it in `to`, with its state,
+ * cycle and points (MACLEOD-761). Its links in `from` go: an edge names
+ * two tickets of one plan. A ticket `to` already holds is only taken out
+ * of `from`. Both runs are levelled again.
+ */
+export function moveNode(from, to, key, { at = now() } = {}) {
+  const clean = String(key || '').trim();
+  const ticket = (from?.tickets || []).find((t) => t.key === clean);
+  if (!ticket) throw new Error(`${clean} is not in "${from?.name}".`);
+  if (from === to || from.id === to.id) throw new Error(`${clean} is already in "${to.name}".`);
+  from.tickets = from.tickets.filter((t) => t !== ticket);
+  const links = (from.dependencies || []).filter((d) => d.from === clean || d.on === clean);
+  from.dependencies = (from.dependencies || []).filter((d) => !links.includes(d));
+  const already = (to.tickets || []).some((t) => t.key === clean);
+  if (!already) {
+    to.tickets = [...(to.tickets || []), { ...ticket, rank: (to.tickets || []).length + 1, movedFrom: from.id, updatedAt: at }];
+  }
+  relevel(from);
+  relevel(to);
+  from.updatedAt = at;
+  to.updatedAt = at;
+  return { key: clean, already, links: links.length };
+}
+
+/** The one line a person reads about a move. */
+export function moveLine({ key, links }, from, to) {
+  const tail = links ? ` ${links} link${links === 1 ? '' : 's'} to it in the old run ${links === 1 ? 'was' : 'were'} removed.` : '';
+  return `TeamFlow moved ${key} from "${from.name}" to "${to.name}".${tail}`;
 }
 
 /**
@@ -2045,9 +2183,13 @@ export function autoCreate(state, name, owner) {
  * because the agent is already working; levelled so the run has phases
  * -- one, until edges are drawn.
  */
-export function addDispatched(workflow, key) {
+export function addDispatched(workflow, key, place) {
   const ticket = add(workflow, key);
   ticket.addedBy = 'dispatch';
+  // Where the agent was sent from (MACLEOD-761), local only: what
+  // `reconcile` reads to find a node that is in the wrong run.
+  if (place?.repo) ticket.repo = place.repo;
+  if (place?.project) ticket.project = place.project;
   ticket.state = 'running';
   ticket.cycle = 'build';
   relevel(workflow);

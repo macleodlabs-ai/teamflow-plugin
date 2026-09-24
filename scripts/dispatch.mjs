@@ -55,7 +55,7 @@ import {
 } from './core.mjs';
 import { projectFor, projectsCachePath } from './project.mjs';
 import { launchRole, roleBlock } from './launch-role.mjs';
-import { addDispatched, autoCreate, finishRun, liveRun, move, publish, stated } from './workflow.mjs';
+import { addDispatched, autoCreate, finishRun, liveRun, move, placeFor, publish, stated } from './workflow.mjs';
 
 import fs from 'node:fs';
 import path from 'node:path';
@@ -258,8 +258,21 @@ export function boundToTeamflow(cwd, config = {}, state = {}, repository = undef
     }
     const cached = readJson(projectsCachePath(config));
     if (repository && projectFor(repository, cached?.projects)) return true;
+    // The session made or chose a run in this organisation (MACLEOD-761):
+    // somebody put this work on the board by hand, so its agents belong there.
+    if (state.sessionId && readWorkflows(config, { sessionId: state.sessionId }).via === 'session') return true;
   } catch { /* unbound is the safe answer */ }
   return false;
+}
+
+/** Where a dispatch happens: the session, its repository and that repository's project. */
+export function dispatchPlace(config, state = {}, info = {}, cwd = undefined) {
+  return placeFor({
+    config,
+    cwd: cwd || state.cwd,
+    info: { ...info, repository: info?.repository || state.reportedRepository },
+    sessionId: state.sessionId,
+  });
 }
 
 /**
@@ -269,9 +282,12 @@ export function boundToTeamflow(cwd, config = {}, state = {}, repository = undef
  * run. Undefined when the lock was not had in time; the async half
  * tries again.
  */
-export function ensureRun(config, state = {}, info = {}, { waitMs, keys = [] } = {}) {
+export function ensureRun(config, state = {}, info = {}, { waitMs, keys = [], cwd } = {}) {
   const held = withRunsLock(() => {
-    const runs = readWorkflows(config);
+    // This session's run, and only if the work fits it; else the run for
+    // this repository or project (MACLEOD-761). Never another session's
+    // run because it was the newest on the machine.
+    const runs = readWorkflows(config, dispatchPlace(config, state, info, cwd));
     let run = liveRun(runs);
     let created = false;
     if (!run) {
@@ -279,9 +295,11 @@ export function ensureRun(config, state = {}, info = {}, { waitMs, keys = [] } =
       created = true;
     }
     let changed = created;
+    // Joined, so it is this session's now: pointed at, never only inherited.
+    if (runs.current !== run.id || runs.via === 'legacy') { runs.current = run.id; runs.via = 'dispatch'; changed = true; }
     for (const key of [state.binding?.key, ...keys].filter(Boolean)) {
       if (!(run.tickets || []).some((t) => t.key === key)) {
-        addDispatched(run, key);
+        addDispatched(run, key, runs.place);
         changed = true;
       }
     }
@@ -330,7 +348,7 @@ export function planLaunch(config, { state = {}, dispatch = {}, cwd, info = {}, 
       out.reason = 'unbound';
       return out;
     }
-    const made = ensureRun(config, state, info);
+    const made = ensureRun(config, state, info, { cwd });
     if (made?.created) out.notice = createdNotice(made.run);
     if (made) out.run = { id: made.run.id, name: made.run.name };
     if (dispatch.kind !== 'agent') return out;
@@ -414,7 +432,7 @@ export async function settle(config, { sessionId, launch, state = {}, cwd, info 
           writeMint(sessionId, launch.id, result);
           minted = true;
           result = await publishMinted(sessionId, launch, result, { state, cwd, config, info });
-          ensureRun(config, state, info, { waitMs: 5000, keys: [got.key] });
+          ensureRun(config, state, info, { waitMs: 5000, keys: [got.key], cwd });
         } else {
           result = {
             state: 'failed',
@@ -430,7 +448,7 @@ export async function settle(config, { sessionId, launch, state = {}, cwd, info 
       if (!result) result = mintOf(sessionId, launch.id);
     }
     if (minted || publishRun) {
-      const run = liveRun(readWorkflows(config));
+      const run = liveRun(readWorkflows(config, dispatchPlace(config, state, info, cwd)));
       if (run) { try { await publish(run, config); } catch { /* queued or refused; the run is on this machine */ } }
     }
   } catch { /* fails open: the launch stays pending and status counts it */ }
@@ -484,6 +502,33 @@ export async function publishOwed(config, { sessionId, state = {}, cwd, info = {
     }
   } catch { /* the next turn tries again */ }
   return tried;
+}
+
+/**
+ * Give a node to every agent the session sent while its repository was
+ * not yet on TeamFlow (MACLEOD-761). The website session dispatched an
+ * agent, then made a run and bound a ticket; the launch kept "unbound"
+ * for ever and its work reached no card. Once the repository counts as
+ * bound, each such launch is owed a node like any other and is settled
+ * here. At most `limit` a turn, on `Stop` and `SubagentStop`. Returns
+ * how many were given one. Never throws.
+ */
+export async function replanUnbound(config, { sessionId, state = {}, cwd, info = {}, limit = 3 } = {}) {
+  let done = 0;
+  try {
+    if (!sessionId) return 0;
+    const waiting = launchesOf(sessionId).filter((l) => l.reason === 'unbound' && !l.key && !l.launchedBy && l.id);
+    if (!waiting.length || !boundToTeamflow(cwd, config, state, info?.repository)) return 0;
+    if (!ensureRun(config, state, info, { cwd })) return 0;
+    for (const launch of waiting.slice(0, limit)) {
+      const owed = { ...launch, pending: true };
+      delete owed.reason;
+      writeJson(path.join(launchesPath(sessionId), `${launch.id}.json`), owed);
+      const got = await settle(config, { sessionId, launch: owed, state, cwd, info });
+      if (got?.key) done += 1;
+    }
+  } catch { /* the next turn tries again */ }
+  return done;
 }
 
 /**
