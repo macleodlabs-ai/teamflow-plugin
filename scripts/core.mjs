@@ -5899,6 +5899,19 @@ export async function sendSay({ jiraKey, line, by, at }, config) {
   return result;
 }
 
+/**
+ * The machine's map of one repository's CI (MACLEOD-792): names, kinds,
+ * order and thresholds, checked by `gatemap.mjs::validateMap` first. Free
+ * like an inventory, and never queued: `teamflow gates map` says whether
+ * it arrived.
+ */
+export async function sendGateMap(payload, config) {
+  if (!credentialKind(config)) return { ok: false, skipped: true, reason: 'no service credential configured' };
+  const envelope = { kind: 'gatemap', payload };
+  const idempotencyKey = crypto.createHash('sha256').update(JSON.stringify(envelope)).digest('hex');
+  return postEnvelope(`${serviceUrl(config)}/v1/report`, envelope, idempotencyKey, config, reportScope(config));
+}
+
 export async function fetchAccount(config) {
   const cred = await credential(config);
   if (!cred) return { ok: false, reason: 'no service credential available' };

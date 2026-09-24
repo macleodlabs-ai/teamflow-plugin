@@ -237,6 +237,26 @@ Documents written before this shape are still read, and so are reports still sen
 
 `history` rows are events in the one shape above, written with `source: "pr"` and `kind: "forge"`: the forge's `action` is the row's sentence and the delivery id is its evidence. No title, no branch, no body, no review comment.
 
+#### The CI gate's parts (MACLEOD-792)
+
+The service reads the jobs and steps of each CI run the GitHub App hears about (`adapters/teamflow/ci_parts.py`), in the five-minute pass and never inside the webhook's request, and adds what they say to the same sidecar:
+
+```text
+"parts": [ { "kind": "build" | "lint" | "test" | "security_scan" | "deploy",
+             "label": "Tests",
+             "status": "passed" | "failed" | "running" | "not_run" | "skipped",
+             "failurePoints": ["Run npx vitest run", "11 passed, 1 failed", "11/12"],   (≤ 5)
+             "at": "<ISO>" } ]
+"partsRuns": { "<workflow name>": { "id", "attempt", "finished", "parts" } }
+"points": [ … ]  (points.py, gate "ci", key "part:<kind>", text "test: 11/12")
+```
+
+One part per kind, in the order the runner runs them. `failurePoints` are the failed step's **name**, the failed check run's output **title**, the **counts** in its summary (`11/12`, `3 failed`) and its annotations' **titles**, each one line of at most 120 characters. Never the summary's text, an annotation's message, the output's text, a log line, a script or code. A test part's annotation titles name tests, so they are dropped while `adapter.reporting.failingTests` is off. `parts` and `partsRuns` go with the commit they describe and are dropped when the head changes; `points` stay, because the next run is what checks them off.
+
+Per repository, the gate's parts are published at `pipelines/ci-parts/<owner>--<name>.json` (`{repository, gate, parts: [{kind, label}], runs, disagreements}`) and on the bundle as `pipelines.parts[<owner/name>]`. A step's kind is cached at `ci/kinds/<owner>--<name>.json` by workflow and step name, so a known step is never asked about twice.
+
+The App needs **Actions: read** (and Checks: read, which the check events already need) to list a run's jobs.
+
 ### The `detail` block on the `tracker` sidecar
 
 `runtime/<KEY>/tracker.json` carries a `detail` block: the structure the tracker keeps around the issue, written only by a verified connector webhook and never by a reporter. Its fields are the whole of it:
@@ -575,6 +595,45 @@ line when this machine has none current. Each change is a row on the run's
 `hygiene[]` by `classifier`; the outcome goes back as usual (`done` with the
 plugin's own sentence, or `not_needed`), and `actions[]` on the issue
 document may carry `kind: "tidy"`. Nothing received is run in a shell.
+
+### The machine's map of its CI (MACLEOD-792)
+
+The eighth kind. The service sees a CI run's step names; only the machine
+can read what the workflow runs. `teamflow gates learn` reads the
+repository's `.github/workflows/*.yml` (jobs, steps, the head of each
+`run:`, each `uses:`), the `package.json` scripts and Makefile targets those
+steps call, tox and nox environments and `sonar-project.properties`, and
+drafts a map. When a repository has no map for its CI files as they are now,
+the session's own Claude is asked once (a SessionStart notice, at most once a
+day) to check the draft, explain what scripts such as `npm run verify` run
+and write the quality gate's conditions. `teamflow gates map --file` checks
+the result and sends it.
+
+```text
+{ "kind": "gatemap", "payload": {
+    "repo": "owner/name",
+    "gates": [ { "gate": "ci", "parts": [ { "kind", "label", "matches": ["<step or job name glob>"] } ] } ],   (≤ 6, ≤ 12 parts, ≤ 20 matches)
+    "quality": [ { "condition": "Coverage on new code", "threshold": "80%" } ],   (≤ 20)
+    "sourceHash": "<16 hex: a digest of the CI files>" } }
+```
+
+- **Names, kinds, order and thresholds only.** A label is plain words (the
+  words checker, both ends) of at most 40 characters; a match is one line of
+  at most 120. Never a script, a command's arguments, code or a log. What
+  `learn` read to make the draft (command heads, script and target names,
+  SonarQube setting keys) stays on the machine; SonarQube's token, host,
+  project key and organisation are never read at all.
+- **Refused on the machine first.** An unknown field, a kind outside the six,
+  a label that is not plain, a match on two lines, or a `sourceHash` that no
+  longer matches the CI files is refused before anything is sent. The
+  service drops unknown fields and refuses the rest again.
+- **Stored** at `pipelines/ci-map/<owner>--<name>.json`, one per repository;
+  each replaces the last. Free and never queued.
+- **What the service does with it** (`ci_parts.py`): a step or job whose name
+  matches a part's glob takes that part's kind and label without asking the
+  classifier. Observed runs still decide each part's status and the order;
+  a run whose parts differ from the map is written down on the gate's parts
+  document (`disagreements`), so the next `learn` can fix the map.
 
 ### A gate's lifecycle on the runtime sidecar (MACLEOD-639)
 

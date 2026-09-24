@@ -71,6 +71,8 @@ const USAGE = `teamflow \u2014 delivery reporting for TeamFlow
   teamflow org [switch <id>]       which organisation this session syncs under
   teamflow status                  who is signed in, what is bound, what was sent
   teamflow gates                   the checks your organisation added that this card must still pass
+  teamflow gates learn [--json]    read this repository's CI files and draft a map of its parts
+  teamflow gates map --file <path> check a map of the CI parts and send it to TeamFlow
   teamflow bind <issue> [--local] | unbind
                                    name the ticket by hand, or stop; --local writes
                                    the binding inside the repository, for a worktree
@@ -984,6 +986,12 @@ try {
     const { main } = await import('./hooks.mjs');
     process.exit(await main(args, { cwd, config }));
   } else if (command === 'status') await status();
+  else if (command === 'gates' && ['learn', 'map'].includes(args[0])) {
+    // The machine's map of its CI (MACLEOD-792): read here, sent as
+    // names, kinds and order only.
+    const { main } = await import('./gatemap.mjs');
+    process.exit(await main(args, { cwd, config }));
+  }
   else if (command === 'gates') await gates();
   else if (command === 'bind') await bind();
   else if (command === 'work-on') await workOn();

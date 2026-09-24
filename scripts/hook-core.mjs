@@ -1259,6 +1259,14 @@ export async function handleEvent(input = {}) {
       const { takeNotices } = await import('./video-evidence.mjs');
       notices = [...notices, ...takeNotices(dataDir())];
     } catch { /* nothing to say is said */ }
+    // The map of this repository's CI (MACLEOD-792): asked of this
+    // session's Claude only when there is none for the CI files as they
+    // are now, once a day at most. File reads only.
+    try {
+      const { gatemapLines } = await import('./gatemap.mjs');
+      const { dataDir, repositoryRoot } = await import('./core.mjs');
+      notices = [...notices, ...gatemapLines({ cwd, stampDir: dataDir(), rootOf: repositoryRoot })];
+    } catch { /* nothing to say is said */ }
   }
   // Other sessions on this card or in this folder (MACLEOD-641): told,
   // never blocked. Local files only; the heartbeat keeps the service's word.

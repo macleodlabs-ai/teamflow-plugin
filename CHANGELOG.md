@@ -3,6 +3,16 @@
 What changed in each published version of the TeamFlow plugin, newest first.
 Only what a person using it would notice.
 
+## 0.3.42
+
+- **A CI run that does several jobs shows each part.** When one workflow
+  builds, lints and tests, the card shows a tick or a cross for each part.
+- **`teamflow gates learn`** reads this repository's CI files on your
+  machine and drafts a map of those parts. Claude can help you check it.
+- **`teamflow gates map --file <path>`** checks the map and sends it to
+  TeamFlow. It sends step names and part kinds only. Scripts, commands,
+  code and logs stay on your machine.
+
 ## 0.3.41
 
 - **Each card can say what a person gets.** `teamflow card say <KEY> "<line>"`
