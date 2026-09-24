@@ -59,12 +59,15 @@ function gateOf(stage, pipeline = DEFAULT_PIPELINE) {
 function gateById(id, pipeline = DEFAULT_PIPELINE) {
   return pipeline.gates.find((gate) => gate.id === id);
 }
+function buildGate(pipeline = DEFAULT_PIPELINE) {
+  return gateOf("LOCAL_DEV", pipeline);
+}
 function gateFor(item, pipeline = DEFAULT_PIPELINE) {
+  if (isReworkStage(item.stage)) return buildGate(pipeline) ?? gateOf(item.stage, pipeline);
   if (item.gate) {
     const named = gateById(item.gate, pipeline);
     if (named) return named;
   }
-  if (isReworkStage(item.stage) && item.reworkFrom) return gateOf(item.reworkFrom, pipeline);
   return gateOf(item.stage, pipeline);
 }
 function gateIndex(gate, pipeline = DEFAULT_PIPELINE) {
@@ -73,7 +76,7 @@ function gateIndex(gate, pipeline = DEFAULT_PIPELINE) {
 function displayStagesOf(pipeline = DEFAULT_PIPELINE) {
   const out = {};
   for (const stage of STAGE_VALUES) {
-    const gate = gateOf(stage, pipeline);
+    const gate = gateFor({ stage }, pipeline);
     out[stage] = gate?.stages[0] ?? stage;
   }
   return out;
@@ -296,8 +299,8 @@ function time(value) {
   const parsed = value ? Date.parse(value) : Number.NaN;
   return Number.isFinite(parsed) ? parsed : 0;
 }
-function isRework(card) {
-  return card.stage === "LOCAL_REWORK" || card.stage === "DEV_REWORK" || Boolean(card.reworkFrom);
+function inRework(card) {
+  return card.stage === "LOCAL_REWORK" || card.stage === "DEV_REWORK";
 }
 function planDoneAt(keys, workflows) {
   let at;
@@ -363,13 +366,13 @@ function newestReport(card) {
 function settledStep(card, out) {
   const held = card.settled;
   if (!held || !GATE_STEPS.includes(out.stage) || !REST_STEPS.includes(held.stage)) return out;
-  if (card.removed || card.gate || isRework(card) || time(held.at) < newestReport(card)) return out;
+  if (card.removed || card.gate || time(held.at) < newestReport(card)) return out;
   const summary = held.stage === "DEV_VERIFIED" ? SETTLED_DEPLOYED : SETTLED_WAITING;
   return { stage: held.stage, status: "idle", from: card.stage, missed: [], summary };
 }
 function reportedStep(card, workflows) {
   const same = { stage: card.stage, status: card.status, missed: [] };
-  if (card.removed || card.gate || card.stage === "BACKLOG" || isRework(card)) return same;
+  if (card.removed || card.gate || card.stage === "BACKLOG" || inRework(card)) return same;
   if (card.stage === "DONE") {
     const missed = missedSteps(card);
     return { ...same, finished: "tracker", finishedAt: finishTime(card, lastDoneMove(card)), missed, summary: finishedWords("tracker", missed) };
@@ -636,11 +639,11 @@ var BANNED_RE = any(BANNED);
 var JARGON_RE = any(JARGON);
 var isUpper = (c) => c !== c.toLowerCase();
 var upperFirst = (s) => s[0].toUpperCase() + s.slice(1);
-function plainer(text2) {
-  return text2.replace(GLOSS, (found, _g, at) => {
+function plainer(text3) {
+  return text3.replace(GLOSS, (found, _g, at) => {
     const plain = LOOKUP[found.toLowerCase()];
     const original = ORIGINAL[found.toLowerCase()];
-    const before = text2.slice(0, at).trimEnd();
+    const before = text3.slice(0, at).trimEnd();
     const first = !before || ".!?".includes(before[before.length - 1]);
     return isUpper(found[0]) && original === original.toLowerCase() && first ? upperFirst(plain) : plain;
   });
@@ -897,8 +900,8 @@ var K = new Uint32Array([
   3329325298
 ]);
 var rotr = (x, n) => x >>> n | x << 32 - n;
-function sha256Hex(text2) {
-  const bytes = new TextEncoder().encode(text2);
+function sha256Hex(text3) {
+  const bytes = new TextEncoder().encode(text3);
   const bitLength = bytes.length * 8;
   const padded = new Uint8Array(bytes.length + 9 + 63 >> 6 << 6);
   padded.set(bytes);
@@ -1187,8 +1190,8 @@ function accountingOf(input) {
     const waitingOutside = waitingOn === "review" || waitingOn === "ci" || waitingOn === "dependency";
     const stalled = midStage && !finished && (Boolean(noVerdict) || live && band === "idle" && !waitingOutside);
     const blocked = openEdges.length > 0;
-    const isRework2 = Boolean(rework);
-    const idle = band === "idle" && !stalled && !blocked && !isRework2;
+    const isRework = Boolean(rework);
+    const idle = band === "idle" && !stalled && !blocked && !isRework;
     const inFlight = midStage && !finished && !stalled && !idle;
     const unassigned = !ticket.assignee && !ticket.member;
     const shipped = shippedAt(ticket);
@@ -1221,7 +1224,7 @@ function accountingOf(input) {
         live,
         stalled,
         blocked,
-        rework: isRework2,
+        rework: isRework,
         idle,
         inFlight,
         unassigned,
@@ -1334,6 +1337,52 @@ function readAdhocTickets(raw) {
   }
   const setting = readSetting(held.setting);
   return { setting: setting ?? OFF, source: setting && held.source === "org" ? "org" : "default", projects };
+}
+
+// src/lib/ciParts.ts
+var KINDS = ["build", "lint", "test", "security_scan", "deploy", "other"];
+var STATUSES = ["passed", "failed", "running", "not_run", "skipped"];
+var SHORT = {
+  build: "Build",
+  lint: "Lint",
+  test: "Test",
+  security_scan: "Scan",
+  deploy: "Deploy",
+  other: ""
+};
+var text2 = (value, max = 120) => typeof value === "string" ? value.trim().slice(0, max) : "";
+function readPart(raw) {
+  if (!raw || typeof raw !== "object") return void 0;
+  const { kind, label } = raw;
+  if (!KINDS.includes(kind)) return void 0;
+  return { kind, label: text2(label, 40) || SHORT[kind] || "Other" };
+}
+function readCardParts(raw) {
+  if (!Array.isArray(raw)) return [];
+  const seen = /* @__PURE__ */ new Set();
+  const out = [];
+  for (const row of raw) {
+    const part = readPart(row);
+    const status = row?.status;
+    if (!part || seen.has(part.kind) || !STATUSES.includes(status)) continue;
+    seen.add(part.kind);
+    const points = row.failurePoints;
+    const failurePoints = Array.isArray(points) ? points.map((p) => text2(p)).filter(Boolean) : [];
+    const at = text2(row.at, 40);
+    out.push({ ...part, status, ...failurePoints.length ? { failurePoints } : {}, ...at ? { at } : {} });
+  }
+  return out;
+}
+function readGateParts(raw) {
+  if (!raw || typeof raw !== "object") return void 0;
+  const out = {};
+  for (const [repo, held] of Object.entries(raw)) {
+    if (!held || typeof held !== "object") continue;
+    const { gate, parts } = held;
+    const read = (Array.isArray(parts) ? parts : []).map(readPart).filter((p) => Boolean(p));
+    if (read.length) out[repo] = { gate: text2(gate, 40) || "ci", parts: read };
+  }
+  return Object.keys(out).length ? out : void 0;
 }
 
 // src/lib/dataSource.ts
@@ -1477,8 +1526,10 @@ function isPrSidecar(sidecar) {
 }
 function mergePrState(issue, sidecar) {
   if (!sidecar) return issue;
-  if (issue.pr && timestamp(issue.updatedAt) > timestamp(sidecar.occurredAt)) return issue;
-  return { ...issue, pr: sidecar.pr };
+  const parts = readCardParts(sidecar.parts);
+  const withParts = parts.length ? { ...issue, ciParts: parts } : issue;
+  if (issue.pr && timestamp(issue.updatedAt) > timestamp(sidecar.occurredAt)) return withParts;
+  return { ...withParts, pr: sidecar.pr };
 }
 function isHygieneSidecar(sidecar) {
   return sidecar.slot === "hygiene";
@@ -1620,16 +1671,16 @@ function normaliseConnections(body) {
     const provider = String(row.provider ?? "").toLowerCase();
     if (!isTracker2(provider)) return [];
     const connection = { provider };
-    const text2 = (...names) => {
+    const text3 = (...names) => {
       for (const name of names) {
         const value = row[name];
         if (typeof value === "string" && value) return value;
       }
       return void 0;
     };
-    const id = text2("id");
+    const id = text3("id");
     if (id) connection.id = id;
-    const filter = text2("filter");
+    const filter = text3("filter");
     const legacyFilter = typeof row.scope === "string" ? row.scope : void 0;
     if (filter ?? legacyFilter) connection.filter = filter ?? legacyFilter;
     const when = (...names) => {
@@ -1637,15 +1688,15 @@ function normaliseConnections(body) {
         const value = row[name];
         if (typeof value === "number" && value > 0) return new Date(value * 1e3).toISOString();
       }
-      return text2(...names);
+      return text3(...names);
     };
     const delivered = when("last_delivery_at", "lastDeliveryAt");
     if (delivered) connection.lastDeliveryAt = delivered;
-    const failed = text2("last_error", "lastError");
+    const failed = text3("last_error", "lastError");
     if (failed) connection.lastError = failed;
-    const label = text2("provider_label", "providerLabel");
+    const label = text3("provider_label", "providerLabel");
     if (label) connection.providerLabel = label;
-    const via = text2("connected_via", "connectedVia");
+    const via = text3("connected_via", "connectedVia");
     if (via) connection.connectedVia = via;
     const done = row.connected ?? row.isConnected;
     if (typeof done === "boolean") connection.connected = done;
@@ -1659,7 +1710,7 @@ function normaliseConnections(body) {
     }
     const backfillable = row.can_backfill ?? row.canBackfill;
     if (typeof backfillable === "boolean") connection.canBackfill = backfillable;
-    const backfill = text2("backfill_state", "backfillState");
+    const backfill = text3("backfill_state", "backfillState");
     if (backfill) connection.backfillState = backfill;
     const counted = row.last_backfill_count ?? row.backfill_count ?? row.backfillCount;
     if (typeof counted === "number") connection.backfillCount = counted;
@@ -1669,7 +1720,7 @@ function normaliseConnections(body) {
     if (typeof read === "number") connection.backfillSeen = read;
     const backfilled = when("last_backfill_at", "lastBackfillAt");
     if (backfilled) connection.lastBackfillAt = backfilled;
-    const backfillFailed = text2("last_backfill_error", "lastBackfillError");
+    const backfillFailed = text3("last_backfill_error", "lastBackfillError");
     if (backfillFailed) connection.lastBackfillError = backfillFailed;
     const stalled = row.backfill_stalled ?? row.backfillStalled;
     if (typeof stalled === "boolean") connection.backfillStalled = stalled;
@@ -1790,6 +1841,7 @@ function readServiceState(index) {
 }
 function pipelinesOf(raw) {
   if (!raw || typeof raw !== "object") return {};
+  const gateParts = readGateParts(raw.parts);
   const { pipeline, source } = pipelineFromBundle(raw);
   const projects = {};
   const held = raw.projects;
@@ -1799,7 +1851,7 @@ function pipelinesOf(raw) {
       if (got.source === "project") projects[id] = got.pipeline;
     }
   }
-  return { ...source === "default" ? {} : { pipeline }, projectPipelines: projects };
+  return { ...source === "default" ? {} : { pipeline }, projectPipelines: projects, ...gateParts ? { gateParts } : {} };
 }
 function mergeCardQueue(issue, hygiene, pings) {
   const queue = hygiene?.actions?.filter((row) => row && typeof row.id === "string" && typeof row.kind === "string");
@@ -1910,8 +1962,8 @@ function time6(value) {
   const parsed = value ? Date.parse(value) : Number.NaN;
   return Number.isFinite(parsed) ? parsed : 0;
 }
-function clip(text2, max = REASON_MAX) {
-  const line = String(text2 ?? "").replace(/\s+/g, " ").trim();
+function clip(text3, max = REASON_MAX) {
+  const line = String(text3 ?? "").replace(/\s+/g, " ").trim();
   if (!line) return void 0;
   return line.length > max ? `${line.slice(0, max - 1).trimEnd()}\u2026` : line;
 }

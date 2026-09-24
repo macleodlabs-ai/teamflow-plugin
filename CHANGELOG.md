@@ -3,6 +3,14 @@
 What changed in each published version of the TeamFlow plugin, newest first.
 Only what a person using it would notice.
 
+## 0.3.43
+
+- **A card that fails a check goes back to build.** It carries that
+  check's failure points, like a ticket sent back by a tester. This is
+  true for tests, audits, CI, SonarQube, reviews and your own checks.
+- **`/teamflow:update` names the part of a CI run that failed**, for
+  example "back from CI/CD · test: 11/12".
+
 ## 0.3.42
 
 - **A CI run that does several jobs shows each part.** When one workflow
