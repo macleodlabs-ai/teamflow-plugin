@@ -7,7 +7,7 @@
 // src/lib/progressCli.ts), so the numbers are the page's numbers. Nothing is
 // written and nothing is sent anywhere else.
 import { fetchState } from './core.mjs';
-import { progressText } from './progress-core.mjs';
+import { progressText, workLinesFromBundle } from './progress-core.mjs';
 
 export const PROGRESS_USAGE = 'teamflow progress [--csv | --line]   the progress of all current and remaining work, as a table';
 
@@ -31,6 +31,11 @@ export async function main(args = [], ctx = {}) {
     return 1;
   }
   print(progressText(result.document, ctx.now ?? Date.now(), format));
+  // Where each open plan item is, by the board's own columns (MACLEOD-773).
+  if (format === 'markdown') {
+    const lines = workLinesFromBundle(result.document);
+    if (lines.length) print(`\nWhere each open plan item is:\n${lines.map((l) => `- ${l}`).join('\n')}\n`);
+  }
   return 0;
 }
 

@@ -79,6 +79,11 @@ const USAGE = `teamflow \u2014 delivery reporting for TeamFlow
   teamflow next [--dry-run]        take the top-priority open ticket and bind it
   teamflow progress [--csv|--line] the progress of all current and remaining work,
                                    as the table the dashboard shows
+  teamflow update                  the Status update: what is live, merged,
+                                   still being built and what needs you
+  teamflow card say <KEY> "<line>" [--by model|person]
+                                   one plain line on the card about what a
+                                   person gets from it; checked before it is sent
   teamflow adhoc start "<what the work is>" | title "<...>" | done
                                    work that arrived without a ticket: TeamFlow
                                    mints the key; \`teamflow adhoc --help\` has the rest
@@ -275,6 +280,14 @@ async function status() {
   // fact somebody checked and not a line that was never there.
   const { dispatchLine, dispatchSummary } = await import('./dispatch.mjs');
   const dispatched = dispatchLine(dispatchSummary(state?.sessionId));
+  // Where each piece of this session is, by the organisation's own column
+  // names (MACLEOD-773): `<column> · <plain task> · <KEY>`, in column order.
+  const { launchesOf } = await import('./dispatch.mjs');
+  const { linesFor, loadPipeline, sessionWork } = await import('./columns.mjs');
+  const work = state?.sessionId
+    ? linesFor(sessionWork(state.sessionId, { launches: launchesOf(state.sessionId) }),
+      (await loadPipeline(config, { project: project?.id })).pipeline)
+    : [];
   // Whether this session's live heartbeat is running (MACLEOD-641).
   const { heartbeatLine } = await import('./heartbeat.mjs');
   const heartbeat = heartbeatLine(state?.sessionId);
@@ -337,6 +350,7 @@ async function status() {
     loopCount: state?.loopCount || 0,
     ...(toPass?.length ? { checksToPass: toPass } : {}),
     dispatched,
+    ...(work.length ? { work } : {}),
     heartbeat,
     autoContinue,
     snapshot,
@@ -982,6 +996,17 @@ try {
   else if (command === 'progress') {
     // Read-only: the organisation's bundle, through the dashboard's own rules.
     const { main } = await import('./progress.mjs');
+    process.exit(await main(args, { config }));
+  }
+  else if (command === 'update') {
+    // Read-only: the Status update from the board (MACLEOD-770).
+    const { main } = await import('./update.mjs');
+    process.exit(await main(args, { config }));
+  }
+  else if (command === 'card') {
+    // `teamflow card say KEY "<line>"` (MACLEOD-770): exit 2 on a line
+    // that is not plain, which the words checker says why.
+    const { main } = await import('./say.mjs');
     process.exit(await main(args, { config }));
   }
   else if (command === 'workflow') {

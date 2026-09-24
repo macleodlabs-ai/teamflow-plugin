@@ -23,7 +23,7 @@ import crypto from 'node:crypto';
 
 import * as core from './core.mjs';
 import { settleMovedAgents } from './dispatch.mjs';
-import { openKeys, reportMerged } from './merged.mjs';
+import { openKeys, reportMerged, withBoardKeys } from './merged.mjs';
 
 // heartbeat.mjs hands in its own row and key checks (`helpers`), so the
 // inventory and the beat say an agent the same way. They are passed in,
@@ -193,11 +193,19 @@ export async function sendInventory({
     const config = core.loadConfig(cwd);
     const inventory = buildInventory({ cwd, config, ...rest });
     const out = await send(inventory, config);
-    // The same pass asks git which of those keys are merged (MACLEOD-726).
+    // The same pass asks git which of those keys are merged (MACLEOD-726),
+    // and which of the board's open cards (MACLEOD-773): a card whose
+    // worktree is gone still finishes, and nobody runs the backfill.
     try {
-      await reportMerged(openKeys(inventory), {
+      const merged = await reportMerged(withBoardKeys(openKeys(inventory), out), {
         root: core.repositoryRoot(cwd), config, run: rest.run, repo: inventory.repo, now: rest.now, send: sendMerged,
       });
+      // The next prompt asks for the plain line of each card that just
+      // merged and has none (MACLEOD-770). Local file only.
+      if (merged?.keys?.length) {
+        const { oweLines } = await import('./say.mjs');
+        oweLines(merged.keys, 'merge');
+      }
     } catch { /* the next pass is twenty minutes away */ }
     // An agent that moved to another ticket and then went quiet never
     // settles its own node; this pass does it for it (MACLEOD-713).

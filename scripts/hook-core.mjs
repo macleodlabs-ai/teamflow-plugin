@@ -630,6 +630,34 @@ function dispatchedLaunch(sessionId, input, launchedBy) {
 // Everything between reading an event and having published it. Returns
 // the state it saved and whether the binding is new, so a caller can
 // decide what, if anything, to say on stdout.
+/**
+ * The ask for a card's plain line at dispatch, merge or deploy
+ * (MACLEOD-770), or undefined. `keys` is a key or text naming keys. A
+ * dispatch starts work, so a line older than it is about earlier work.
+ * Local files only; never throws.
+ */
+export const SAY_LEADS = {
+  dispatch: 'You sent an agent to work on it.',
+  merge: 'The work is merged.',
+  deploy: 'The work is going live.',
+};
+
+export async function sayAt(when, keys) {
+  try {
+    const { keysIn } = await import('./merged.mjs');
+    const { noteWork, sayPrompt } = await import('./say.mjs');
+    const found = [...keysIn(Array.isArray(keys) ? keys.join(' ') : keys)].slice(0, 3);
+    if (!found.length) return undefined;
+    if (when === 'dispatch') {
+      const at = new Date().toISOString();
+      for (const key of found) noteWork(key, at);
+    }
+    return sayPrompt(found, SAY_LEADS[when]);
+  } catch {
+    return undefined;
+  }
+}
+
 export async function handleEvent(input = {}) {
   const event = input.hook_event_name || 'Unknown';
   const sessionId = input.session_id || 'unknown-session';
@@ -884,6 +912,13 @@ export async function handleEvent(input = {}) {
     if (shown.role && state.reviewNext) delete state.reviewNext;
     if (dispatching.kind === 'agent') state.represented = shown;
     if (shown.notice) state.dispatchNotice = shown.notice;
+    // The card's plain line (MACLEOD-770): the session that sends an agent
+    // knows what the work gives a person. Keys named in the launch's
+    // name, description and opening lines, read in memory only.
+    if (dispatching.kind === 'agent') {
+      const ask = await sayAt('dispatch', [given.name, given.description, String(given.prompt || '').slice(0, 300)].join(' '));
+      if (ask) state.sayNotice = ask;
+    }
     // A shell dispatch has no launch to settle; its run is published here,
     // on the async path it already runs on.
     if (dispatching.kind !== 'agent' && shown.run) await settle(config, { sessionId, state, cwd, info, publishRun: true });
@@ -973,6 +1008,13 @@ export async function handleEvent(input = {}) {
 
   const transition = classifyTool(resolved, state, config);
   state = applyTransition(state, transition);
+  // A merge or a deploy of this session's work (MACLEOD-770): ask for the
+  // card's plain line when it has none, or one older than the work.
+  if (!agentKey && transition && transition.status !== 'failed' && ['MERGE', 'DEPLOY_DEV'].includes(transition.stage)) {
+    const key = transition.forKey || state.binding?.key;
+    const ask = key ? await sayAt(transition.stage === 'MERGE' ? 'merge' : 'deploy', key) : undefined;
+    if (ask) state.sayNotice = ask;
+  }
 
   /*
    * The rule goes into the project's own CLAUDE.md (MACLEOD-639, the
@@ -1190,6 +1232,13 @@ export async function handleEvent(input = {}) {
       .map(({ key: _key, ...row }) => row);
     if (mine.length) state.actions = [...(state.actions || []), ...mine].slice(-16);
     const healed = await tick(config, { budget }).catch(() => ({ lines: [] }));
+    // The organisation's columns, kept fresh for the next prompt's line
+    // (MACLEOD-773): at most one read per five minutes, on this async path.
+    try {
+      const { loadPipeline } = await import('./columns.mjs');
+      const project = (await resolveProject(info?.repository, config, { timeoutMs: 1500 }))?.id;
+      await loadPipeline(config, { project, timeoutMs: 1500 });
+    } catch { /* the kept copy stands */ }
     const heard = [...got.notices, ...healed.lines];
     if (heard.length) state.intakePending = [...(state.intakePending || []), ...heard].slice(-8);
     if (got.later?.length) state.intakeFixes = [...(state.intakeFixes || []), ...got.later].slice(-8);
@@ -1215,6 +1264,13 @@ export async function handleEvent(input = {}) {
   // never blocked. Local files only; the heartbeat keeps the service's word.
   if (FAST.includes(event) && !input.reporter_tool) {
     try { notices = [...notices, ...sessionLines(sessionId, cwd)]; } catch { /* nothing to say */ }
+    // Where each running agent's work is, by the board's column names
+    // (MACLEOD-773), so the model can say without asking. Kept copies only.
+    try {
+      const { contextLine } = await import('./columns.mjs');
+      const line = contextLine(config, sessionId, { repository: info?.repository });
+      if (line) notices = [...notices, line];
+    } catch { /* nothing to say */ }
   }
   if (FAST.includes(event) && state.intakePending?.length) {
     notices = [...state.intakePending, ...notices];
@@ -1245,6 +1301,20 @@ export async function handleEvent(input = {}) {
   if (state.dispatchNotice && (event === 'PostToolUse' || FAST.includes(event))) {
     notices = [...notices, state.dispatchNotice];
     delete state.dispatchNotice;
+    saveSession(state);
+  }
+  // The ask for a card's plain line (MACLEOD-770), said the same way; and
+  // on a prompt, the merges the background pass saw since the last one.
+  if (!agentKey && FAST.includes(event) && !input.reporter_tool) {
+    try {
+      const { takeOwed } = await import('./say.mjs');
+      const owed = takeOwed();
+      if (owed && owed !== state.sayNotice) notices = [...notices, owed];
+    } catch { /* nothing to say is said */ }
+  }
+  if (state.sayNotice && (event === 'PostToolUse' || FAST.includes(event))) {
+    notices = [...notices, state.sayNotice];
+    delete state.sayNotice;
     saveSession(state);
   }
 

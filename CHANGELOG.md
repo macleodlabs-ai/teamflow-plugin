@@ -3,6 +3,25 @@
 What changed in each published version of the TeamFlow plugin, newest first.
 Only what a person using it would notice.
 
+## 0.3.41
+
+- **Each card can say what a person gets.** `teamflow card say <KEY> "<line>"`
+  puts one plain line on the card. TeamFlow checks the words first. It
+  refuses code, file names, links and secrets.
+- **Claude is asked for that line** when it sends an agent, merges or
+  deploys, and only when the card has no current line.
+- **`/teamflow:update` prints a Status update**: what is live, what is
+  merged, what is still being built and what needs you. It uses the same
+  words as the dashboard.
+- **TeamFlow tidies cards.** When it finds finished work or a link to a
+  finished card, your machine checks the facts and cleans up.
+- **Each agent shows the step it is on.** The plugin reads the steps from
+  your organisation's plan and labels every agent with its column.
+- **Finished agents leave the board by themselves.** Their cards move on
+  when the work merges or ends, and they no longer sit in a test column.
+- **While paid plans are closed, the plugin says so plainly.** It shows the
+  same sentence as the dashboard, and your trial keeps going.
+
 ## 0.3.40
 
 - **Each session keeps its own plan.** Two Claude Code sessions on one

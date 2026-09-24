@@ -396,3 +396,68 @@ export function check(text) {
   }
   return problems;
 }
+
+// --- a card's plain line (MACLEOD-770) --------------------------------------
+//
+// One line about what a PERSON gets from a piece of work, written by the
+// model doing it (`teamflow card say KEY "..."`). Checked here before it
+// leaves the machine and again by the service with the same rules:
+// `adapters/teamflow/words.py::say_check` is the twin, and
+// tests/fixtures/say-vectors.json pins both to the same answers.
+
+export const SAY_MAX = 180;
+export const SAY_SENTENCES = 2;
+const SAY_SPLIT = /(?<=[.!?])\s+/;
+const SAY_URL = /\b(?:https?|ftp|ssh|file):\/\/\S*|\bwww\.\S+/i;
+const SAY_EMAIL = /[\w.+-]+@[\w-]+(?:\.[\w-]+)+/;
+const SAY_SECRET = /\b(?:sk|pk|rk|dk|ghp|gho|ghs|github_pat|xox[abpr])[-_][A-Za-z0-9_-]{8,}|\b(?:AKIA|ASIA)[A-Z0-9]{12,}|-----BEGIN|\b[A-Za-z0-9+/_-]{32,}/;
+const SAY_PATH = /(?:^|[\s("'])(?:~|\.{1,2})?\/\w|\b[\w.-]+\/[\w.-]+\/[\w./-]*|\b[\w-]+\.(?:mjs|cjs|js|jsx|ts|tsx|py|json|md|ya?ml|sh|css|html|toml|lock|sql|txt|env)\b/i;
+const SAY_CODE = /`|[{}<>;=|\\[\]]|\w\(|\b[a-z]+_[a-z0-9_]+\b|\b[a-z]+[A-Z]\w*|(?:^|\s)--?[a-z]/;
+const everywhere = (re) => new RegExp(re.source, `${re.flags}g`);
+
+/** The problems a card's plain line has, in order. Empty when it may be stored. */
+export function sayCheck(text) {
+  const line = String(text ?? '').replace(/\s+/g, ' ').trim();
+  if (!line) return [{ rule: 'empty', found: '' }];
+  const out = [];
+  if (line.length > SAY_MAX) out.push({ rule: 'too_long', found: `${line.length} characters` });
+  const count = line.split(SAY_SPLIT).filter((s) => WORD.test(s)).length;
+  if (count > SAY_SENTENCES) out.push({ rule: 'sentences', found: `${count} sentences` });
+  for (const [rule, re] of [['url', SAY_URL], ['email', SAY_EMAIL], ['secret', SAY_SECRET]]) {
+    const m = line.match(re);
+    if (m) out.push({ rule, found: m[0].trim().slice(0, 40) });
+  }
+  const rest = line.replace(everywhere(SAY_URL), ' ').replace(everywhere(SAY_EMAIL), ' ');
+  const path = rest.match(SAY_PATH);
+  if (path) out.push({ rule: 'path', found: path[0].trim().slice(0, 40) });
+  const code = rest.replace(everywhere(SAY_PATH), ' ').match(SAY_CODE);
+  if (code) out.push({ rule: 'code', found: code[0].trim().slice(0, 40) });
+  for (const p of check(line)) out.push({ rule: p.rule, found: p.found });
+  return out;
+}
+
+/** What each rule asks the writer to change, in plain words. */
+export const SAY_WORDS = {
+  empty: 'Write one line about what a person gets.',
+  too_long: 'Keep it to 180 characters.',
+  sentences: 'Use one or two sentences.',
+  code: 'Leave out code. Say what a person gets.',
+  path: 'Leave out file names and paths.',
+  url: 'Leave out links.',
+  email: 'Leave out email addresses.',
+  secret: 'Leave out keys and tokens.',
+  long: 'Keep each sentence to 20 words.',
+  banned: "Use plain words, not the tool's own words.",
+  passive: 'Say who does what.',
+  jargon: 'Use common words.',
+};
+
+/** One short sentence per distinct problem, in order. */
+export function sayWords(problems = []) {
+  const seen = [];
+  for (const p of problems) {
+    const said = SAY_WORDS[p?.rule] || '';
+    if (said && !seen.includes(said)) seen.push(said);
+  }
+  return seen.join(' ');
+}

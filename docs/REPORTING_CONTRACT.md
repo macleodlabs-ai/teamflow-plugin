@@ -505,6 +505,77 @@ board lists as open for the organisation.
   finished, one somebody still works on, or one with new work after the
   merge is left alone. Sent again, it writes nothing.
 
+### A card's plain line (MACLEOD-770)
+
+The seventh kind. One line about what a PERSON gets from the piece of work,
+written by the model doing the work in the user's own session (or by a
+person), with `teamflow card say <KEY> "<line>" [--by model|person]`. The
+plugin's hooks ask the session for it at dispatch, at merge and at deploy,
+and when a `tidy` arrives, only for a card with no line on this machine or
+one older than the work under way; they never block.
+
+```text
+{ "kind": "say", "payload": { "jiraKey": "<KEY>", "line": "<≤ 180 chars>",
+                              "by": "model" | "person", "at": "<ISO>" } }
+```
+
+- **Checked twice with the same rules**: by the plugin before anything is
+  sent (`sayCheck` in `plugin/scripts/words.mjs`) and by the service in
+  preflight (`say_check` in `adapters/teamflow/words.py`), pinned to the same
+  answers by `tests/fixtures/say-vectors.json`. The line must pass the plain
+  words checker (at most 20 words a sentence, no internal words, active
+  voice, common words), hold one or two sentences and at most 180
+  characters, and carry no code, file name or path, link, email address,
+  key or token. The service refuses anything else with `400
+  say_not_plain` and plain words saying what to change; nothing is written.
+- **Stored on the card itself**, as `say: { line, by, at }` on
+  `issues/<KEY>.json` (an ad hoc key that became a ticket writes the
+  ticket). So the board's first view, its pages, the bundle, the Status
+  update and `teamflow update` read it with no reader of their own. An
+  issue report cannot carry `say` (it is dropped as unknown), and every
+  later report keeps the stored one, so a line is replaced only by a newer
+  line; an older one is answered `said: "older"`. A key with no card yet is
+  answered `said: "no_card"` and nothing is written.
+- **History names who wrote it**: one row on the hygiene sidecar, `reason:
+  "line"`, `role: "model"` or `"person"`, `by` the member whose credential
+  sent it, and the line as the note.
+- **Free**, like a merged fact: a sentence about the work, not work
+  reported.
+
+### What an open card is, and the `tidy` it may get (MACLEOD-770)
+
+The classifier notices; the machine's model tidies. In the five-minute pass
+(`delivery.live`, `adapters/teamflow/card_tidy.py`) the service asks one
+watch question, `card_state`, of each open card (not Backlog, not finished)
+whose facts changed since it was last asked, at most eight a pass, through
+the decision seam (the classifier, rules standing in). It is shown fixed
+features only — `stage`, `liveOwner`, `livenessState`, `mergeSeen`,
+`prState`, `trackerClass`, `nodeState`, `waitingOn`, `hasLine`, `lineStale`,
+`openLinks`, `closedLinks`, `minutesSinceEvent` — never a key, a title or a
+line. The answer is one of `live_work`, `finished_not_closed`, `stuck`,
+`waiting_outside`, `stale_link`, kept on the hygiene sidecar's
+`watchAnswers[]` beside the rules' answer.
+
+When the sure answer (at the confidence bar) is `finished_not_closed` or
+`stale_link`, or the card has no plain line or one older than its last move,
+the service queues ONE action of kind `tidy` for the card's developer, as
+TeamFlow (`by: "teamflow"`), with no `args`: it carries its kind and its key
+and nothing else. Never while another `tidy` is on its way, never on a card
+a person switched TeamFlow off on, and each queue writes one History row by
+TeamFlow in the `classifier` role, `reason: "tidy"`, saying why in plain
+words. `tidy` is never a person's action: it is not in the card routes.
+
+On the machine (`plugin/scripts/intake.mjs`) a `tidy` maps onto operations
+the plugin already owns, decided from its own facts: (1) this repository's
+own merge facts prove the work merged — they are sent as a `merged` report
+and the run here that holds the key sets its node done; no proof, nothing is
+closed; (2) a dependency whose other end is done or skipped in the run is
+dropped (`undepend`); (3) the session's model is asked for the card's plain
+line when this machine has none current. Each change is a row on the run's
+`hygiene[]` by `classifier`; the outcome goes back as usual (`done` with the
+plugin's own sentence, or `not_needed`), and `actions[]` on the issue
+document may carry `kind: "tidy"`. Nothing received is run in a shell.
+
 ### A gate's lifecycle on the runtime sidecar (MACLEOD-639)
 
 A runtime sidecar is an execution: the same `id`, `kind`, `label`, `stage`,
@@ -534,7 +605,7 @@ The workflow document's `status` gains `stalled`: a running run whose ticket sta
 
 ### What a lead asked, and what came of it
 
-`actions[]` on the issue document: `id`, `kind` (`fix`, `bump`, `rerun_gate`, `resume_plan`, `skip_gate`), `by`, `at`, `outcome` (`done`, `refused`, `failed`, `not_needed`: a fix or re-run whose step passed, or whose card moved on or finished, before it was shown, MACLEOD-726), `reason` (≤ 120), capped at 16. A lead acts from the dashboard; the service holds the intent for the machine that has the ticket (`GET /v1/members/actions?for=<machineId>`, answered per action at `POST /v1/members/actions/{id}/outcome`); the plugin performs what it can and this is its record. **The action's text never travels back**: a `fix` is shown to the agent on the machine and what the report carries is that it was shown; `reason` is the plugin's own sentence ("deploy runs only from the main session"). Nothing here is a queued command, and nothing here is executed from text.
+`actions[]` on the issue document: `id`, `kind` (`fix`, `bump`, `rerun_gate`, `resume_plan`, `skip_gate`, and TeamFlow's own `tidy`, MACLEOD-770), `by`, `at`, `outcome` (`done`, `refused`, `failed`, `not_needed`: a fix or re-run whose step passed, or whose card moved on or finished, before it was shown, MACLEOD-726), `reason` (≤ 120), capped at 16. A lead acts from the dashboard; the service holds the intent for the machine that has the ticket (`GET /v1/members/actions?for=<machineId>`, answered per action at `POST /v1/members/actions/{id}/outcome`); the plugin performs what it can and this is its record. **The action's text never travels back**: a `fix` is shown to the agent on the machine and what the report carries is that it was shown; `reason` is the plugin's own sentence ("deploy runs only from the main session"). Nothing here is a queued command, and nothing here is executed from text.
 
 ### The project document
 
@@ -787,6 +858,7 @@ Four more fields on the issue document, plugin-written, and one more on the `age
 | `lastFailure` | `{stage, at, summary}` | The most recent failed gate, kept after its loop is cleared. |
 | `transitions[]` | `{stage, at, by}`, the latest 32 | When the ticket changed stage and who moved it, so "in CI/CD for 41 h" is a fact the plugin recorded, not a guess from `updatedAt`. Written on every stage change the plugin makes. Transitions the **service** observes — a tracker moving the issue, a pull request event — are written to the service-owned `hygiene` sidecar (WS-D) and the read side merges the two lists; nothing the service writes lives on this document, because every report replaces it whole. |
 | `agent.parentAgent` | the launcher's capped id, same shape as `agent.id` | Emitted for an agent an agent launched, so the board can nest them. Absent when the session launched it. |
+| `agent.agentTask`, `session.agentTask` (MACLEOD-773) | plain words, at most 60 characters, no path separator and never a worktree name | What the agent or session works on, for the board's row header ("Fixing plugin sign-in"). Made on the machine by the same writer an ad hoc card's title uses, from the agent's `name` and `task` (a session: its bound ticket's title or its ad hoc title). Never the prompt, a branch, a worktree or a repository path. |
 | `verdicts[]` (ADHOC-19) | `{round, gate, verdict, at, by?, summary?, raised?, fixed?, open?, notAdded?}`, the latest 20 | Every gate verdict on **this** ticket: an audit pass, or a round a gate sent it back. `gate` is a workflow cycle (`audit`, `test`, `deploy`, …), `verdict` is `pass` or `fail`, `round` is the attempt at that gate, `by` is the orchestrating person's display name (the report's `actor`). `summary` is the words the orchestrator deliberately wrote with `teamflow workflow ticket <KEY> --findings <text>` (or `--note` on a rework), like a ticket's `note`: one line, whitespace collapsed, control characters stripped, at most 280 characters, never a prompt, diff, command or log. A rework with no words is a round with no `summary`. Published on the ticket's own card, keyed by `<KEY>` and never by the session's binding. Appended, never rewritten: the plugin keeps the last 20 and the service carries the stored list across every report that leaves it out (a hook's report replaces this document whole), unioned by `(gate, verdict, round, at)`. `raised`, `fixed` and `open` are point ids (below): the points this round raised, the open ones it found fixed, and the ones still open after it. |
 | `points[]` (ADHOC-19) | `{id, gate, key?, text, from, rounds?, lastRound?, state, at, by?, doneAt?, doneRound?, doneBy?}`, 50 at most, open ones never dropped for the cap: a run that would push an open point out raises no point and counts it on its verdict as `notAdded` | Why a gate sent the card back, one line each, checked off by the runs that follow (one rule: `plugin/scripts/points.mjs`, mirrored in `adapters/teamflow/points.py`). A point failed again stays open and `rounds` goes up; a new failure is a new point in that round; a run that judged every point at its gate marks the ones it did not fail again `done` in that round. On this document the plugin writes two kinds. **Audit and recorded findings** (`F1`, `F2`, …): each `--finding <text>` a person gave to `teamflow workflow ticket <KEY> --state rework`, one line, at most 280 characters, the same sanitising as `note`, at most 20 in one round (more is refused with a sentence, never cut); `--done <ID>` and `--reopen <ID>` change `state`. Nothing is closed by omission: a failed audit only adds points, a second call at the same gate with no new rework in between adds to the same round, and only an audit given with `--rechecked` (a complete re-audit, or a pass that checked everything again) marks the open audit points it does not list `done`. A pass without `--rechecked` closes nothing. **Failing tests** (`T-<6 hex>`, gate `test`), see the next row. Points are never deleted. Carried by the service across reports that leave them out, merged by `id` with the report's copy winning. |
 | `points[]` from a test run (ADHOC-19) | **Off. The owner declined on 2026-09-22 for now; cards get a per-file count instead:** one point per failing test file with a count, `<file>: 2 tests failing` (key: the file), or `2 tests failing` when the runner names no file, and no test name. The service drops any named test point it receives. The code still holds the switches (`reporting.failingTests` in the plugin, `adapter.reporting.failingTests` in the service), both off, and they stay off unless the owner decides otherwise. What a named point would carry, for that decision: a failing test's **identifier**, its file and name as the runner printed them on its own summary line (`FAILED tests/test_x.py::test_y`, vitest `FAIL a.test.ts > group > name`, jest `● group › name`, TAP `not ok N - name`, go `--- FAIL: TestName`), with a trailing `[...]` parameter part cut off, at most 20 per run, 160 characters each. Parameter values a runner expands into the name itself (jest's `it.each` with `%s`) cannot be told from the name and stay in it | So a card a test run sent back carries which tests failed, and the next run checks each one off when it passes. Only the identifier: never the assertion message, a diff, a stack trace or any other line of output (`plugin/scripts/failing-tests.mjs`; `plugin/tests/failing-tests.test.mjs` asserts a message printed beside the name never reaches the payload). Test names come from the customer's repository, which is why this row is listed apart. Only a whole-suite run, or named test files run in full, checks a point off; a run of one file judges exactly that file's points. A directory, a filter word, a node id, a glob or a name filter (`-k`, `-t`, `--grep`, `--testNamePattern`) makes a run partial and it checks nothing off, and so does a run with more than 20 failures, whose list was cut. A run judges only its own runner's points: pytest the Python files, go the `_test.go` files, vitest, jest, mocha and node:test the JavaScript and TypeScript ones; a point whose name carries no file keeps its runner in its key (`js|group › name`). |

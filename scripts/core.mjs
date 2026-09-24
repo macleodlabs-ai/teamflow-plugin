@@ -4030,6 +4030,24 @@ export function executionId(state = {}) {
  * messages it wrote and its transcript are none of them here and never
  * leave the machine.
  */
+/** The longest `agentTask` a report carries (the service's AGENT_TASK_MAX). */
+export const AGENT_TASK_MAX = 60;
+
+/**
+ * What an agent or a session works on, in plain words (MACLEOD-773): the
+ * board's row header, "Fixing plugin sign-in". The first source the writer
+ * turns into more than "Agent work" wins. Never a path or a worktree's name:
+ * a row header made from one is what the owner could not read.
+ */
+export function agentTaskWords(sources = []) {
+  for (const raw of sources) {
+    if (!raw) continue;
+    const plain = plainTitle(String(raw));
+    if (plain !== 'Agent work' && !/[\\/]|worktree-agent/i.test(plain)) return agentLabel(plain, AGENT_TASK_MAX);
+  }
+  return undefined;
+}
+
 export function agentBlock(state = {}) {
   const agent = state.agent || {};
   const block = {
@@ -4040,6 +4058,9 @@ export function agentBlock(state = {}) {
   const type = agentLabel(agent.type, 40);
   if (task) block.task = task;
   if (type) block.type = type;
+  // The row's header (MACLEOD-773): its task first, as nodeTitle reads it.
+  const said = agentTaskWords([task, agent.name, agent.name && task ? `${agent.name}: ${task}` : '']);
+  if (said) block.agentTask = said;
   /*
    * The session this agent runs under, as the same digest `session.id`
    * carries — so the board joins on one value, and so this field is not
@@ -4098,6 +4119,12 @@ export function sessionBlock(state = {}, info = {}) {
   if (state.ended && state.updatedAt && !state.agentKey) block.endedAt = state.updatedAt;
   if (info.repository) block.repository = String(info.repository).slice(0, 200);
   if (info.branch) block.branch = String(info.branch).slice(0, 200);
+  // What the session itself works on (MACLEOD-773): its ticket's title in
+  // plain words. An agent's report names its session but speaks for itself.
+  if (!state.agentKey) {
+    const said = agentTaskWords([state.jira?.title, state.binding?.title]);
+    if (said) block.agentTask = said;
+  }
   return block;
 }
 
@@ -4332,7 +4359,7 @@ export function sanitizePayload(value, { kind = 'issue' } = {}) {
    * the payload they are dropped, `prompt` and `last_assistant_message`
    * among them, because neither is in either set.
    */
-  const agentOnly = new Set(['id', 'name', 'task', 'type', 'parent', 'parentAgent', 'startedAt', 'endedAt', 'role']);
+  const agentOnly = new Set(['id', 'name', 'task', 'agentTask', 'type', 'parent', 'parentAgent', 'startedAt', 'endedAt', 'role']);
   // What the agent was launched for (MACLEOD-722): the answer, how it was
   // reached and the classifier's fixed features. Enums, flags, one count
   // and one number; the prompt it was scored on has no field here.
@@ -4342,7 +4369,7 @@ export function sanitizePayload(value, { kind = 'issue' } = {}) {
   // flat set already; the rest are here and nowhere else, so a transcript
   // path or a raw session id has no field to arrive on.
   // `label` is the plan's name on a `kind: plan` row (MACLEOD-639).
-  const sessionOnly = new Set(['id', 'tool', 'startedAt', 'endedAt', 'repository', 'branch', 'label']);
+  const sessionOnly = new Set(['id', 'tool', 'startedAt', 'endedAt', 'repository', 'branch', 'label', 'agentTask']);
   // MACLEOD-639. A loop is a gate, two clocks, one derived line and a
   // name; a failure is a stage, a clock and that line; a transition is a
   // stage, a clock and a name. `summary` is the only prose and it is the
@@ -5506,6 +5533,11 @@ async function postEnvelope(endpoint, envelope, idempotencyKey, config, account 
     // cards, and the cards it holds.
     ...(Array.isArray(body?.others) ? { others: body.others } : {}),
     ...(Array.isArray(body?.holds) ? { holds: body.holds } : {}),
+    // A card line's reply (MACLEOD-770): stored, older or no_card.
+    ...(['stored', 'older', 'no_card'].includes(body?.said) ? { said: body.said } : {}),
+    // An inventory's reply (MACLEOD-773): the board's open cards, which the
+    // same pass checks for a merge. Keys only; merged.mjs checks each one.
+    ...(Array.isArray(body?.open_keys) ? { openKeys: body.open_keys } : {}),
     // The key this report was sent under became a ticket (ADHOC-15):
     // the service wrote it under `convertedTo`, and the session follows.
     ...(isAdHocKey(body?.converted_from) && typeof body?.converted_to === 'string'
@@ -5845,6 +5877,26 @@ export async function sendMerged(payload, config) {
   const envelope = { kind: 'merged', payload };
   const idempotencyKey = crypto.createHash('sha256').update(JSON.stringify(envelope)).digest('hex');
   return postEnvelope(`${serviceUrl(config)}/v1/report`, envelope, idempotencyKey, config, reportScope(config));
+}
+
+/**
+ * A card's plain line (MACLEOD-770): `{ jiraKey, line, by, at }`, built
+ * field by field here and checked by the words checker before it is
+ * called (say.mjs) and again by the service. Free like a merged fact.
+ * Queued and retried like a report: the line is the model's work, and a
+ * service that did not answer should not lose it.
+ */
+export async function sendSay({ jiraKey, line, by, at }, config) {
+  if (!credentialKind(config)) return { ok: false, skipped: true, reason: 'no service credential configured' };
+  const envelope = { kind: 'say', payload: { jiraKey: String(jiraKey), line: String(line), by: String(by), at: String(at) } };
+  const endpoint = `${serviceUrl(config)}/v1/report`;
+  const idempotencyKey = crypto.createHash('sha256').update(JSON.stringify(envelope)).digest('hex');
+  const result = await postEnvelope(endpoint, envelope, idempotencyKey, config, reportScope(config));
+  if (result.retry) {
+    queueOutbox(scheduleRetry({ endpoint, envelope, idempotencyKey, owner: result.owner }, result));
+    return { ok: false, queued: true, status: result.status, reason: result.reason };
+  }
+  return result;
 }
 
 export async function fetchAccount(config) {

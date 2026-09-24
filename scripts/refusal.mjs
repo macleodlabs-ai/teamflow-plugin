@@ -46,6 +46,10 @@ export const REFUSAL_REASONS = Object.assign(Object.create(null), {
   // owner chooses a plan.
   trial_ended: 'Your TeamFlow trial has ended. Choose a plan at https://codercat.io/pricing/. '
     + 'Your board stays readable and TeamFlow deleted nothing.',
+  // MACLEOD-755: live with the free trial only. While payments are off the
+  // service never ends a trial, and refuses every payment with this code.
+  // The owner's sentence, with somewhere to ask.
+  payments_off: 'Paid plans open soon. Your trial keeps going until then. Questions: macleod@macleodlabs.ai',
   // MACLEOD-620's two soft refusals: the owner's exact sentences, each with
   // its remedy, and the fair use guide as a line of its own after them.
   usage_exceeds_plan: 'Usage on the credential exceeds the plan. Contact us to discuss Enterprise plans.'

@@ -7,12 +7,18 @@
 // gives Reconnect, enable/disable and the tool list for free, and the
 // only thing this file decides is which header, if any, to print.
 //
-// The header is the machine's device authorization and nothing else:
-// the same one-hour `dat_` access token a report carries, minted by the
-// same `accessToken()` call. Not the Cognito login Claude Code would
-// attempt on its own (Cognito has no dynamic client registration, and
-// the owner's rule is that the plugin uses the device flow's credential),
-// not a `dk_` from before 0.3.24 and never an API key (MACLEOD-630).
+// The header is the short-lived access token this machine already
+// reports with, minted by the same `accessToken()` call: the device
+// authorization's one-hour `dat_`, or, on a machine that still holds a
+// browser sign-in, that sign-in's one-hour access token (MACLEOD-757).
+// The service's /mcp door accepts exactly what a report is accepted
+// with. Never a refresh token, never a `dk_` from before 0.3.24 and
+// never an API key (MACLEOD-630).
+//
+// With nothing to send the header is `{}`, and Claude Code falls
+// through to its own OAuth sign-in, which the service serves itself
+// (the kit's mcp_oauth.py: dynamic registration, PKCE, rotating refresh
+// tokens) -- so /mcp shows Authenticate, as it does for Linear.
 //
 // Where it goes is decided as for every other credential (MACLEOD-616):
 // the URL the plugin itself declares, and only when that URL's origin is
@@ -72,11 +78,8 @@ export async function mcpHeaders(config = {}, { url = declaredMcpUrl(), announce
     return refuse(`this helper sends TeamFlow's token only to ${url}, not to ${announced}`);
   }
   const session = auth.readSession();
-  if (!session) return refuse(`this machine is not authorized; ${LOGIN}`);
-  if (!auth.isDeviceSession(session)) {
-    return refuse('this machine holds a browser sign-in, and the MCP connection uses the '
-      + `machine's device authorization only; ${LOGIN}`);
-  }
+  if (!session) return refuse(`this machine is not authorized; choose Authenticate for teamflow in /mcp, or ${LOGIN}`);
+  const device = auth.isDeviceSession(session);
   const bound = auth.sessionOrigin(session);
   const destination = credentialDestination({ serviceUrl: target }, bound);
   if (!destination.ok) return refuse(destination.reason);
@@ -92,9 +95,15 @@ export async function mcpHeaders(config = {}, { url = declaredMcpUrl(), announce
       + 'the token was not sent there');
   }
   // `status` asks whether a header could be printed without minting one.
-  if (!mint) return { headers: {}, ok: true };
+  if (!mint) return { headers: {}, ok: true, device };
   const token = await auth.accessToken({ ...config, serviceTimeoutMs: HELPER_TIMEOUT_MS });
   if (!token.ok) return refuse(token.reason || 'could not read this machine\'s authorization');
+  if (!device) {
+    // A browser sign-in: its access token, refreshed by `accessToken()`
+    // as a report's is. The machine id rule is the device's, so no
+    // X-Machine-Id rides with a person's token.
+    return { headers: { Authorization: `Bearer ${token.token}` }, ok: true, device };
+  }
   if (!String(token.token || '').startsWith(DEVICE_ACCESS_PREFIX)) {
     // A `dk_` that has not migrated yet. The MCP door refuses keys, and
     // the next report migrates it.
@@ -108,6 +117,7 @@ export async function mcpHeaders(config = {}, { url = declaredMcpUrl(), announce
   return {
     headers: { Authorization: `Bearer ${token.token}`, ...(machine ? { 'X-Machine-Id': machine } : {}) },
     ok: true,
+    device,
   };
 }
 
@@ -179,8 +189,9 @@ export async function mcpStatus(config = {}, { url = declaredMcpUrl() } = {}) {
 /** What `teamflow status` says, from local state only: no token is minted. */
 export async function mcpReadinessLine(config = {}, { url = declaredMcpUrl() } = {}) {
   const ready = await mcpHeaders(config, { url, mint: false });
+  const by = ready.device ? 'this machine\'s device authorization' : 'this machine\'s browser sign-in';
   return ready.ok
-    ? `${MCP_SERVER} authorized by this machine's device authorization; /mcp to reconnect or disable it, /teamflow:doctor to test it`
+    ? `${MCP_SERVER} authorized by ${by}; /mcp to reconnect or disable it, /teamflow:doctor to test it`
     : `${MCP_SERVER} not connected: ${ready.reason}`;
 }
 

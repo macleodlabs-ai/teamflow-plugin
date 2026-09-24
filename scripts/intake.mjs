@@ -7,7 +7,7 @@
 // intent for the machine that holds the ticket, and the plugin on that
 // machine asks for its actions on every async hook round (`Stop`) and
 // in `teamflow status`, performs each one it can, and reports what
-// came of it. Five kinds, and nothing else is an action:
+// came of it. Six kinds, and nothing else is an action:
 //
 //   fix          guidance from a named person, shown to the agent as a
 //                sentence in that person's name. Never executed.
@@ -22,6 +22,11 @@
 //                "skipped by <who>: <reason>", and the run records who.
 //                Only ever from the service, after its own authority
 //                check.
+//   tidy         TeamFlow's own card upkeep (MACLEOD-770): the kind and
+//                the key, nothing else. This machine proves a card
+//                finished from its own merge facts, drops links to
+//                finished cards and asks the session for the card's
+//                plain line. See `tidy` below.
 //
 // Four rules decide the shape of this.
 //
@@ -57,11 +62,13 @@ import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import {
   STAGE_ORDER, accountName, credential, dataDir, globalConfigPath, isWorktree, machineId, readJson, readKeyAliases,
-  reportScope, sendReport, serviceUrl, writeJson,
+  reportScope, repositoryRoot, sendReport, serviceUrl, writeJson,
 } from './core.mjs';
 import { step } from './words.mjs';
+import { markSent, mergedFacts, sendInBatches } from './merged.mjs';
+import { readLines, sayPrompt } from './say.mjs';
 import {
-  GATE_SLOTS, gateDeadlinesOf, gateReports, gateSaid, hygieneRow, load, move, publish, ready, restall, save,
+  GATE_SLOTS, gateDeadlinesOf, gateReports, gateSaid, hygieneRow, load, move, publish, ready, restall, save, undepend,
 } from './workflow.mjs';
 import { bounded, budgetUntil, remainingMs, settle } from './selfheal.mjs';
 
@@ -71,7 +78,7 @@ export const TEXT_MAX = 500;
 export const REASON_MAX = 120;
 /** How many actions one round performs; the rest wait for the next. */
 export const BATCH = 8;
-export const KINDS = new Set(['fix', 'bump', 'rerun_gate', 'resume_plan', 'skip_gate']);
+export const KINDS = new Set(['fix', 'bump', 'rerun_gate', 'resume_plan', 'skip_gate', 'tidy']);
 
 // --- the developer's say ------------------------------------------------
 
@@ -391,6 +398,92 @@ export function followedKey(key, config = {}) {
   return readKeyAliases(config)[key.toUpperCase()]?.to || key;
 }
 
+// --- tidy: the classifier noticed, this machine proves and tidies ----------------
+
+/*
+ * `tidy` (MACLEOD-770) is TeamFlow's own card upkeep: the service's
+ * classifier found a card that looks finished but open, one that waits on
+ * a finished card, or one with no current plain line. It carries only the
+ * kind and the key. This machine decides from its OWN facts what to change,
+ * and each change is one the plugin already owns:
+ *
+ *   1. finished: merge facts from this repository's own history prove it
+ *      (merged.mjs, the same proof the background pass sends); they go to
+ *      the service, which finishes the card, and the run here that holds
+ *      the key settles its node. No proof, nothing is closed.
+ *   2. links: a dependency whose other end is done or skipped in the run
+ *      is dropped (`undepend`), with a History row on the run.
+ *   3. the line: the session's model is asked for the card's plain line
+ *      (`sayPrompt`), when this machine has none or it predates the work.
+ *
+ * Every change names who: `classifier` for what it noticed and code
+ * proved, and the model writes the line itself.
+ */
+export const TIDY_BY = 'classifier';
+const CLOSED_NODES = ['done', 'skipped'];
+const OPEN_RUNS = ['running', 'stalled', 'blocked', 'planning'];
+
+/** Proof from this repository that `key` is merged: sends the facts, returns true. */
+export async function proveFromHistory(key, { config = {}, cwd = process.cwd() } = {}) {
+  const facts = mergedFacts([key], { root: repositoryRoot(cwd), aliases: readKeyAliases(config) });
+  if (!facts.length) return false;
+  const out = await sendInBatches(facts, { config });
+  if (out.sent) markSent(facts.slice(0, out.sent));
+  return true;
+}
+
+/** Links touching `key` whose other end is finished in the same run: dropped. */
+export function dropFinishedLinks(workflow, key, at) {
+  const states = new Map((workflow.tickets || []).map((t) => [t.key, t.state]));
+  const stale = (workflow.dependencies || []).filter((d) => (d.from === key || d.on === key)
+    && CLOSED_NODES.includes(states.get(d.from === key ? d.on : d.from)));
+  for (const d of stale) {
+    undepend(workflow, d.from, d.on, { reason: 'the other card is finished' });
+    const other = d.from === key ? d.on : d.from;
+    hygieneRow(workflow, 'dropped link', TIDY_BY, `${key} no longer waits on ${other}: ${other} is finished`, at);
+  }
+  return stale.length;
+}
+
+export async function tidy(key, {
+  config = {}, state, cwd, at = new Date().toISOString(), budget, publishRun = publish,
+  proveMerged = proveFromHistory, lines, deadlines,
+} = {}) {
+  const did = [];
+  const runs = Object.values(state?.workflows || {}).filter((wf) => OPEN_RUNS.includes(wf.status)
+    && (wf.tickets || []).some((t) => t.key === key));
+  const changed = new Set();
+  let proved = false;
+  try { proved = await proveMerged(key, { config, cwd }); } catch { proved = false; }
+  if (proved) {
+    for (const wf of runs) {
+      const ticket = wf.tickets.find((t) => t.key === key);
+      if (!ticket || CLOSED_NODES.includes(ticket.state)) continue;
+      move(wf, key, { state: 'done' });
+      hygieneRow(wf, 'settled', TIDY_BY, `${key} is merged, so the plan says done`, at);
+      changed.add(wf);
+    }
+    did.push('its work is merged');
+  }
+  let dropped = 0;
+  for (const wf of runs) {
+    const n = dropFinishedLinks(wf, key, at);
+    if (n) { dropped += n; changed.add(wf); }
+  }
+  if (dropped) did.push(dropped === 1 ? 'dropped one link to a finished card' : `dropped ${dropped} links to finished cards`);
+  if (changed.size) {
+    for (const wf of changed) settle(wf, { now: at, deadlines });
+    save(state, config);
+    for (const wf of changed) {
+      if (remainingMs(budget) > 0) await publishRun(wf, bounded(config, budget)).catch(() => ({ ok: false }));
+    }
+  }
+  const notice = sayPrompt([key], 'TeamFlow asked to tidy this card.', lines ?? readLines());
+  if (notice) did.push('asked for its plain line');
+  if (!did.length) return { ...said('not_needed', `${key} needed nothing from this machine`) };
+  return { ...said('done', `${key}: ${did.join(', ')}`), ...(notice ? { notice } : {}) };
+}
+
 /** A held action this old is dropped here; the service gives it its outcome (MACLEOD-726). */
 export const HOLD_MAX_MS = 24 * 60 * 60 * 1000;
 
@@ -404,7 +497,7 @@ export const HOLD_MAX_MS = 24 * 60 * 60 * 1000;
 export async function perform(action, {
   config = {}, state, bound, local, cwd = process.cwd(), at = new Date().toISOString(), budget,
   spawnGate = spawnDetached, publishRun = publish, inWorktree = isWorktree, delivery = userDelivery(),
-  deadlines = gateDeadlinesOf({ delivery }), env = process.env,
+  deadlines = gateDeadlinesOf({ delivery }), env = process.env, proveMerged = proveFromHistory, lines,
 } = {}) {
   const kind = String(action.kind || '');
   const key = followedKey(String(action.key || ''), config);
@@ -421,6 +514,8 @@ export async function perform(action, {
     if (!notice) return { ...said('refused', 'a fix with no text') };
     return { ...said('done', `shown to the session on ${key}`), notice };
   }
+
+  if (kind === 'tidy') return tidy(key, { config, state, cwd, at, budget, publishRun, proveMerged, lines, deadlines });
 
   const workflow = state ? runHolding(state, key) : undefined;
   if (!workflow) {

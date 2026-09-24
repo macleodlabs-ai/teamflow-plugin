@@ -248,6 +248,21 @@ export function openKeys(inventory = {}) {
   return [...keys].filter(Boolean);
 }
 
+/** How many of the board's open keys one pass checks (the service sends at most 300). */
+export const BOARD_KEYS_MAX = 300;
+
+/**
+ * The machine's open keys and the board's (MACLEOD-773): the inventory's
+ * reply names every card the service holds open, so a card whose worktree
+ * was removed after its merge is still checked, and nobody has to run
+ * `teamflow reconcile --merged`. A received key that is not a tracker key
+ * is dropped; each is only ever compared with what git printed.
+ */
+export function withBoardKeys(keys = [], reply = {}) {
+  const board = Array.isArray(reply?.openKeys) ? reply.openKeys.slice(0, BOARD_KEYS_MAX) : [];
+  return [...new Set([...keys, ...board.map(keyOk)].filter(Boolean))];
+}
+
 /**
  * How many facts go in one request. The service settles each card in the
  * request, and 122 in one request ran past its time limit on this
@@ -366,5 +381,6 @@ export async function reportMerged(keys, {
   if (!facts.length) return { ok: true, sent: 0 };
   const out = await sendInBatches(facts, { repo, now, send, config });
   markSent(facts.slice(0, out.sent));
-  return { ok: out.ok, sent: out.sent };
+  // The keys that went, for the next prompt's ask for a plain line (MACLEOD-770).
+  return { ok: out.ok, sent: out.sent, ...(out.sent ? { keys: facts.slice(0, out.sent).map((fact) => fact.key) } : {}) };
 }

@@ -1786,6 +1786,12 @@ export async function main(args, {
     }
     const named = find(state, wanted) || target;
     print(render(named, state));
+    // Where each open item is, by the organisation's column names (MACLEOD-773).
+    try {
+      const { linesFor, loadPipeline, planWork } = await import('./columns.mjs');
+      const lines = linesFor(planWork(named), (await loadPipeline(config)).pipeline);
+      if (lines.length) print(['  where each open item is:', ...lines.map((l) => `    ${l}`)].join('\n'));
+    } catch { /* the run above is the whole answer */ }
     return 0;
   }
 

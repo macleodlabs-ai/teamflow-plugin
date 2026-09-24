@@ -239,7 +239,7 @@ function groupOfStage(stage) {
   return "local";
 }
 function groupsOf(pipeline = DEFAULT_PIPELINE) {
-  const order = ["backlog", "local", "review", "cicd", "dev", "done"];
+  const order2 = ["backlog", "local", "review", "cicd", "dev", "done"];
   const groups = /* @__PURE__ */ new Map();
   let previous = "backlog";
   for (const gate of columnsOf(pipeline)) {
@@ -250,7 +250,7 @@ function groupsOf(pipeline = DEFAULT_PIPELINE) {
     if (gate.stages.length) group.stages.push(gate.stages[0]);
     groups.set(id, group);
   }
-  return order.filter((id) => groups.has(id)).map((id) => groups.get(id));
+  return order2.filter((id) => groups.has(id)).map((id) => groups.get(id));
 }
 var STAGE_GROUPS = groupsOf(DEFAULT_PIPELINE);
 function groupOfGate(gateId, pipeline = DEFAULT_PIPELINE) {
@@ -288,6 +288,10 @@ var WAITS_FOR = {
 };
 var STEP_WORDS = { LOCAL_TEST: "a test", LOCAL_AUDIT: "an audit" };
 var LIVE = ["running", "waiting", "blocked"];
+var GATE_STEPS = ["LOCAL_TEST", "LOCAL_AUDIT", "CI_BUILD", "DEPLOY_DEV", "DEV_TEST", "DEV_AUDIT"];
+var REST_STEPS = ["LOCAL_DEV", "MERGE", "DEV_VERIFIED"];
+var SETTLED_WAITING = "Waiting: nobody is working on it.";
+var SETTLED_DEPLOYED = "Deployed. Nobody is working on it now.";
 function time(value) {
   const parsed = value ? Date.parse(value) : Number.NaN;
   return Number.isFinite(parsed) ? parsed : 0;
@@ -351,6 +355,19 @@ function finishedWords(by, missed) {
   return void 0;
 }
 function currentStep(card, workflows = []) {
+  return settledStep(card, reportedStep(card, workflows));
+}
+function newestReport(card) {
+  return Math.max(time(card.updatedAt), ...(card.executions ?? []).map((run) => time(run.updatedAt)));
+}
+function settledStep(card, out) {
+  const held = card.settled;
+  if (!held || !GATE_STEPS.includes(out.stage) || !REST_STEPS.includes(held.stage)) return out;
+  if (card.removed || card.gate || isRework(card) || time(held.at) < newestReport(card)) return out;
+  const summary = held.stage === "DEV_VERIFIED" ? SETTLED_DEPLOYED : SETTLED_WAITING;
+  return { stage: held.stage, status: "idle", from: card.stage, missed: [], summary };
+}
+function reportedStep(card, workflows) {
   const same = { stage: card.stage, status: card.status, missed: [] };
   if (card.removed || card.gate || card.stage === "BACKLOG" || isRework(card)) return same;
   if (card.stage === "DONE") {
@@ -779,9 +796,10 @@ var FIX_GRACE_MS = 2 * 60 * 6e4;
 var OLDER_AFTER_MS = 48 * 60 * 6e4;
 var PASSIVE = /* @__PURE__ */ new Set(["idle", "unfinished", "agent_offline", "audit_no_review", "blocked", "mutual"]);
 var FOLLOW_KINDS = /* @__PURE__ */ new Set(["fix", "bump", "rerun_gate", "resume_plan", "skip_gate"]);
+var followable = (entry) => FOLLOW_KINDS.has(entry.kind);
 function followUpOf(row, card, now) {
   const began = now - row.ageMs;
-  const queued = (card.ticket.actionQueue ?? []).filter((entry) => FOLLOW_KINDS.has(entry.kind) && entry.status !== "not_needed" && time3(entry.at) >= began - 6e4);
+  const queued = (card.ticket.actionQueue ?? []).filter((entry) => followable(entry) && entry.status !== "not_needed" && time3(entry.at) >= began - 6e4);
   const last = queued[queued.length - 1];
   const quiet = row.tier === "need" && !card.run && PASSIVE.has(row.cause) && row.ageMs > OLDER_AFTER_MS;
   if (!last) return quiet ? { ...row, quiet } : row;
@@ -1480,6 +1498,8 @@ function mergeHygieneState(issue, hygiene) {
     ...hygiene.decisions?.length ? { decisions: hygiene.decisions } : {},
     /* WS-K2: what TeamFlow did on its own, for the Attention row and the dialog. */
     ...hygiene.autonomy ? { autonomy: hygiene.autonomy } : {},
+    /* MACLEOD-773: where the card rests once everybody on it ended. */
+    ...hygiene.settled ? { settled: hygiene.settled } : {},
     ...transitions.length ? { transitions } : {}
   };
 }
@@ -2223,12 +2243,12 @@ function progressOf(input) {
       changed: since > 0 && lastActivity !== void 0 && lastActivity > since
     };
   };
-  const order = (a, b) => STATE_ORDER.indexOf(a.state) - STATE_ORDER.indexOf(b.state) || (b.lastActivity ?? 0) - (a.lastActivity ?? 0);
+  const order2 = (a, b) => STATE_ORDER.indexOf(a.state) - STATE_ORDER.indexOf(b.state) || (b.lastActivity ?? 0) - (a.lastActivity ?? 0);
   const groups = [];
   const inPlan = /* @__PURE__ */ new Set();
   for (const run of liveRuns(input.workflows)) {
     const completion = planCompletion(run, input.tickets, { now, pipeline, liveness: accounting.liveness });
-    const rows2 = (run.tickets ?? []).map((planned) => rowOf(planned.key, planned, run)).sort(order);
+    const rows2 = (run.tickets ?? []).map((planned) => rowOf(planned.key, planned, run)).sort(order2);
     for (const row of rows2) inPlan.add(row.key);
     const burn = burndownOf(run, input.tickets, now);
     groups.push({
@@ -2241,7 +2261,7 @@ function progressOf(input) {
       total: rows2.length
     });
   }
-  const loose = [...accounting.cards.values()].filter((card) => !inPlan.has(card.key)).filter((card) => !cardDone(card) || card.flags.shipped7d).map((card) => rowOf(card.key)).sort(order);
+  const loose = [...accounting.cards.values()].filter((card) => !inPlan.has(card.key)).filter((card) => !cardDone(card) || card.flags.shipped7d).map((card) => rowOf(card.key)).sort(order2);
   if (loose.length) {
     groups.push({
       id: NO_PLAN,
@@ -2356,8 +2376,165 @@ function progressMarkdown(model, rows = exportRows(model.groups)) {
   return [`**${headline(model)}**`, "", finishWords(model), ...plans.length ? ["", ...plans] : [], "", head, rule, ...body, ""].join("\n");
 }
 
+// src/lib/statusUpdate.ts
+var DAY_MS7 = 24 * 60 * 6e4;
+var RECENT_MS = 7 * DAY_MS7;
+var GROUP_ORDER = ["needs_you", "live", "merged", "building", "waiting"];
+function groupOf(facts) {
+  if (facts.needsYou) return "needs_you";
+  if (facts.finished) return facts.deployed ? "live" : "merged";
+  if (facts.live) return "building";
+  return "waiting";
+}
+var DEPLOYED_STAGES = /* @__PURE__ */ new Set(["DEPLOY_DEV", "DEV_TEST", "DEV_AUDIT", "DEV_REWORK", "DEV_VERIFIED"]);
+var DEPLOYED_STATUS = /^(deployed|released)$/i;
+function wasDeployed(ticket) {
+  if (ticket.finishedBy === "deployed") return true;
+  if (DEPLOYED_STAGES.has(ticket.stage) || ticket.reportedStage && DEPLOYED_STAGES.has(ticket.reportedStage)) return true;
+  if ((ticket.transitions ?? []).some((t) => DEPLOYED_STAGES.has(t.stage))) return true;
+  if ((ticket.executions ?? []).some((run) => DEPLOYED_STAGES.has(run.stage) && run.status === "success")) return true;
+  return DEPLOYED_STATUS.test(ticket.jiraStatus ?? "");
+}
+var LEADING_KEY = /^\s*(\[?[A-Za-z][\w-]*-\d+\]?|#\d+)\s*[:\-–—]?\s*/;
+function plainLine(ticket) {
+  const said = ticket.say?.line?.trim();
+  if (said) return said;
+  const title = (ticket.title ?? "").replace(LEADING_KEY, "").trim();
+  return title ? plainer(title) : ticket.jiraKey;
+}
+function whenWords(at, now) {
+  if (at === void 0 || !Number.isFinite(at)) return "";
+  const minutes = Math.floor(Math.max(0, now - at) / 6e4);
+  if (minutes < 1) return "just now";
+  if (minutes < 60) return `${minutes} ${minutes === 1 ? "minute" : "minutes"} ago`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return `${hours} ${hours === 1 ? "hour" : "hours"} ago`;
+  const days = Math.floor(hours / 24);
+  return days === 1 ? "yesterday" : `${days} days ago`;
+}
+function time9(value) {
+  const parsed = value ? Date.parse(value) : Number.NaN;
+  return Number.isFinite(parsed) ? parsed : void 0;
+}
+function waitingWhy(card, now) {
+  const edge = card.openEdges.find((e) => e.from === card.key);
+  if (edge) return `waits for ${edge.on}`;
+  if (card.flags.backlog) return "not started";
+  const at = time9(card.ticket.updatedAt);
+  return at === void 0 ? "nobody is on it" : `no news for ${whenWords(at, now).replace(/ ago$/, "")}`;
+}
+function order(rows, planRank) {
+  const rank = (row) => row.planId ? planRank.get(row.planId) ?? 999 : 1e3;
+  return rows.sort((a, b) => rank(a) - rank(b) || (b.at ?? 0) - (a.at ?? 0) || a.key.localeCompare(b.key));
+}
+function statusUpdateOf(input) {
+  const now = input.now ?? input.accounting.now;
+  const runs = liveRuns(input.workflows);
+  const planOf = /* @__PURE__ */ new Map();
+  for (const run of runs) for (const t of run.tickets) if (!planOf.has(t.key)) planOf.set(t.key, run);
+  const planRank = new Map(runs.map((run, n) => [run.id, n]));
+  const needs = new Set(needYou(input.accounting.attention, now).map((row) => row.key));
+  const groups = { needs_you: [], live: [], merged: [], building: [], waiting: [] };
+  for (const card of input.accounting.cards.values()) {
+    const ticket = card.ticket;
+    const group = groupOf({ needsYou: needs.has(card.key), finished: card.flags.finished, deployed: wasDeployed(ticket), live: card.flags.live && !card.flags.stalled });
+    const finishedAt = group === "live" || group === "merged" ? time9(shippedAt(ticket)) : void 0;
+    const at = finishedAt ?? time9(ticket.updatedAt);
+    const run = planOf.get(card.key);
+    groups[group].push({
+      key: card.key,
+      group,
+      line: plainLine(ticket),
+      who: card.laneLabel,
+      at,
+      planId: run?.id,
+      planName: run?.name,
+      older: (group === "live" || group === "merged") && (at === void 0 || now - at > RECENT_MS),
+      why: group === "waiting" ? waitingWhy(card, now) : void 0
+    });
+  }
+  for (const id of GROUP_ORDER) order(groups[id], planRank);
+  const byKey = new Map(Object.values(groups).flat().map((row) => [row.key, row]));
+  const plans = runs.map((run) => {
+    const completion = planCompletion(run, input.tickets, { now });
+    const live = run.tickets.filter((t) => byKey.get(t.key)?.group === "live").length;
+    return { id: run.id, name: run.name, total: completion.total, done: completion.done, live: Math.min(live, completion.done) };
+  });
+  return { now, groups, plans };
+}
+function rowTail(row, now) {
+  return [row.who, whenWords(row.at, now)].filter(Boolean).join(", ");
+}
+var NONE = {
+  live: "Nothing went live this week.",
+  merged: "Nothing is waiting for a deploy.",
+  built: "Nothing is being built now.",
+  needs: "Nothing needs you."
+};
+function bullets(rows, now, tail) {
+  return rows.map((row) => `- ${row.line} (${rowTail(row, now)})${tail ? tail(row) : ""}`);
+}
+function byPlan(rows, now, tail) {
+  const out = [];
+  const plans = [...new Set(rows.map((row) => row.planName ?? ""))];
+  const named = plans.some(Boolean);
+  for (const plan of plans) {
+    const mine = rows.filter((row) => (row.planName ?? "") === plan);
+    if (named) out.push(`  ${plan || "Not in a plan"}:`);
+    out.push(...bullets(mine, now, tail).map((line) => named ? `  ${line}` : line));
+  }
+  return out;
+}
+function statusText(update) {
+  const { groups, now } = update;
+  const live = groups.live.filter((row) => !row.older);
+  const merged = groups.merged.filter((row) => !row.older);
+  const waitingInPlan = groups.waiting.filter((row) => row.planId);
+  const rest = groups.waiting.length - waitingInPlan.length;
+  const built = [...groups.building, ...waitingInPlan];
+  const lines = [];
+  lines.push("Live now:", ...live.length ? bullets(live, now) : [NONE.live]);
+  lines.push("", "Merged but not deployed yet:", ...merged.length ? bullets(merged, now) : [NONE.merged]);
+  lines.push("", "Still being built:");
+  lines.push(...built.length ? byPlan(built, now, (row) => row.group === "waiting" && row.why ? ` - waiting: ${row.why}` : "") : [NONE.built]);
+  if (rest > 0) lines.push(`- and ${rest} more not being worked on now`);
+  lines.push("", "Needs you:", ...groups.needs_you.length ? bullets(groups.needs_you, now) : [NONE.needs]);
+  return lines.join("\n");
+}
+
+// src/lib/workLines.ts
+function pipelineOf(raw) {
+  const block = raw && typeof raw === "object" && "gates" in raw ? { pipeline: raw } : raw;
+  return pipelineFromBundle(block).pipeline;
+}
+var place = (item, pipeline) => gateFor({ ...item, stage: item.stage ?? "BACKLOG" }, pipeline);
+function workLine(item, pipeline = DEFAULT_PIPELINE) {
+  const column = place(item, pipeline)?.label ?? "Not on the board";
+  return [column, item.task?.replace(/\s+/g, " ").trim() || "Work", item.key].join(" \xB7 ");
+}
+function workLines(items, pipeline = DEFAULT_PIPELINE) {
+  const seen = /* @__PURE__ */ new Map();
+  for (const item of items) if (item.key && !seen.has(item.key)) seen.set(item.key, item);
+  return [...seen.values()].map((item) => ({ item, at: gateIndex(place(item, pipeline), pipeline) })).sort((a, b) => (a.at < 0 ? 1e9 : a.at) - (b.at < 0 ? 1e9 : b.at) || a.item.key.localeCompare(b.item.key)).map(({ item }) => workLine(item, pipeline));
+}
+
 // src/lib/progressCli.ts
-function progressFromBundle(bundle, now) {
+var OPEN_RUNS = /* @__PURE__ */ new Set(["planning", "running", "blocked", "stalled"]);
+function workLinesFromBundle(bundle) {
+  const data = dashboardFromBundle(bundle);
+  const tickets = new Map(data.tickets.map((ticket) => [ticket.jiraKey, ticket]));
+  const items = [];
+  for (const run of data.workflows ?? []) {
+    if (!OPEN_RUNS.has(run.status)) continue;
+    for (const node of run.tickets ?? []) {
+      if (node.state === "done" || node.state === "skipped") continue;
+      const ticket = tickets.get(node.key);
+      items.push({ key: node.key, task: ticket?.title, stage: ticket?.stage, reworkFrom: ticket?.reworkFrom });
+    }
+  }
+  return workLines(items, data.service?.pipeline);
+}
+function readBundle(bundle, now) {
   const data = dashboardFromBundle(bundle);
   const { service } = data;
   const accounting = accountingOf({
@@ -2371,7 +2548,19 @@ function progressFromBundle(bundle, now) {
     pipeline: service?.pipeline,
     now
   });
+  return { data, accounting };
+}
+function progressFromBundle(bundle, now) {
+  const { data, accounting } = readBundle(bundle, now);
   return progressOf({ tickets: data.tickets, workflows: data.workflows, accounting });
+}
+function statusUpdateFromBundle(bundle, now) {
+  const { data, accounting } = readBundle(bundle, now);
+  return statusUpdateOf({ accounting, tickets: data.tickets, workflows: data.workflows, now });
+}
+function statusUpdateText(bundle, now) {
+  return `${statusText(statusUpdateFromBundle(bundle, now))}
+`;
 }
 function progressText(bundle, now, format = "markdown") {
   const model = progressFromBundle(bundle, now);
@@ -2381,6 +2570,12 @@ function progressText(bundle, now, format = "markdown") {
   return progressMarkdown(model);
 }
 export {
+  pipelineOf,
   progressFromBundle,
-  progressText
+  progressText,
+  statusUpdateFromBundle,
+  statusUpdateText,
+  workLine,
+  workLines,
+  workLinesFromBundle
 };
