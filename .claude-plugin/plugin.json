@@ -1,7 +1,7 @@
 {
   "name": "teamflow",
   "description": "TeamFlow, the DevOps harness for agentic software delivery. Shows every agent at work in real time, fixes stuck agents and keeps your code on your machine.",
-  "version": "0.3.44",
+  "version": "0.3.45",
   "author": {
     "name": "MacleodLabs"
   },

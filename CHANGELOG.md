@@ -3,6 +3,14 @@
 What changed in each published version of the TeamFlow plugin, newest first.
 Only what a person using it would notice.
 
+## 0.3.45
+
+- **`/teamflow:update` says who picks up work sent back.** A card sent back
+  reads "waiting for someone to pick it up" until someone takes it. The
+  dashboard and your terminal use the same words.
+- **A CI run's parts read the same everywhere.** Your terminal names each
+  part and its result in the dashboard's words.
+
 ## 0.3.44
 
 - **A ticket key in a message does not move your session.** Keys in a

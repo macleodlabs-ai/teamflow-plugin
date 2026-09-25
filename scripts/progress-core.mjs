@@ -14,6 +14,17 @@ function freshness(updatedAt, now = Date.now()) {
   if (age <= STALE_MS) return "stale";
   return "idle";
 }
+function relativeAge(updatedAt, now = Date.now()) {
+  const seconds = Math.max(0, Math.floor((now - new Date(updatedAt).getTime()) / 1e3));
+  if (seconds < 60) return `${seconds}s ago`;
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return `${minutes}m ago`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return `${hours}h ago`;
+  const days = Math.floor(hours / 24);
+  if (days < 7) return `${days}d ago`;
+  return `${Math.floor(days / 7)}w ago`;
+}
 
 // src/lib/pipeline.ts
 var STAGE_VALUES = [
@@ -222,6 +233,9 @@ var STAGE_LABELS = {
   DONE: "Done"
 };
 var DISPLAY_STAGE = displayStagesOf(DEFAULT_PIPELINE);
+function displayStage(item) {
+  return DISPLAY_STAGE[item.stage];
+}
 function stageIndex(stage) {
   return STAGES.indexOf(DISPLAY_STAGE[stage]);
 }
@@ -258,6 +272,9 @@ function groupsOf(pipeline = DEFAULT_PIPELINE) {
 var STAGE_GROUPS = groupsOf(DEFAULT_PIPELINE);
 function groupOfGate(gateId, pipeline = DEFAULT_PIPELINE) {
   return groupsOf(pipeline).find((group) => group.gates.includes(gateId));
+}
+function isRework(stage) {
+  return stage === "LOCAL_REWORK" || stage === "DEV_REWORK";
 }
 
 // src/lib/currentStep.ts
@@ -535,6 +552,8 @@ function livenessAge(said, now) {
 }
 
 // src/lib/words.ts
+var MAX_WORDS = 20;
+var TITLE_MAX = 60;
 var GLOSSARY = {
   "gate verdicts": "check results",
   "gate verdict": "check result",
@@ -625,6 +644,86 @@ var JARGON = [
   "impl",
   "wf"
 ];
+var PROPER = [
+  "Claude",
+  "Code",
+  "TeamFlow",
+  "GitHub",
+  "Linear",
+  "Jira",
+  "SonarQube",
+  "Playwright",
+  "Stripe",
+  "Google",
+  "Cognito",
+  "AWS",
+  "Resend",
+  "Slack",
+  "Cursor",
+  "Copilot",
+  "Windsurf",
+  "Cline",
+  "Codex",
+  "Gemini",
+  "Junie",
+  "Dev",
+  "Delivery",
+  "Home",
+  "Attention",
+  "History",
+  "Test",
+  "Audit",
+  "Rework",
+  "Deployed",
+  "Local",
+  "Done",
+  "CI/CD",
+  "January",
+  "February",
+  "March",
+  "April",
+  "May",
+  "June",
+  "July",
+  "August",
+  "September",
+  "October",
+  "November",
+  "December"
+];
+var NOISE = ["claude-code", "claude code", "general-purpose", "wf"];
+var TAIL = [
+  "a",
+  "an",
+  "and",
+  "the",
+  "to",
+  "of",
+  "for",
+  "with",
+  "in",
+  "on",
+  "or",
+  "at",
+  "by",
+  "from",
+  "until",
+  "but"
+];
+var KEY = /\b[A-Z][A-Z0-9]*-\d+\b:?/g;
+var AGENT_ID = /\b(?:worktree-)?agent-[0-9a-f]{6,}\b/gi;
+var HEX = /^(?=[0-9a-f]*\d)[0-9a-f]{7,}$/i;
+var CUT = /\S*(?:…|\.\.\.)$/;
+var MAJOR = /\s+·\s+|\s+—\s+|\s+-\s+/;
+var COLON = /:\s+/;
+var CODENAME = /^ws-|-(?:opus|sonnet|haiku|fable)(?:-\d+)?$/i;
+var CODEWORD = /^[a-z]+\d[a-z\d]*$/i;
+var BRACKETS = /\([\s,;&]*\)|\[[\s,;&]*\]/g;
+var CLAUSE = /[,;.](?=\s)|\s—(?=\s)/g;
+var AREA_MAX = 3;
+var ABOUT_MIN = 3;
+var FIRST = /(?<=[.;!?])\s/;
+var WORD = /[A-Za-z0-9']/;
 var escape = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 function any(terms) {
   const sorted = [...terms].sort((a, b) => b.length - a.length).map(escape).join("|");
@@ -639,6 +738,13 @@ var BANNED_RE = any(BANNED);
 var JARGON_RE = any(JARGON);
 var isUpper = (c) => c !== c.toLowerCase();
 var upperFirst = (s) => s[0].toUpperCase() + s.slice(1);
+function strip(text3, chars, left = true) {
+  let start = 0;
+  let end = text3.length;
+  while (left && start < end && chars.includes(text3[start])) start += 1;
+  while (end > start && chars.includes(text3[end - 1])) end -= 1;
+  return text3.slice(start, end);
+}
 function plainer(text3) {
   return text3.replace(GLOSS, (found, _g, at) => {
     const plain = LOOKUP[found.toLowerCase()];
@@ -647,6 +753,132 @@ function plainer(text3) {
     const first = !before || ".!?".includes(before[before.length - 1]);
     return isUpper(found[0]) && original === original.toLowerCase() && first ? upperFirst(plain) : plain;
   });
+}
+var squash = (text3) => String(text3 ?? "").replace(/\s+/g, " ").trim();
+var counted = (text3) => text3.split(" ").filter((w) => WORD.test(w));
+function sentence(parts) {
+  const list = typeof parts === "string" ? [parts] : parts || [];
+  let text3 = squash(list.map(squash).filter(Boolean).join(" "));
+  text3 = strip(plainer(text3), " .;:,", false);
+  if (!text3) return "";
+  const words = text3.split(" ");
+  const at = words.flatMap((w, i) => WORD.test(w) ? [i] : []);
+  if (at.length > MAX_WORDS) {
+    const kept = words.slice(0, at[MAX_WORDS - 1] + 1);
+    while (kept.length > 1 && TAIL.includes(strip(kept[kept.length - 1].toLowerCase(), ",;:"))) kept.pop();
+    text3 = strip(kept.join(" "), " .;:,", false);
+  }
+  text3 = upperFirst(text3);
+  return "?!".includes(text3[text3.length - 1]) ? text3 : `${text3}.`;
+}
+function slug(token, alone) {
+  if (!token.includes("-") && !token.includes("_") || HYPHENED.includes(token.toLowerCase())) return false;
+  return alone || token.includes("_") || token.split("-").length > 2 || token.toLowerCase().startsWith("wf-") || /-\d+$/.test(token);
+}
+function code(token, alone) {
+  if (GLOSS_WHOLE.test(token)) return false;
+  return CODENAME.test(token) || alone && CODEWORD.test(token);
+}
+function cleanSegment(segment) {
+  const raw = segment.split(" ").map((t) => t.startsWith("--") ? t.slice(2) : t);
+  const tokens = raw.filter((t) => !NOISE.includes(t.toLowerCase()) && !code(t, raw.length === 1));
+  const words = [];
+  let prose = 0;
+  let slugs = 0;
+  for (const token of tokens) {
+    if (HEX.test(token)) continue;
+    if (!slug(token, tokens.length === 1) || GLOSS_WHOLE.test(token)) {
+      words.push(token);
+      prose += 1;
+      continue;
+    }
+    slugs += 1;
+    const parts = token.split(/[-_]+/).filter(Boolean);
+    while (parts.length && /^\d+$/.test(parts[parts.length - 1])) parts.pop();
+    words.push(...parts.filter((p) => !NOISE.includes(p.toLowerCase())));
+  }
+  return [words.join(" "), prose > 0 && !slugs];
+}
+function isName(word) {
+  const bare = strip(word, "()[],;.");
+  return PROPER.includes(bare) || bare.slice(1) !== bare.slice(1).toLowerCase();
+}
+function sentenceCase(text3) {
+  const words = text3.split(" ");
+  const rest = words.slice(1).map((w) => strip(w, "()[],;.")).filter((w) => /^[A-Za-z]/.test(w));
+  const titled = rest.length > 0 && 2 * rest.filter((w) => isUpper(w[0])).length >= rest.length;
+  return words.map((word, i) => {
+    const bare = strip(word, "()[],;.");
+    const keep = PROPER.includes(bare) || !(bare && isUpper(bare[0]) && bare.slice(1) === bare.slice(1).toLowerCase());
+    if (i === 0) return upperFirst(word);
+    return titled && !keep ? word.toLowerCase() : word;
+  }).join(" ");
+}
+function cap(text3) {
+  if (text3.length > TITLE_MAX) {
+    const cuts = [...text3.matchAll(CLAUSE)].map((m) => m.index).filter((at) => at <= TITLE_MAX && text3.slice(0, at).split(/\s+/).filter(Boolean).length > 1);
+    if (cuts.length) text3 = text3.slice(0, cuts[cuts.length - 1]);
+  }
+  let words = text3.split(" ");
+  while (words.length > 1 && words.join(" ").length > TITLE_MAX) words.pop();
+  words = strip(words.join(" "), " .;:,-", false).split(" ");
+  while (words.length > 1 && TAIL.includes(words[words.length - 1].toLowerCase())) {
+    words = strip(words.slice(0, -1).join(" "), " .;:,-", false).split(" ");
+  }
+  return words.join(" ").slice(0, TITLE_MAX);
+}
+function segments(group, at) {
+  const parts = [];
+  for (const part of group.split(COLON)) {
+    const [cleaned, prose] = cleanSegment(squash(part));
+    const words = strip(squash(plainer(cleaned)), " .;:,-");
+    if (words && words.toLowerCase() !== "agent") parts.push([words, prose, part.trim()]);
+  }
+  const out = [];
+  if (parts.length === 2 && parts[0][1] && parts[1][1] && isUpper(parts[0][2][0]) && parts[0][0].split(" ").length <= AREA_MAX) {
+    const [first, ...rest] = parts[1][0].split(" ");
+    const detail = [isName(first) ? first : first.toLowerCase(), ...rest].join(" ");
+    const joined = `${parts[0][0]}: ${detail}`;
+    if (joined.length <= TITLE_MAX) out.push([0, -joined.split(" ").length, at, joined]);
+  }
+  parts.forEach(([words, prose], n) => out.push([prose ? 1 : 2, -words.split(" ").length, at + n + 1, words]));
+  return out;
+}
+function prepare(raw) {
+  const text3 = strip(squash(raw).replace(CUT, ""), " \xB7:\u2014-");
+  return squash(text3.replace(AGENT_ID, " ").replace(KEY, " ").replace(BRACKETS, " "));
+}
+var bag = (words) => new Set(words.toLowerCase().match(/[\w'$/-]+/g));
+function candidates(raw) {
+  const text3 = prepare(raw);
+  const found = [];
+  for (const group of text3.split(MAJOR)) found.push(...segments(group, found.length * 10));
+  found.sort((a, b) => a[0] - b[0] || a[1] - b[1] || a[2] - b[2]);
+  const out = [];
+  for (const [, , , words] of found) {
+    const mine = bag(words);
+    if (out.some((o) => {
+      const theirs = bag(o);
+      return [...mine].every((w) => theirs.has(w));
+    })) continue;
+    out.push(words);
+  }
+  const titled = out.map((words) => cap(sentenceCase(words))).filter((t) => t.split(" ").length > 1);
+  return titled.length ? titled : ["Agent work"];
+}
+function title(raw) {
+  return candidates(raw)[0];
+}
+function about(raw) {
+  let text3 = prepare(raw).split(FIRST)[0];
+  const colon = text3.indexOf(": ");
+  const area = colon > 0 ? text3.slice(0, colon) : "";
+  if (area && text3.slice(colon + 2) && /^[a-z]/.test(area) && area.split(" ").length <= AREA_MAX) text3 = text3.slice(colon + 2);
+  const open = text3.lastIndexOf("(");
+  if (open >= 0 && !text3.slice(open).includes(")")) text3 = text3.slice(0, open);
+  const kept = text3.split(" ").filter((w) => !NOISE.includes(w.toLowerCase()) && !CODENAME.test(strip(w, ":", false)));
+  const said = sentence(strip(kept.join(" "), " :\xB7\u2014-"));
+  return counted(said).length >= ABOUT_MIN ? said : "";
 }
 
 // src/lib/attention.ts
@@ -954,9 +1186,9 @@ function memberIdOf(email) {
 }
 
 // src/lib/identity.ts
-var slug = (value) => value.trim().toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "");
+var slug2 = (value) => value.trim().toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "");
 function actorAlias(actor) {
-  const id = slug(actor ?? "");
+  const id = slug2(actor ?? "");
   return id ? `actor:${id}` : void 0;
 }
 
@@ -1074,6 +1306,9 @@ function hasLiveOwner(ticket) {
 function hasFailedStatus(item) {
   return item.status === "failed" || item.status === "blocked";
 }
+function inReworkStage(ticket) {
+  return ticket.stage === "LOCAL_REWORK" || ticket.stage === "DEV_REWORK";
+}
 function isGateRun(run) {
   if (isReviewRun(run)) return false;
   return Boolean(run.gate) || GATE_KINDS.has(run.kind) || run.source !== void 0 && run.source !== "plugin";
@@ -1190,8 +1425,8 @@ function accountingOf(input) {
     const waitingOutside = waitingOn === "review" || waitingOn === "ci" || waitingOn === "dependency";
     const stalled = midStage && !finished && (Boolean(noVerdict) || live && band === "idle" && !waitingOutside);
     const blocked = openEdges.length > 0;
-    const isRework = Boolean(rework);
-    const idle = band === "idle" && !stalled && !blocked && !isRework;
+    const isRework2 = Boolean(rework);
+    const idle = band === "idle" && !stalled && !blocked && !isRework2;
     const inFlight = midStage && !finished && !stalled && !idle;
     const unassigned = !ticket.assignee && !ticket.member;
     const shipped = shippedAt(ticket);
@@ -1224,7 +1459,7 @@ function accountingOf(input) {
         live,
         stalled,
         blocked,
-        rework: isRework,
+        rework: isRework2,
         idle,
         inFlight,
         unassigned,
@@ -1384,6 +1619,14 @@ function readGateParts(raw) {
   }
   return Object.keys(out).length ? out : void 0;
 }
+var failedPart = (parts) => parts?.find((p) => p.status === "failed");
+var COUNT = /\b(\d+)\s*\/\s*(\d+)\b/;
+var TALLY = /\b\d+\s+(?:passed|failed|failing|failures?|errors?|warnings?|skipped|vulnerabilit(?:y|ies)|issues?)\b/i;
+function partPoint(part) {
+  const facts = part.failurePoints ?? [];
+  return facts.find((f) => COUNT.test(f))?.match(COUNT)?.[0].replace(/\s+/g, "") ?? facts.find((f) => TALLY.test(f))?.match(TALLY)?.[0] ?? facts[0] ?? "failed";
+}
+var reworkPoint = (part) => `${part.kind.replace("_", " ")}: ${partPoint(part)}`;
 
 // src/lib/dataSource.ts
 var CUSTOM_GATE_SLOT = /^(?:sonarqube|check-[a-z0-9][a-z0-9-]{0,39})$/;
@@ -1577,12 +1820,12 @@ function offTheBoard(tracker, projects = []) {
   return home.length > 0 && home.every((p) => (p.linear?.length ?? 0) + (p.jira?.length ?? 0) > 0);
 }
 function ticketFromTracker(tracker, team) {
-  const title = tracker.title ?? tracker.jiraKey;
+  const title2 = tracker.title ?? tracker.jiraKey;
   return {
     jiraKey: tracker.jiraKey,
     jiraUrl: trackerIssueUrl(tracker, team),
     tracker: tracker.provider,
-    title,
+    title: title2,
     jiraStatus: tracker.statusName,
     project: projectOf(tracker.jiraKey),
     actor: tracker.assignee?.name ?? "",
@@ -1593,7 +1836,7 @@ function ticketFromTracker(tracker, team) {
     stage: tracker.stage ?? "BACKLOG",
     reworkFrom: tracker.reworkFrom,
     status: "waiting",
-    summary: title,
+    summary: title2,
     updatedAt: tracker.occurredAt,
     deliveredAt: tracker.deliveredAt,
     ...tracker.removed ? { removed: true } : {}
@@ -1712,8 +1955,8 @@ function normaliseConnections(body) {
     if (typeof backfillable === "boolean") connection.canBackfill = backfillable;
     const backfill = text3("backfill_state", "backfillState");
     if (backfill) connection.backfillState = backfill;
-    const counted = row.last_backfill_count ?? row.backfill_count ?? row.backfillCount;
-    if (typeof counted === "number") connection.backfillCount = counted;
+    const counted2 = row.last_backfill_count ?? row.backfill_count ?? row.backfillCount;
+    if (typeof counted2 === "number") connection.backfillCount = counted2;
     const already = row.last_backfill_duplicate ?? row.backfillDuplicate;
     if (typeof already === "number") connection.backfillDuplicate = already;
     const read = row.last_backfill_seen ?? row.backfillSeen;
@@ -2036,8 +2279,8 @@ function doneAt(planned, card, joined, now) {
   const done = planned.state === "done" || (card ? isFinishedStage(card.stage) : false);
   if (!done) return void 0;
   const toDone = (card?.transitions ?? []).filter((move) => move.stage === "DONE").map((move) => time7(move.at)).filter(Number.isFinite);
-  const candidates = [time7(card ? shippedAt(card) : void 0), toDone.length ? Math.max(...toDone) : Number.NaN, time7(card?.updatedAt), time7(planned.updatedAt)];
-  const at = candidates.find(Number.isFinite) ?? now;
+  const candidates2 = [time7(card ? shippedAt(card) : void 0), toDone.length ? Math.max(...toDone) : Number.NaN, time7(card?.updatedAt), time7(planned.updatedAt)];
+  const at = candidates2.find(Number.isFinite) ?? now;
   return Math.min(Math.max(at, joined), now);
 }
 function burndownOf(run, tickets, now) {
@@ -2428,6 +2671,252 @@ function progressMarkdown(model, rows = exportRows(model.groups)) {
   return [`**${headline(model)}**`, "", finishWords(model), ...plans.length ? ["", ...plans] : [], "", head, rule, ...body, ""].join("\n");
 }
 
+// src/lib/failurePoints.ts
+var GATE_NAMES = {
+  audit: "Audit",
+  test: "Tests",
+  deploy: "Deploy",
+  build: "Build",
+  status: "Merge",
+  verified: "Check on dev",
+  rework: "Rework",
+  ci: "CI",
+  sonarqube: "SonarQube",
+  "dev-test": "Dev tests",
+  "audit-local": "Audit",
+  "audit-dev": "Dev audit",
+  security: "Security"
+};
+var FAILURE_WORDS = /\b(the|a|an|gate|check|checks|step|run|has|have|was|were|is|did|not|pass|passed|failed|fails|fail|failure|failing|again|found|some|problems?|issues?|errors?|red|broke|broken)\b/g;
+function saysMore(summary, names = []) {
+  let text3 = ` ${String(summary ?? "").toLowerCase()} `;
+  for (const name of names) {
+    const words = String(name ?? "").toLowerCase().trim();
+    if (words) text3 = text3.split(words).join(" ");
+  }
+  text3 = text3.replace(FAILURE_WORDS, " ").replace(/[^\p{L}\p{N}%]+/gu, " ").trim();
+  return text3.length > 0;
+}
+function namedEvidence(evidence) {
+  const said = (evidence ?? []).slice(0, 2).map((item) => `${item.value} ${item.label}`).join(", ");
+  return said || void 0;
+}
+function gateName2(gate) {
+  return GATE_NAMES[gate] ?? gate.replace(/[-_]/g, " ").replace(/^./, (c) => c.toUpperCase());
+}
+function fixedLine(done, total) {
+  return `${done} of ${total} ${total === 1 ? "point" : "points"} fixed`;
+}
+var STAGE_POINT_GATES = {
+  LOCAL_DEV: ["build"],
+  LOCAL_TEST: ["test"],
+  LOCAL_AUDIT: ["audit", "audit-local", "security"],
+  MERGE: ["status"],
+  CI_BUILD: ["ci", "build"],
+  DEPLOY_DEV: ["deploy", "ci"],
+  DEV_TEST: ["dev-test"],
+  DEV_AUDIT: ["audit-dev"],
+  DEV_VERIFIED: ["verified"]
+};
+function reworkFacts(ticket, move, now = Date.now()) {
+  const slot = move.failure?.slot;
+  const custom = ticket?.gate;
+  const gates = /* @__PURE__ */ new Set([...STAGE_POINT_GATES[move.from] ?? [], ...slot ? [slot] : [], ...custom ? [custom] : []]);
+  const checkId = slot?.startsWith("check-") ? slot.slice("check-".length) : void 0;
+  const customSlot = checkId ?? (slot === "sonarqube" ? slot : void 0);
+  const name = custom ? gateName2(checkId ?? slot ?? custom) : customSlot ? gateName2(customSlot) : STAGE_LABELS[move.from];
+  const mine = (ticket?.points ?? []).filter((point) => gates.has(point.gate));
+  const open = mine.filter((point) => point.state === "open").sort((a, b) => (b.lastRound ?? b.from) - (a.lastRound ?? a.from) || Date.parse(b.at) - Date.parse(a.at));
+  const done = mine.filter((point) => point.state === "done").length;
+  const verdict = [...ticket?.verdicts ?? []].reverse().find((one) => one.verdict === "fail" && gates.has(one.gate));
+  const round = verdict?.round ?? (mine.length ? Math.max(...mine.map((point) => point.lastRound ?? point.from)) : void 0);
+  const loop = [...ticket?.rework ?? []].reverse().find((entry) => !entry.clearedAt);
+  const at = loop?.at ?? move.failure?.updatedAt ?? verdict?.at;
+  const by = verdict?.by ?? loop?.by ?? move.failure?.agent?.name ?? move.failure?.session?.branch;
+  const head = [`${name}${round ? `, round ${round}` : ""}`, at ? relativeAge(at, now) : void 0, by ? `by ${by}` : void 0].filter(Boolean).join(" \xB7 ");
+  const names = [name, STAGE_LABELS[move.from], move.failure?.label, slot ? gateName2(slot) : void 0];
+  const said = [loop?.summary, move.failure?.summary, ticket?.lastFailure?.summary].find((text3) => text3 && saysMore(text3, names));
+  const counts = namedEvidence(move.failure?.evidence?.length ? move.failure.evidence : ticket?.evidence);
+  return {
+    head,
+    open: open.map((point) => point.text),
+    fixed: done > 0 ? fixedLine(done, mine.length) : void 0,
+    reason: open.length ? void 0 : said || counts || (mine.length ? void 0 : "Nobody gave a reason."),
+    said: said || void 0,
+    evidence: counts,
+    gate: name,
+    loops: (move.loopCount ?? 0) > 1 ? `Sent back ${move.loopCount} times` : void 0
+  };
+}
+
+// src/lib/insights.ts
+function reworkLoop(ticket) {
+  const gate = ticket.reworkFrom;
+  if (!gate) return void 0;
+  const from = DISPLAY_STAGE[gate];
+  const to = displayStage(ticket);
+  if (stageIndex(from) <= stageIndex(to)) return void 0;
+  const atGate = (ticket.executions ?? []).filter((execution) => DISPLAY_STAGE[execution.stage] === from);
+  const failure = atGate.filter(hasFailedStatus).sort((a, b) => time9(b.updatedAt) - time9(a.updatedAt))[0];
+  if (failure && atGate.some((run) => run.status === "success" && time9(run.updatedAt) > time9(failure.updatedAt))) {
+    return void 0;
+  }
+  return { from, to, failure, label: moveLabel(ticket, from, failure), loopCount: ticket.loopCount ?? 0 };
+}
+function moveLabel(ticket, from, failure) {
+  const evidence = failure?.evidence?.length ? failure.evidence : ticket.evidence ?? [];
+  const counts = namedEvidence(evidence);
+  const said = failure?.summary && saysMore(failure.summary, [failure.label, STAGE_LABELS[from]]) ? failure.summary : void 0;
+  return said || counts || failure?.label || ticket.summary || STAGE_LABELS[from];
+}
+function failureAt(ticket, column) {
+  return (ticket.executions ?? []).filter((run) => DISPLAY_STAGE[run.stage] === column && hasFailedStatus(run)).sort((a, b) => time9(b.updatedAt) - time9(a.updatedAt))[0];
+}
+function passedSince(ticket, column, failure) {
+  if (!failure) return false;
+  return (ticket.executions ?? []).some((run) => DISPLAY_STAGE[run.stage] === column && run.status === "success" && time9(run.updatedAt) > time9(failure.updatedAt));
+}
+function backwardMove(ticket) {
+  const flagged = reworkLoop(ticket);
+  if (flagged) return { ...flagged, source: "rework" };
+  const to = displayStage(ticket);
+  const named = isRework(ticket.stage) ? ticket.reworkFrom : void 0;
+  if (named && DISPLAY_STAGE[named] === to) {
+    const failure2 = failureAt(ticket, to);
+    if (passedSince(ticket, to, failure2)) return void 0;
+    return {
+      from: to,
+      to: DISPLAY_STAGE[ticket.stage],
+      failure: failure2,
+      label: moveLabel(ticket, to, failure2),
+      loopCount: ticket.loopCount ?? 0,
+      source: "rework"
+    };
+  }
+  const failure = (ticket.executions ?? []).filter((run) => hasFailedStatus(run) && stageIndex(DISPLAY_STAGE[run.stage]) > stageIndex(to)).sort((a, b) => time9(b.updatedAt) - time9(a.updatedAt))[0];
+  if (!failure) return void 0;
+  const from = DISPLAY_STAGE[failure.stage];
+  if (passedSince(ticket, from, failure)) return void 0;
+  return { from, to, failure, label: moveLabel(ticket, from, failure), loopCount: ticket.loopCount ?? 0, source: "history" };
+}
+var time9 = (iso2) => new Date(iso2).getTime() || 0;
+var TRACKER_NAMES = {
+  jira: "Jira",
+  linear: "Linear",
+  github: "GitHub",
+  teamflow: "Ad hoc"
+};
+var TRACKERS = Object.keys(TRACKER_NAMES).filter((tracker) => tracker !== "teamflow");
+
+// src/lib/arrows.ts
+function reworkWords(ticket) {
+  const move = backwardMove(ticket);
+  const part = failedPart(ticket.ciParts);
+  if (part && (!move || displayStage({ stage: move.from }) === "CI_BUILD")) return `back from ${STAGE_LABELS.CI_BUILD} \xB7 ${reworkPoint(part)}`;
+  return move ? `back from ${reworkFacts(ticket, move).gate}` : void 0;
+}
+
+// src/lib/cardFace.ts
+var NEXT_WORDS = {
+  backlog: "plan it",
+  build: "start work",
+  test: "tests",
+  audit: "checks",
+  merge: "merge",
+  ci: "build and deploy",
+  "dev-test": "tests on Dev",
+  "dev-audit": "checks on Dev",
+  verified: "deploy",
+  done: "close the ticket"
+};
+var WAITING_WORDS2 = {
+  review: "waiting for a review",
+  ci: "waiting for the build",
+  deploy: "waiting to deploy",
+  dependency: "waiting for other work"
+};
+var PLACEHOLDER_TITLE = "Agent work";
+var PICK_UP = "waiting for someone to pick it up";
+var trimEnd = (text3) => text3.replace(/[\s.]+$/, "");
+function firstName(name) {
+  const raw = (name ?? "").trim();
+  if (!raw) return "";
+  const local = raw.includes("@") && !raw.includes(" ") ? raw.split("@")[0].split(/[._-]/)[0] : raw.split(/\s+/)[0];
+  return local ? local[0].toUpperCase() + local.slice(1) : "";
+}
+function ageWords2(ms) {
+  const minutes = Math.max(1, Math.floor(ms / 6e4));
+  const unit = (n, word) => `${n} ${word}${n === 1 ? "" : "s"}`;
+  if (minutes < 60) return unit(minutes, "minute");
+  const hours = Math.floor(minutes / 60);
+  if (hours < 48) return unit(hours, "hour");
+  return unit(Math.floor(hours / 24), "day");
+}
+function lineOf(account) {
+  const { ticket } = account;
+  const said = ticket.say?.line?.trim();
+  if (said) return said;
+  const raw = (ticket.title ?? "").trim();
+  if (raw && raw !== ticket.jiraKey) {
+    const plain = title(raw);
+    return plain === PLACEHOLDER_TITLE ? plainer(raw) : plain;
+  }
+  return ticket.jiraKey;
+}
+function whoOf(account, members) {
+  const { ticket } = account;
+  if (!account.flags.finished) {
+    const agent = [...ticket.executions ?? []].reverse().find((run) => run.agent)?.agent;
+    if (agent && !agent.endedAt) {
+      const task = ticket.agentTask?.trim() || trimEnd(about(agent.task));
+      return task || "an agent";
+    }
+  }
+  const member = ticket.member ? members?.get(ticket.member)?.displayName : void 0;
+  return firstName(member ?? ticket.assignee?.name ?? account.laneLabel);
+}
+function nextOf(account, pipeline, viewer) {
+  const { flags, ticket } = account;
+  if (flags.finished || flags.done) return "done";
+  if (account.rework && inReworkStage(ticket)) return PICK_UP;
+  if (account.delayed) return "next: try again";
+  const need = account.attention.find((row) => row.tier === "need" && !row.handled && !(account.rework && row.cause === "rework"));
+  const person = need ? need.ownerLabel : ticket.assignee?.name ?? account.laneLabel;
+  const me = viewer?.toLowerCase();
+  const whom = (name, id) => me && (name?.toLowerCase() === me || id?.toLowerCase() === me) ? "you" : firstName(name) || "a person";
+  if (account.waitingOn === "human") return `waiting for ${whom(person, need?.ownerId)}`;
+  if (account.waitingOn) return WAITING_WORDS2[account.waitingOn];
+  if (account.openEdges.length) return WAITING_WORDS2.dependency;
+  if (need) return `waiting for ${whom(need.ownerLabel, need.ownerId)}`;
+  const gates = columnsOf(pipeline);
+  const at = account.gate ? gates.findIndex((g) => g.id === account.gate.id) : -1;
+  const next = at >= 0 ? gates[at + 1] : void 0;
+  if (!next) return "";
+  return `next: ${NEXT_WORDS[next.id] ?? next.label}`;
+}
+function cardFace(account, now, opts = {}) {
+  const pipeline = opts.pipeline ?? DEFAULT_PIPELINE;
+  const { ticket, flags } = account;
+  const line = lineOf(account);
+  const next = nextOf(account, pipeline, opts.viewer);
+  const who = next === PICK_UP ? "" : whoOf(account, opts.members);
+  const second = [next.endsWith(` ${who}`) ? "" : who, next].filter(Boolean).join(" \xB7 ");
+  const face = { line, who, next, second };
+  if (!flags.finished && !flags.done && (account.noVerdict || flags.stalled || account.band === "idle")) {
+    const last = Math.max(Date.parse(ticket.updatedAt) || 0, account.liveness?.lastEventAt ?? 0);
+    const short = ageWords2(now - last);
+    face.staleShort = short;
+    face.stale = `no news for ${short}`;
+  }
+  if (account.rework) face.rework = reworkWords(ticket) ?? "back from an earlier check";
+  return face;
+}
+function reworkLine(account, now, opts = {}) {
+  const { ticket } = account;
+  if (ticket.stage === "DONE" || !(inReworkStage(ticket) || ticket.reworkFrom)) return void 0;
+  return cardFace(account, now, opts).second || void 0;
+}
+
 // src/lib/statusUpdate.ts
 var DAY_MS7 = 24 * 60 * 6e4;
 var RECENT_MS = 7 * DAY_MS7;
@@ -2451,8 +2940,8 @@ var LEADING_KEY = /^\s*(\[?[A-Za-z][\w-]*-\d+\]?|#\d+)\s*[:\-–—]?\s*/;
 function plainLine(ticket) {
   const said = ticket.say?.line?.trim();
   if (said) return said;
-  const title = (ticket.title ?? "").replace(LEADING_KEY, "").trim();
-  return title ? plainer(title) : ticket.jiraKey;
+  const title2 = (ticket.title ?? "").replace(LEADING_KEY, "").trim();
+  return title2 ? plainer(title2) : ticket.jiraKey;
 }
 function whenWords(at, now) {
   if (at === void 0 || !Number.isFinite(at)) return "";
@@ -2464,7 +2953,7 @@ function whenWords(at, now) {
   const days = Math.floor(hours / 24);
   return days === 1 ? "yesterday" : `${days} days ago`;
 }
-function time9(value) {
+function time10(value) {
   const parsed = value ? Date.parse(value) : Number.NaN;
   return Number.isFinite(parsed) ? parsed : void 0;
 }
@@ -2472,7 +2961,7 @@ function waitingWhy(card, now) {
   const edge = card.openEdges.find((e) => e.from === card.key);
   if (edge) return `waits for ${edge.on}`;
   if (card.flags.backlog) return "not started";
-  const at = time9(card.ticket.updatedAt);
+  const at = time10(card.ticket.updatedAt);
   return at === void 0 ? "nobody is on it" : `no news for ${whenWords(at, now).replace(/ ago$/, "")}`;
 }
 function order(rows, planRank) {
@@ -2490,14 +2979,15 @@ function statusUpdateOf(input) {
   for (const card of input.accounting.cards.values()) {
     const ticket = card.ticket;
     const group = groupOf({ needsYou: needs.has(card.key), finished: card.flags.finished, deployed: wasDeployed(ticket), live: card.flags.live && !card.flags.stalled });
-    const finishedAt = group === "live" || group === "merged" ? time9(shippedAt(ticket)) : void 0;
-    const at = finishedAt ?? time9(ticket.updatedAt);
+    const finishedAt = group === "live" || group === "merged" ? time10(shippedAt(ticket)) : void 0;
+    const at = finishedAt ?? time10(ticket.updatedAt);
     const run = planOf.get(card.key);
     groups[group].push({
       key: card.key,
       group,
       line: plainLine(ticket),
-      who: card.laneLabel,
+      // A card back from a check says its line 2 (MACLEOD-766): nobody until picked up, then who and next.
+      who: reworkLine(card, now) ?? card.laneLabel,
       at,
       planId: run?.id,
       planName: run?.name,

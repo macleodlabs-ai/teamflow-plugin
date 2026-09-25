@@ -837,7 +837,7 @@ entry of an issue document's `verdicts[]`:
 ```
 Audit passed.
 Audit passed. <n> points are still open.
-Audit found problems. Sent back for rework (round <n>).
+Audit found problems. Sent back for rework (round <n>). <the card's line 2>.
 
 <summary>
 
@@ -845,7 +845,12 @@ Audit found problems. Sent back for rework (round <n>).
 - [ ] <a failure point it raised, or one still open>
 ```
 
-(`Tests failed.`, `Deploy failed.` and so on for the other gates). The
+(`Tests failed.`, `Deploy failed.` and so on for the other gates). A failed
+round ends its first line with the card's line 2 on the board as the comment
+goes out (MACLEOD-766): `Waiting for someone to pick it up.` until somebody
+does, then `<first name, or the running agent's task> · next: <step>.`, derived by
+`card_face.rework_line` from the stage, the assignee or reporter, the
+reported `agentTask` and the pipeline, and made inert like the summary. The
 summary is the entry's own `summary`, when it has one. The task list is the
 round's failure points (`raised`, `fixed`, `open` on the entry, their text
 from `points[]` below), each ticked when it is done; GitHub and Linear both
