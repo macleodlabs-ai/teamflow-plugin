@@ -33,6 +33,7 @@ const JIRA_URL_RE = /\/browse\/([A-Z][A-Z0-9]{1,19}-\d+)\b/i;
 const LINEAR_URL_RE = /linear\.app\/([\w.-]+)\/issue\/([A-Z][A-Z0-9]{1,19}-\d+)/i;
 // The whole argument, for `teamflow bind` and `teamflow report --issue`.
 const BARE_KEY_RE = /^[A-Z][A-Z0-9]{1,19}-\d+$/i;
+const GLUED_KEY_RE = /\b[A-Za-z0-9]+-[A-Z][A-Z0-9]{1,19}-\d+\b/gi;
 const GITHUB_URL_RE = /github\.com\/([\w.-]+)\/([\w.-]+)\/issues\/(\d+)\b/i;
 // The lookbehind keeps a deeper path such as src/lib/dataSource.ts#42 from reading as owner/repo#n.
 const GITHUB_REF_RE = /(?<![\w.\-/])([\w.-]+)\/([\w.-]+)#(\d+)\b/;
@@ -2968,7 +2969,10 @@ export function issueCandidates(input = {}, info = {}, manual = undefined, confi
     add({ key: bound.jiraKey, tracker: bound.tracker || tracker, repo: bound.repo, workspace: bound.workspace, boundAt: bound.boundAt, account: bound.account }, 1000, 'manual');
   }
   // Only what the person typed: quoted text is somebody else's (MACLEOD-795).
-  add(detectIssueRef(ownPromptText(input.prompt), config, info), 100, 'prompt');
+  // A key glued to a word before it is part of that word, not a ticket:
+  // "EU-WEST-1" in a pasted AWS email bound a session to WEST-1 (2026-09-25).
+  // Prompts only; a branch such as fix-CORE-217 still binds as before.
+  add(detectIssueRef(ownPromptText(input.prompt).replace(GLUED_KEY_RE, ' '), config, info), 100, 'prompt');
   add(detectIssueRef(input.task_subject, config, info), 98, 'task');
   // The two sources nobody wrote to name a ticket, and the two the prefix rule
   // guards: a dependency bump's branch and its commit message say `express-6.9.21`
@@ -5968,6 +5972,36 @@ export async function sendGateMap(payload, config) {
   const envelope = { kind: 'gatemap', payload };
   const idempotencyKey = crypto.createHash('sha256').update(JSON.stringify(envelope)).digest('hex');
   return postEnvelope(`${serviceUrl(config)}/v1/report`, envelope, idempotencyKey, config, reportScope(config));
+}
+
+/**
+ * One agent view chunk (MACLEOD-793, docs/AGENT_VIEW.md), built and cleaned
+ * by agent-view.mjs. Never queued in the outbox: agent-view.mjs keeps its
+ * own bounded spool, and a refusal there must stop, not wait in line.
+ */
+export async function sendAgentView(body, config) {
+  if (!credentialKind(config)) return { ok: false, skipped: true, reason: 'no service credential configured' };
+  const idempotencyKey = crypto.createHash('sha256').update(`${body.session}/${body.agent}/${body.seq}`).digest('hex');
+  return postEnvelope(`${serviceUrl(config)}/v1/agent-view/chunks`, body, idempotencyKey, config, reportScope(config));
+}
+
+/** The organisation's agent view setting (MACLEOD-793), readable by any member. */
+export async function fetchAgentViewSetting(config) {
+  const cred = await credential(config);
+  if (!cred) return { ok: false, reason: 'no service credential available' };
+  try {
+    const response = await fetch(`${serviceUrl(config)}/v1/members/settings/agent-view`, {
+      headers: { [cred.header]: cred.value },
+      redirect: 'error',
+      signal: AbortSignal.timeout(Number(config.serviceTimeoutMs || 5000)),
+    });
+    let body;
+    try { body = await response.json(); } catch { body = undefined; }
+    if (!response.ok) return { ok: false, status: response.status, ...refusalOf(body, `service returned ${response.status}`) };
+    return { ok: true, status: response.status, body };
+  } catch (error) {
+    return { ok: false, reason: unreachableReason(error, config) };
+  }
 }
 
 export async function fetchAccount(config) {

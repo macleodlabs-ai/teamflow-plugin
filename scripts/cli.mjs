@@ -120,6 +120,8 @@ const USAGE = `teamflow \u2014 delivery reporting for TeamFlow
   teamflow skills install --for <tool>      install these skills into another tool
   teamflow continue on|off|status   whether TeamFlow tells a stopped session what
                                    to do next (on for plan runs by default)
+  teamflow agent-view on|off|status whether this computer sends what your agents
+                                   say to their tickets (off by default)
   teamflow hooks status | install           report automatically from that tool
   teamflow hooks uninstall --all            take all of it back out again
   teamflow hook --for <tool>                the hook entry itself; tools call this
@@ -355,6 +357,8 @@ async function status() {
     ...(work.length ? { work } : {}),
     heartbeat,
     autoContinue,
+    // Which of the two switches is off (MACLEOD-793), from local files only.
+    agentView: (await import('./agent-view.mjs')).agentViewLine(config),
     snapshot,
     lastPublishResult: state?.lastPublishResult,
     // Machine-wide, and until a report is accepted again (MACLEOD-620).
@@ -676,6 +680,14 @@ async function doctor() {
       ? safeExec('aws', ['s3', 'ls', String(config.dataUri).replace(/\/data\/?$/, '')], { timeout: 5000 })
       : { ok: false, stderr: 'neither TEAMFLOW_API_KEY nor TEAMFLOW_DATA_URI is configured' };
     report.s3Access = s3Probe.ok ? 'ok' : `not verified: ${s3Probe.stderr || 'failed'}`;
+  }
+  // Agent view (MACLEOD-793): which switch is off, with the organisation's
+  // asked of the settings route when there is a credential to ask with.
+  {
+    const { agentViewLine, fetchOrgSetting, noteOrg } = await import('./agent-view.mjs');
+    const setting = transport === 'service' ? await fetchOrgSetting(config) : undefined;
+    if (setting) noteOrg(config, setting.state, setting.code);
+    report.agentView = agentViewLine(config, { setting });
   }
   print(report);
 }
@@ -1090,6 +1102,19 @@ try {
         ? 'TeamFlow will tell a stopped session what to do next, in a plan and outside one.'
         : 'TeamFlow will not tell a stopped session what to do next. `teamflow continue on` turns it back on.');
     }
+  }
+  else if (command === 'agent-view') {
+    // `teamflow agent-view on|off|status` (MACLEOD-793): this person's own
+    // switch. The organisation's switch is the other half; both must be on.
+    const { agentViewLine, setPersonSwitch } = await import('./agent-view.mjs');
+    const [verb = 'status'] = args;
+    if (verb !== 'status') {
+      const on = setPersonSwitch(verb);
+      print(on
+        ? 'TeamFlow will send what your agents say to their tickets, when your organisation has it on. Code and secrets are taken out first.'
+        : 'TeamFlow will not send what your agents say. `teamflow agent-view on` turns it back on.');
+    }
+    print(`Agent view: ${agentViewLine(config)}`);
   }
   else if (command === 'statusline-tap') {
     // Chained from a statusline command: reads its JSON, prints nothing (MACLEOD-641).

@@ -1439,3 +1439,95 @@ No report carries anything new for this: every field below is written by the ser
 | private model | `learning/v1/entitlements/private-model.json` | `{enabled, source, at}` | The flag for the "trained only on your data" tier; the billing webhook will set it once the product exists (nothing writes it yet). |
 
 `features` hold **no free text**. They are `decide.STATE_FIELDS` without `note`: `gate`, `status`, `gateKind`, the clocks, `waitingOn`, `loopCount`, and `lastFailure {stage, at, digest, flake}`, `retry {attempt, of, status, digest, flake}`, `rework[] {gate, at, clearedAt?, digest, flake}`, where `digest` is the first 16 hex characters of sha256(organisation + the normalised line) and `flake` whether the line matched the rules' transient-failure pattern. A failure line or retry reason is therefore only ever compared for equality within one organisation, and never kept; a note is not kept at all; every other string is a short enum, id or timestamp (`decision_labels.SHORT`), and anything else is dropped at the write (`decision_labels.clean_row`). A label row never holds a ticket key (the row id is a hash of it), a member, an address, a command, a prompt, a diff or a log. Labels are kept 90 days. When an owner switches own training off, capture and labelling stop at once, the policy reads the default bars at once, and a purge job starts at once and deletes every capture and label made before the switch, whatever the switch says by the time it runs; the nightly fan-out keeps the tenant due until the purge has finished, activity or not. A pooled set is assembled at read time from the organisations whose pooled switch is on at that moment (which needs own training on) and which are not private, and is never stored.
+
+## Agent view (MACLEOD-793)
+
+Agent view is the one opt-in exception to "derived facts only". It sends
+what agents say and do, so a lead can read a conversation beside its card.
+`docs/AGENT_VIEW.md` is the full contract; this section is what may cross
+the wire.
+
+It is sent only when two switches are both on: the organisation's (an
+owner or admin, Team plan or above) and the person's own
+(`teamflow agent-view on`, kept in `~/.config/teamflow/config.json`, which
+a repository cannot write). The plugin reads the organisation's switch
+from `GET /v1/members/settings/agent-view` and from the service's last
+refusal, and sends nothing while it does not know. Only lines written
+after the person switched on are sent. After `403 agent_view_off` or
+`403 plan_required` it stops and asks again after 10 minutes; what was
+said in between is dropped, never kept for later.
+
+`POST /v1/agent-view/chunks` carries
+`{key, session, agent, seq, sent_at, encoding: "gzip+base64", data}`:
+
+- `key`: the ticket the agent is bound to.
+- `session`: the first 16 hex characters of sha256 of the Claude Code
+  session id, never the id itself.
+- `agent`: `main`, or the subagent's id. Background agents are subagents.
+- `seq`: counts up per session and agent.
+- `data`: gzip-compressed JSON lines, at most 256 KB compressed per chunk.
+
+Each line is `{t, role, tool?, text}`:
+
+- `t`: when it was said, from the transcript.
+- `role`: `user`, `assistant` or `tool`.
+- `user` and `assistant` text: what the person typed and what the agent
+  answered, after the two steps below, at most 4,000 characters.
+- `tool`: the tool's name in `tool`, and in `text` a one-line summary of
+  its input and its outcome (`done`, `failed` or `no result`). The summary
+  is a command's own description (or its first line), a path relative to
+  the repository (or only the file name), a search pattern, a URL or a
+  query, or an agent's description and type.
+
+Every line passes two steps on the machine, in this order
+(`plugin/scripts/redact.mjs`):
+
+1. **Code out.** It never carries source code: a fenced block (``` or
+   `~~~`, closed or not) and a run of four or more lines that looks like
+   code become `[code, N lines]`; an inline code span longer than 60
+   characters becomes `[code]`.
+2. **Secrets out.** Private key blocks, credentials in URLs, `Bearer` and
+   `Basic` values, JWTs, `.env` and environment assignments
+   (`NAME=value`), anything named like a secret (`api_key: …`,
+   `"password": "…"`), known token shapes (`sk_`, `pk_`, `ghp_`, `gho_`,
+   `github_pat_`, `xox?-`, `glpat-`, `npm_`, `whsec_`, `AKIA…`, `AIza…`
+   and others) and long opaque runs of letters and digits become
+   `[redacted]`.
+
+Never in the safe layer:
+
+- a tool's output or result body, an error's text, or a log;
+- file contents: a write's content, an edit's old and new text, a diff,
+  or anything a read returned;
+- source code, as above.
+
+Never sent at all, in either layer and whatever the switches say:
+
+- secrets: every line of both layers passes `redactSecrets`;
+- an agent's prompt;
+- thinking, system reminders, CLAUDE.md or memory text, and meta entries;
+- anything a read returned (a file's contents as the agent read it);
+- the Claude Code session id, or an absolute path outside the repository.
+
+### The detail layer (sensitive detail)
+
+A second layer, sent only while the organisation's `agent_view.sensitive`
+is on. That setting is a ceiling an owner or admin controls, off by
+default; while it is off, or unknown to the machine, nothing below leaves.
+
+- Chunks carry `layer: "detail"`, the same `key`, `session` and `agent`,
+  their own `seq`, and at most 512 KB compressed.
+- Each line is `{t, role, kind, tool?, text}`. `kind` is `text` (what was
+  typed or said, code kept), `output` (a tool's output, its terminal
+  colours kept as ANSI codes) or `diff` (an Edit, Write or MultiEdit as a
+  unified diff, paths relative to the repository).
+- A line's text is at most 64 KB; the rest becomes "[N more lines]".
+- `redactSecrets` runs on every detail line, code and output included.
+  Only `stripCode` is skipped.
+- A `403 sensitive_off` stops the detail layer at once; the safe layer
+  goes on.
+
+A chunk the service could not be reached for waits in a spool on the
+machine, at most about 5 MB, oldest dropped first. The service keeps
+chunks apart from the board, for 7 days, and never reads them into a
+report, a digest, the classifier or the board's views.

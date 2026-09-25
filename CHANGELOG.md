@@ -3,6 +3,21 @@
 What changed in each published version of the TeamFlow plugin, newest first.
 Only what a person using it would notice.
 
+## 0.3.47
+
+- **A region name in a pasted message is not a ticket.** Text such as
+  "EU-WEST-1" no longer binds your session to a ticket called WEST-1.
+
+- **Full detail, when your organisation allows it.** With sensitive detail
+  on, your agents' code, tool output and edits are sent too, so you can
+  read them in TeamFlow. Secrets are still removed. It is off by default.
+
+- **Agent view, off by default.** `teamflow agent-view on` lets your
+  organisation read what your agents say, beside their cards. It sends only
+  when you and your organisation both turn it on. Code and secrets are taken
+  out first, and tool output is not sent unless your organisation allows
+  full detail.
+
 ## 0.3.46
 
 - **`teamflow status` forgets a finished ad hoc card.** After

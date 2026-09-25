@@ -1368,6 +1368,19 @@ export async function handleEvent(input = {}) {
     } catch { /* nothing to say is said */ }
   }
 
+  /*
+   * Agent view (MACLEOD-793): only when this person switched it on, a
+   * detached process reads the session's transcripts and sends them. The
+   * hook reads nothing and waits for nothing. Claude Code only: the
+   * transcript is Claude Code's.
+   */
+  if (!input.reporter_tool) {
+    try {
+      const { kick } = await import('./agent-view.mjs');
+      kick(event, input, sessionId, cwd);
+    } catch { /* nothing is sent this event */ }
+  }
+
   return {
     state,
     justBound,

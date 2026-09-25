@@ -1574,6 +1574,29 @@ function readAdhocTickets(raw) {
   return { setting: setting ?? OFF, source: setting && held.source === "org" ? "org" : "default", projects };
 }
 
+// src/lib/watching.ts
+var names = (value) => Array.isArray(value) ? value.filter((name) => typeof name === "string" && name.length > 0) : [];
+function readWatching(raw) {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return void 0;
+  const held = raw;
+  const out = { tickets: {}, threads: {} };
+  const take = (source, into) => {
+    if (!source || typeof source !== "object" || Array.isArray(source)) return;
+    for (const [key, value] of Object.entries(source)) {
+      const who = names(value);
+      if (!who.length) continue;
+      out[into ?? (key.includes("/") ? "threads" : "tickets")][key] = who;
+    }
+  };
+  if ("tickets" in held || "threads" in held) {
+    take(held.tickets, "tickets");
+    take(held.threads, "threads");
+  } else {
+    take(held);
+  }
+  return out;
+}
+
 // src/lib/ciParts.ts
 var KINDS = ["build", "lint", "test", "security_scan", "deploy", "other"];
 var STATUSES = ["passed", "failed", "running", "not_run", "skipped"];
@@ -1914,8 +1937,8 @@ function normaliseConnections(body) {
     const provider = String(row.provider ?? "").toLowerCase();
     if (!isTracker2(provider)) return [];
     const connection = { provider };
-    const text3 = (...names) => {
-      for (const name of names) {
+    const text3 = (...names2) => {
+      for (const name of names2) {
         const value = row[name];
         if (typeof value === "string" && value) return value;
       }
@@ -1926,12 +1949,12 @@ function normaliseConnections(body) {
     const filter = text3("filter");
     const legacyFilter = typeof row.scope === "string" ? row.scope : void 0;
     if (filter ?? legacyFilter) connection.filter = filter ?? legacyFilter;
-    const when = (...names) => {
-      for (const name of names) {
+    const when = (...names2) => {
+      for (const name of names2) {
         const value = row[name];
         if (typeof value === "number" && value > 0) return new Date(value * 1e3).toISOString();
       }
-      return text3(...names);
+      return text3(...names2);
     };
     const delivered = when("last_delivery_at", "lastDeliveryAt");
     if (delivered) connection.lastDeliveryAt = delivered;
@@ -2064,6 +2087,7 @@ function readServiceState(index) {
   const reportedColumns = [...new Set(list(index.reportedColumns, (row) => typeof row === "string").map((stage) => canonicalStage(stage)))];
   const liveness = readLiveness(index.liveness);
   const sessions = readSessions(index.sessions);
+  const watching = readWatching(index.agentViewWatching);
   const adhocTickets = readAdhocTickets(index.adhocTickets);
   return {
     members,
@@ -2079,7 +2103,9 @@ function readServiceState(index) {
     ...adhocTickets ? { adhocTickets } : {},
     // MACLEOD-641: left out, not empty, when the service did not send it.
     ...liveness ? { liveness } : {},
-    ...sessions ? { sessions } : {}
+    ...sessions ? { sessions } : {},
+    // MACLEOD-793: left out when the service did not send it.
+    ...watching ? { watching } : {}
   };
 }
 function pipelinesOf(raw) {
@@ -2688,9 +2714,9 @@ var GATE_NAMES = {
   security: "Security"
 };
 var FAILURE_WORDS = /\b(the|a|an|gate|check|checks|step|run|has|have|was|were|is|did|not|pass|passed|failed|fails|fail|failure|failing|again|found|some|problems?|issues?|errors?|red|broke|broken)\b/g;
-function saysMore(summary, names = []) {
+function saysMore(summary, names2 = []) {
   let text3 = ` ${String(summary ?? "").toLowerCase()} `;
-  for (const name of names) {
+  for (const name of names2) {
     const words = String(name ?? "").toLowerCase().trim();
     if (words) text3 = text3.split(words).join(" ");
   }
@@ -2734,8 +2760,8 @@ function reworkFacts(ticket, move, now = Date.now()) {
   const at = loop?.at ?? move.failure?.updatedAt ?? verdict?.at;
   const by = verdict?.by ?? loop?.by ?? move.failure?.agent?.name ?? move.failure?.session?.branch;
   const head = [`${name}${round ? `, round ${round}` : ""}`, at ? relativeAge(at, now) : void 0, by ? `by ${by}` : void 0].filter(Boolean).join(" \xB7 ");
-  const names = [name, STAGE_LABELS[move.from], move.failure?.label, slot ? gateName2(slot) : void 0];
-  const said = [loop?.summary, move.failure?.summary, ticket?.lastFailure?.summary].find((text3) => text3 && saysMore(text3, names));
+  const names2 = [name, STAGE_LABELS[move.from], move.failure?.label, slot ? gateName2(slot) : void 0];
+  const said = [loop?.summary, move.failure?.summary, ticket?.lastFailure?.summary].find((text3) => text3 && saysMore(text3, names2));
   const counts = namedEvidence(move.failure?.evidence?.length ? move.failure.evidence : ticket?.evidence);
   return {
     head,
