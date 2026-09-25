@@ -523,6 +523,11 @@ export async function done(cwd, config = {}, info = {}, { summary, status = 'suc
   const line = summary === undefined ? 'Ad hoc work done' : checkTitle(summary);
   const sent = await republish(bound.jiraKey, bound.title, cwd, config, info, { status, summary: line });
   clearBinding(cwd, config);
+  // The session still named the finished card, so `teamflow status` kept
+  // showing it after "done and unbound" (MACLEOD-807). Only that exact key
+  // is cleared: a session that has moved on keeps its newer binding.
+  const session = latestSessionForCwd(cwd, config);
+  if (session?.binding?.key === bound.jiraKey) saveSession({ ...session, binding: undefined });
   return { key: bound.jiraKey, title: bound.title, sent };
 }
 

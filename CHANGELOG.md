@@ -3,6 +3,11 @@
 What changed in each published version of the TeamFlow plugin, newest first.
 Only what a person using it would notice.
 
+## 0.3.46
+
+- **`teamflow status` forgets a finished ad hoc card.** After
+  `teamflow adhoc done`, status no longer names the card you just finished.
+
 ## 0.3.45
 
 - **`/teamflow:update` says who picks up work sent back.** A card sent back
