@@ -3,6 +3,18 @@
 What changed in each published version of the TeamFlow plugin, newest first.
 Only what a person using it would notice.
 
+## 0.3.44
+
+- **A ticket key in a message does not move your session.** Keys in a
+  message from another session, pasted text or a system note are ignored.
+  A key you type yourself still binds, and `teamflow bind` always wins.
+- **`teamflow workflow restore` brings back runs this computer lost.**
+  It reads the board and brings back your open runs. Name a run to bring
+  back just that one. It never makes a second copy, and it says what it
+  left and why. `teamflow doctor` tells you when to run it.
+- **Your runs now have a second copy in `~/.config/teamflow/runs`.** Removing
+  the plugin deletes its data folder, but not this copy.
+
 ## 0.3.43
 
 - **A card that fails a check goes back to build.** It carries that

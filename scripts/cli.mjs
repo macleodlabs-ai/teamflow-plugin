@@ -621,6 +621,11 @@ async function doctor() {
     if (probe.ok) {
       report.account = probe.account?.account;
       report.identity = identity(probe.email || auth.readSession()?.email, probe.account?.account);
+      // A finding (MACLEOD-794): the local run file is gone, and the board
+      // still has runs from this computer or this person.
+      const { missingRunsLine } = await import('./restore.mjs');
+      const missing = await missingRunsLine(config, { info, cwd });
+      if (missing) report.runsMissing = missing;
     }
 
     // Which trackers may report what happens to the issue. A repo whose keys

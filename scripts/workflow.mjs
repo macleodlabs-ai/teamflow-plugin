@@ -94,6 +94,13 @@ export const USAGE = `teamflow workflow — the pool of tickets a run works thro
       same id. Local, nothing is sent, and the older copy is left
       exactly where it is.
 
+  teamflow workflow restore [<id|name>]
+      Bring back runs this computer lost, for example when removing the
+      plugin deleted its data folder. Reads the board and brings back the
+      open runs this computer reported or you started. Named, it brings
+      back that one run, whoever started it. Never copies a run already
+      here, and says what it left and why.
+
   teamflow workflow status <planning|running|blocked|done|cancelled> [--to <name>]
       Move the whole workflow. \`stalled\` is written by the plugin itself
       when a ticket's gate has had no verdict past twice its deadline,
@@ -1300,7 +1307,7 @@ async function readJson(stream) {
 }
 
 export async function main(args, {
-  config = {}, info = {}, stdin = process.stdin, cwd, sessionId,
+  config = {}, info = {}, stdin = process.stdin, cwd, sessionId, read,
   print = (s) => process.stdout.write(`${s}\n`),
 } = {}) {
   const [sub = 'show', ...rest] = args;
@@ -1377,6 +1384,18 @@ export async function main(args, {
     print(`TeamFlow adopted "${taken.name}" (${taken.id}) into this organisation. `
       + 'TeamFlow sent nothing and removed nothing.');
     return 0;
+  }
+
+  /*
+   * Runs this computer lost, back from the board (MACLEOD-794). Before
+   * the workflow is resolved: the point is that there may be none here.
+   */
+  if (sub === 'restore') {
+    const wanted = rest.filter((a) => !a.startsWith('--'))[0];
+    const { restore } = await import('./restore.mjs');
+    const out = await restore(config, { wanted, info, cwd: cwd || process.cwd(), read });
+    for (const line of out.lines) print(line);
+    return out.ok ? 0 : 1;
   }
 
   /*

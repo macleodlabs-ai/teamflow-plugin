@@ -779,7 +779,7 @@ function organisationsSeen(config = {}) {
     readable = error?.code === 'ENOENT';
   }
   try {
-    for (const key of Object.keys(readJson(workflowsPath(), {}) || {})) add(key);
+    for (const key of Object.keys(readRunFile())) add(key);
   } catch { /* an unreadable store is no evidence either way */ }
   // One file or directory per organisation: the name is the answer.
   for (const dir of ['projects', 'bindings']) {
@@ -925,6 +925,49 @@ export function workflowsPath() {
   return path.join(dataDir(), 'workflows.json');
 }
 
+/**
+ * A second copy of the file, outside the plugin's data folder
+ * (MACLEOD-794). Removing a plugin deletes its data folder, and on
+ * 2026-09-24 that took a 27-node run with it. `~/.config/teamflow` is
+ * where the device credential already lives, and no uninstall touches it.
+ *
+ * One copy per data folder, keyed by its resolved path. Config
+ * directories on one machine can be different clients in different
+ * organisations, so a new data folder must never start from another
+ * one's runs. A reinstall brings the folder back at the same path, so it
+ * finds its own copy and nothing else.
+ */
+export function workflowsBackupPath() {
+  const key = crypto.createHash('sha256').update(path.resolve(dataDir())).digest('hex').slice(0, 16);
+  return path.join(userHome(), '.config', 'teamflow', 'runs', `${key}.json`);
+}
+
+/**
+ * The file as it stands: the data folder's copy, else the backup when
+ * the data folder lost its copy. Reading never writes; the next write
+ * puts both back in step.
+ */
+export function readRunFile() {
+  if (fs.existsSync(workflowsPath())) return readJson(workflowsPath(), {}) || {};
+  try { return readJson(workflowsBackupPath(), {}) || {}; } catch { return {}; }
+}
+
+/**
+ * Write the file and its backup, each atomically (write, then rename).
+ * The backup never fails a write: a home directory this process may not
+ * write leaves the one copy there always was.
+ */
+export function writeRunFile(all) {
+  fs.mkdirSync(path.dirname(workflowsPath()), { recursive: true });
+  writeJson(workflowsPath(), all);
+  try {
+    const backup = workflowsBackupPath();
+    fs.mkdirSync(path.dirname(backup), { recursive: true, mode: 0o700 });
+    fs.chmodSync(path.dirname(backup), 0o700);
+    writeJson(backup, all);
+  } catch { /* the data folder's copy stands */ }
+}
+
 // The organisation, not the S3 tenant (MACLEOD-583). `tenantId` is
 // `default` on every service install, so keying by it put two
 // organisations' runs in one bucket: `teamflow workflow ticket` under B
@@ -981,7 +1024,7 @@ function isLegacyScope(key) {
  * bucket wins, silently, and nothing is offered.
  */
 export function unclaimedWorkflows(config = {}) {
-  const all = readJson(workflowsPath(), {}) || {};
+  const all = readRunFile();
   const scope = workflowScope(config);
   if (Object.keys(all[scope]?.workflows || {}).length) return [];
   const found = [];
@@ -1019,7 +1062,7 @@ export function adoptWorkflow(id, config = {}, { from } = {}) {
     .filter((row) => row.id === id && (!from || row.from === from));
   if (matches.length !== 1) return undefined;
   const [offered] = matches;
-  const all = readJson(workflowsPath(), {}) || {};
+  const all = readRunFile();
   const source = all[offered.from]?.workflows?.[id];
   // The listing was read a moment ago and this is a second read of the
   // same file. A CLI is the only caller, so a race here is somebody
@@ -1035,8 +1078,7 @@ export function adoptWorkflow(id, config = {}, { from } = {}) {
   // line starts overwriting whatever run somebody is in the middle of.
   mine.current = id;
   all[scope] = mine;
-  fs.mkdirSync(path.dirname(workflowsPath()), { recursive: true });
-  writeJson(workflowsPath(), all);
+  writeRunFile(all);
   return offered;
 }
 
@@ -1051,7 +1093,7 @@ export function adoptWorkflow(id, config = {}, { from } = {}) {
  * organisation's run. This organisation's bucket, and nothing else.
  */
 export function readWorkflows(config = {}, where = undefined) {
-  const all = readJson(workflowsPath(), {}) || {};
+  const all = readRunFile();
   const mine = all[workflowScope(config)] || {};
   const workflows = mine.workflows || {};
   // A converted ad hoc item (MACLEOD-639, ADHOC-15) is renamed on every
@@ -1350,7 +1392,7 @@ export function followKeyAliases(state, cwd, config = {}) {
  * `teamflow workflow adopt` is how a run crosses the versions instead.
  */
 export function writeWorkflows(state, config = {}) {
-  const all = readJson(workflowsPath(), {}) || {};
+  const all = readRunFile();
   const scope = workflowScope(config);
   const mine = all[scope] || {};
   // The pointers survive every writer (MACLEOD-761): a caller that read
@@ -1358,8 +1400,7 @@ export function writeWorkflows(state, config = {}) {
   // stays the last run anybody chose, for an older plugin.
   const legacy = state.place && !state.current ? (mine.current || null) : (state.current ?? mine.current ?? null);
   all[scope] = { current: legacy, workflows: state.workflows, ...pointersFor(mine, state) };
-  fs.mkdirSync(path.dirname(workflowsPath()), { recursive: true });
-  writeJson(workflowsPath(), all);
+  writeRunFile(all);
 }
 
 /**
@@ -2926,7 +2967,8 @@ export function issueCandidates(input = {}, info = {}, manual = undefined, confi
     // already holds (see chooseBinding).
     add({ key: bound.jiraKey, tracker: bound.tracker || tracker, repo: bound.repo, workspace: bound.workspace, boundAt: bound.boundAt, account: bound.account }, 1000, 'manual');
   }
-  add(detectIssueRef(input.prompt, config, info), 100, 'prompt');
+  // Only what the person typed: quoted text is somebody else's (MACLEOD-795).
+  add(detectIssueRef(ownPromptText(input.prompt), config, info), 100, 'prompt');
   add(detectIssueRef(input.task_subject, config, info), 98, 'task');
   // The two sources nobody wrote to name a ticket, and the two the prefix rule
   // guards: a dependency bump's branch and its commit message say `express-6.9.21`
@@ -2953,6 +2995,22 @@ export function issueCandidates(input = {}, info = {}, manual = undefined, confi
   if (tool === 'Bash') add(detectGithubCommand(command, config, info), 110, 'gh-command');
   return candidates;
 }
+
+/*
+ * Text the person did not type (MACLEOD-795). A message from another
+ * session, pasted content, a system reminder, a task notification, a
+ * subagent's hand-back (`<agent-message>`) and a teammate's message are
+ * quoted into the prompt; a key inside one is somebody else's ticket. A session was bound to TEAMFLOW-69 because a
+ * cross-session message named it, and its work went to a ticket that
+ * does not exist. A span with no closing tag runs to the end.
+ */
+const QUOTED_SPAN_RE = /<(cross-session-message|pasted_content|system-reminder|task-notification|agent-message|teammate-message|subagent[-_]?hand-?back)\b[^>]*?(?:\/>|>[\s\S]*?(?:<\/\1\s*>|$))/gi;
+
+/** The prompt with every quoted span removed. Never throws. */
+export function ownPromptText(value) {
+  return String(value ?? '').replace(QUOTED_SPAN_RE, ' ');
+}
+
 
 export function detectCandidates(input, cwd, state = {}, config = {}) {
   const info = gitInfo(cwd);

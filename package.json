@@ -1,6 +1,6 @@
 {
   "name": "@macleodlabs/teamflow",
-  "version": "0.3.43",
+  "version": "0.3.44",
   "description": "TeamFlow, the DevOps harness for agentic software delivery: one CLI and one set of skills for Claude Code, Cursor, Copilot, Codex, Gemini CLI and any other agent tool. Your code stays on your machine.",
   "type": "module",
   "license": "SEE LICENSE IN LICENSE",
