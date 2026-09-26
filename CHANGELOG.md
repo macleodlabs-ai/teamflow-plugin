@@ -3,6 +3,11 @@
 What changed in each published version of the TeamFlow plugin, newest first.
 Only what a person using it would notice.
 
+## 0.3.50
+
+- **TeamFlow manages your AI software factory.** The plugin's description
+  says so. Nothing else changes when you use it.
+
 ## 0.3.49
 
 - **TeamFlow is the control centre for your AI software factory.** The

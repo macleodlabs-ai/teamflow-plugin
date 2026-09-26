@@ -8,7 +8,7 @@
     {
       "name": "teamflow",
       "source": "./",
-      "description": "TeamFlow, the control centre for your AI software factory. Shows every agent at work in real time, fixes stuck agents and keeps your code on your machine."
+      "description": "TeamFlow manages your AI software factory. It shows every agent at work in real time, fixes stuck agents and keeps your code on your machine."
     }
   ]
 }

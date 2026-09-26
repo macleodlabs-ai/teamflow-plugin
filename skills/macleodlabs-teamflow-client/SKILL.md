@@ -1,6 +1,6 @@
 ---
 name: macleodlabs-teamflow-client
-description: Call the subscription TeamFlow service (macleodlabs.teamflow) over MCP or REST. Use this skill whenever a task matches this service's purpose: The control centre for your AI software factory: every agent workstream visible in real time, stalled and crashed agents fixed, and code kept inside your organisation. Reporters post derived stage, status and evidence per issue; the dashboard shows every ticket's swimlane from local dev through audits to verified. A seat is a person: their agents, subagents and CI report under it. Trigger on any request to run, verify, price, or take a seat on TeamFlow, even if the user does not name the service.
+description: Call the subscription TeamFlow service (macleodlabs.teamflow) over MCP or REST. Use this skill whenever a task matches this service's purpose: TeamFlow manages your AI software factory: every agent workstream visible in real time, stalled and crashed agents fixed, and code kept inside your organisation. Reporters post derived stage, status and evidence per issue; the dashboard shows every ticket's swimlane from local dev through audits to verified. A seat is a person: their agents, subagents and CI report under it. Trigger on any request to run, verify, price, or take a seat on TeamFlow, even if the user does not name the service.
 ---
 
 # TeamFlow client
