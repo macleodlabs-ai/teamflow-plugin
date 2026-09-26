@@ -8,13 +8,14 @@
 //   otherwise.
 // - with `--watch`, on Stop with `asyncRewake`: in the background, it
 //   wakes the session (stderr, exit 2) when something an actor stopped
-//   to wait for is done. Otherwise it ends quietly.
+//   to wait for is done, or for the one-minute check-in (MACLEOD-845,
+//   checkin.mjs). Otherwise it ends quietly.
 //
 // Any error prints nothing a tool could act on and exits 0: the session
 // stops as it always did.
 import { failOpen, readStdin } from './hook-core.mjs';
-import { blockOutput, decide, logDirection, noteDirection, noteHeld, record, recordWait, runsFor, watch } from './continue.mjs';
-import { loadConfig, readJson, sessionActors, sessionPath } from './core.mjs';
+import { blockOutput, decide, logDirection, noteDirection, noteHeld, record, recordWait } from './continue.mjs';
+import { readJson, sessionPath } from './core.mjs';
 import { acquireLock, runsLockPath } from './dispatch.mjs';
 
 const lock = (fn) => {
@@ -26,12 +27,13 @@ const lock = (fn) => {
 await failOpen(async () => {
   const input = await readStdin();
   if (process.argv.includes('--watch')) {
-    // Only a session in a plan run has anything to wait for.
-    const main = readJson(sessionPath(input.session_id));
-    if (!main) return;
-    const keys = new Set(sessionActors(input.session_id).map((a) => a.binding?.key).filter(Boolean));
-    if (!runsFor(keys, loadConfig(main.cwd || input.cwd || process.cwd())).length) return;
-    const words = await watch(input.session_id);
+    // Every main-session Stop (MACLEOD-845): a plan's waits, and the
+    // one-minute check-in. checkin.mjs says why and how it ends.
+    if (input.hook_event_name && input.hook_event_name !== 'Stop') return;
+    if (!readJson(sessionPath(input.session_id))) return;
+    const { watchSession } = await import('./checkin.mjs');
+    const stop = { background_tasks: input.background_tasks || [], session_crons: input.session_crons || [] };
+    const words = await watchSession(input.session_id, stop);
     if (words) {
       process.stderr.write(words);
       process.exit(2);

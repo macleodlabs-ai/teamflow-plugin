@@ -95,6 +95,9 @@ function displayStagesOf(pipeline = DEFAULT_PIPELINE) {
 function isReworkStage(stage) {
   return stage === "LOCAL_REWORK" || stage === "DEV_REWORK";
 }
+function reworkHolds(stage) {
+  return stage !== "BACKLOG" && stage !== "DONE";
+}
 var GATE_ID = /^[a-z0-9][a-z0-9-]{0,39}$/;
 var EXTERNAL_SYSTEMS = ["sonarqube"];
 function pipelineProblems(pipeline) {
@@ -904,7 +907,8 @@ var SEVERITY_OF = {
   two_sessions: "blocked",
   audit_no_review: "idle",
   work_after_done: "note",
-  teamflow_stopped: "rework"
+  teamflow_stopped: "rework",
+  asks_you: "blocked"
 };
 function severityRank(rule) {
   return SEVERITY.indexOf(SEVERITY_OF[rule]);
@@ -930,6 +934,12 @@ function delayedSentence(retry, since, now, timeZone) {
   const reason = (retry.reason ?? "no reason given").replace(/\s+/g, " ").trim();
   return `delayed since ${clockLabel(since, now, timeZone)}: ${reason}, retry ${retry.attempt} of ${retry.of}`;
 }
+function askWords(asks) {
+  if (asks.kind === "permission") return asks.tool ? `a permission for ${asks.tool}` : "a permission";
+  if (asks.kind === "choice") return "a choice";
+  if (asks.kind === "elicitation") return "some details";
+  return "a question";
+}
 var WAITING_WORDS = {
   review: "a review",
   ci: "CI",
@@ -947,7 +957,7 @@ function attentionRows(cards, ctx) {
   const rows = [];
   for (const card of cards.values()) rows.push(...rowsFor(card, ctx));
   const marks = ctx.marks ?? [];
-  return rows.filter((row) => !snoozed(marks, row.key, row.rule, ctx.now)).sort((a, b) => severityRank(a.rule) - severityRank(b.rule) || b.ageMs - a.ageMs);
+  return rows.filter((row) => !snoozed(marks, row.key, row.rule, ctx.now)).sort((a, b) => Number(Boolean(a.frozen)) - Number(Boolean(b.frozen)) || severityRank(a.rule) - severityRank(b.rule) || b.ageMs - a.ageMs);
 }
 function rowsFor(card, ctx) {
   const { now } = ctx;
@@ -998,6 +1008,10 @@ function rowsFor(card, ctx) {
   }
   const silentFor = Math.max(0, now - time3(card.ticket.updatedAt));
   const column = card.gate?.label ?? STAGE_LABELS[card.ticket.stage];
+  const asks = card.ticket.status === "waiting" && card.ticket.waitingOn === "human" ? card.ticket.asks : void 0;
+  if (asks && !card.flags.finished && !card.flags.done) {
+    out.push(row("asks_you", silentFor, `${card.key} needs your answer: ${askWords(asks)} \xB7 ${owner}`, "ping"));
+  }
   const said = card.liveness;
   const lost = said && !card.flags.finished && !card.flags.backlog && !card.flags.done ? livenessSentence(card.key, said, column, now) : void 0;
   if (said?.state === "paused") {
@@ -1006,7 +1020,7 @@ function rowsFor(card, ctx) {
     out.push(row(rule, livenessAge(said, now), `${lost} \xB7 ${owner}${plan}`, "ping"));
   } else if (card.flags.stalled && !card.noVerdict && !card.delayed) {
     out.push(row("silent", silentFor, `${card.key} ${VOCABULARY.card.word} \xB7 no report for ${ageLabel(silentFor)} in ${column} \xB7 ${owner}${plan}`, "ping"));
-  } else if (card.flags.idle && !card.flags.backlog && !card.flags.finished && card.waitingOn) {
+  } else if (card.flags.idle && !card.flags.backlog && !card.flags.finished && card.waitingOn && !asks) {
     out.push(row("idle", silentFor, `${card.key} waiting on ${waitingWords(card.waitingOn)} \xB7 no report for ${ageLabel(silentFor)} \xB7 ${owner}`, "ping"));
   } else if (card.flags.idle && !card.flags.backlog && !card.flags.finished && !card.flags.live) {
     out.push(row("unfinished", silentFor, `${card.key} left unfinished in ${column} \xB7 last report ${ageLabel(silentFor)} ago \xB7 ${owner}${plan}`, "ping"));
@@ -1016,10 +1030,13 @@ function rowsFor(card, ctx) {
     const many = card.sessions.length === 2 ? "two" : String(card.sessions.length);
     out.push(row("two_sessions", now - together, `${card.key} has ${many} sessions working on it. Check that they do not collide.`, "ping"));
   }
-  if (card.gate?.id.includes("audit") && silentFor > DAY_MS && card.ticket.git?.head && !card.ticket.transitions?.some((t) => t.stage === "MERGE")) {
+  const git = card.ticket.git;
+  const awaitsReview = Boolean(git?.head) && git?.pushed !== false && git?.commitsSinceMain !== 0;
+  if (card.gate?.id.includes("audit") && silentFor > DAY_MS && awaitsReview && !card.ticket.transitions?.some((t) => t.stage === "MERGE")) {
     out.push(row("audit_no_review", silentFor, `${card.key} passed its audit and the code is pushed. Nobody has reviewed it for ${ageLabel(silentFor)} \xB7 ${owner}`, "ping"));
   }
-  return autonomyRows(card, out, row, now).map((held) => followUpOf(held, card, now));
+  const frozen = (card.ticket.attention ?? []).some((mark) => mark.kind === "autonomy_off");
+  return autonomyRows(card, out, row, now).map((held) => followUpOf(frozen ? { ...held, frozen } : held, card, now));
 }
 function doneRows(card, row, now) {
   if (!card.flags.done) return [];
@@ -1038,9 +1055,11 @@ function followUpOf(row, card, now) {
   const last = queued[queued.length - 1];
   const quiet = row.tier === "need" && !card.run && PASSIVE.has(row.cause) && row.ageMs > OLDER_AFTER_MS;
   if (!last) return quiet ? { ...row, quiet } : row;
-  const served = last.status !== "pending";
+  const served = last.status !== "pending" && last.status !== "expired";
   const followUp = { kind: last.kind, by: last.by, at: last.at, status: "waiting", served };
-  if (last.status === "pending") {
+  if (last.status === "expired") {
+    followUp.status = "not_picked_up";
+  } else if (last.status === "pending") {
     if (now - time3(last.at) > DAY_MS) followUp.status = "not_picked_up";
   } else if (last.status === "refused" || last.status === "failed") {
     followUp.status = "failed";
@@ -1381,12 +1400,20 @@ function passedAgain(ticket, stage, pipeline) {
   return failed > -Infinity && runs.some((run) => run.status === "success" && time5(run.updatedAt) > failed);
 }
 function openRework(ticket, gates, pipeline) {
+  if (!reworkHolds(ticket.stage)) return void 0;
   const uncleared = [...ticket.rework ?? []].reverse().find((entry) => !entry.clearedAt);
   if (uncleared) return { gate: uncleared.gate, at: uncleared.at, summary: uncleared.summary, by: uncleared.by };
   if (ticket.reworkFrom && !passedAgain(ticket, ticket.reworkFrom, pipeline)) return { gate: ticket.reworkFrom, at: ticket.updatedAt, summary: ticket.lastFailure?.summary };
   const failing = [...gates.values()].find((v) => v.run.status === "failed" || v.run.status === "blocked");
   if (failing) return { gate: failing.run.stage, at: failing.run.updatedAt, summary: failing.run.summary, by: failing.run.agent?.name ?? failing.run.label };
   return void 0;
+}
+function restingGate(gate, finishedNotDone, pipeline) {
+  if (!finishedNotDone || !gate) return gate;
+  const merge = gateFor({ stage: "MERGE" }, pipeline);
+  const at = gateIndex(gate, pipeline);
+  const first = gateIndex(gateFor({ stage: "BACKLOG" }, pipeline), pipeline);
+  return merge && at > first && at < gateIndex(merge, pipeline) ? merge : gate;
 }
 function retryOf(run) {
   const retry = run.retry;
@@ -1405,7 +1432,10 @@ function accountingOf(input) {
   const liveRuns2 = workflows.filter((run) => run.status === "running" || run.status === "blocked" || run.status === "stalled");
   const cards = /* @__PURE__ */ new Map();
   for (const ticket of tickets) {
-    const gate = gateFor(ticket, pipeline);
+    const backlog = ticket.stage === "BACKLOG";
+    const done = ticket.stage === "DONE" || trackerDone(ticket);
+    const finished = isFinishedWork(ticket, [ticket.jiraKey, ...ticket.convertedFrom ?? []].some((key) => planDone.has(key)));
+    const gate = restingGate(gateFor(ticket, pipeline), finished && !done, pipeline);
     const column = gateIndex(gate, pipeline);
     const gates = gateVerdicts(ticket, pipeline, input.deadlines, now);
     const noVerdict = [...gates.values()].find((v) => v.deadline && v.deadline.state !== "running");
@@ -1413,21 +1443,18 @@ function accountingOf(input) {
     const delayed = delayedRun ? { gate: delayedRun.gate, run: delayedRun.run, retry: retryOf(delayedRun.run), since: delayedRun.run.startedAt ?? delayedRun.run.updatedAt } : void 0;
     const edges = edgesOf(ticket, all, workflows, planDone);
     const openEdges = edges.filter((edge) => edge.resolution === "open");
-    const rework = openRework(ticket, gates, pipeline);
+    const rework = finished || done ? void 0 : openRework(ticket, gates, pipeline);
     const band = freshness(ticket.updatedAt, now);
     const waitingOn = ticket.status === "waiting" ? ticket.waitingOn : void 0;
-    const backlog = ticket.stage === "BACKLOG";
-    const done = ticket.stage === "DONE" || trackerDone(ticket);
     const midStage = !backlog && !done;
-    const finished = isFinishedWork(ticket, [ticket.jiraKey, ...ticket.convertedFrom ?? []].some((key) => planDone.has(key)));
     const live = cardIsWorked(ticket, liveness);
     const said = agentLiveness(ticket, liveness);
     const waitingOutside = waitingOn === "review" || waitingOn === "ci" || waitingOn === "dependency";
     const stalled = midStage && !finished && (Boolean(noVerdict) || live && band === "idle" && !waitingOutside);
-    const blocked = openEdges.length > 0;
+    const blocked = openEdges.length > 0 && !finished && !done;
     const isRework2 = Boolean(rework);
     const idle = band === "idle" && !stalled && !blocked && !isRework2;
-    const inFlight = midStage && !finished && !stalled && !idle;
+    const inFlight = midStage && !finished && !stalled && !idle && !(isRework2 && !live);
     const unassigned = !ticket.assignee && !ticket.member;
     const shipped = shippedAt(ticket);
     const shippedAge = shipped ? now - time5(shipped) : Number.POSITIVE_INFINITY;
@@ -1543,6 +1570,15 @@ function sortProjects(projects) {
 // src/lib/criteria.ts
 function withCriteria(ticket, doc) {
   return doc && Array.isArray(doc.criteria) ? { ...ticket, criteria: doc } : ticket;
+}
+function agreed(ticket) {
+  const doc = ticket?.criteria;
+  return doc && !doc.proposed ? doc.criteria ?? [] : [];
+}
+function criteriaMeter(ticket) {
+  const list = agreed(ticket);
+  if (!list.length) return void 0;
+  return { met: list.filter((c) => c.state === "met").length, total: list.length };
 }
 
 // src/lib/adhocTickets.ts
@@ -2171,6 +2207,10 @@ function planState(run, pool, byKey, clock) {
   if (status === "stalled" && stalled.stalledOn) {
     const since = Date.parse(stalled.stalledAt ?? run.updatedAt);
     return { kind: "waiting", ageMs: Math.max(0, now - (Number.isFinite(since) ? since : now)), ...stalled.stalledOn };
+  }
+  if (status === "stalled" && run.waitsOn?.length) {
+    const since = Date.parse(stalled.stalledAt ?? run.updatedAt);
+    return { kind: "held", ageMs: Math.max(0, now - (Number.isFinite(since) ? since : now)), keys: run.waitsOn };
   }
   const pipeline = clock.pipeline ?? DEFAULT_PIPELINE;
   for (const planned of pool) {
@@ -2842,6 +2882,13 @@ function reworkWords(ticket) {
   return move ? `back from ${reworkFacts(ticket, move).gate}` : void 0;
 }
 
+// src/lib/placeOf.ts
+var FINISHED_OPEN = "finished, ticket still open";
+function partWords(ticket) {
+  const meter = criteriaMeter(ticket);
+  return meter && meter.met < meter.total ? `${meter.met} of ${meter.total} done` : void 0;
+}
+
 // src/lib/cardFace.ts
 var NEXT_WORDS = {
   backlog: "plan it",
@@ -2903,7 +2950,8 @@ function whoOf(account, members) {
 }
 function nextOf(account, pipeline, viewer) {
   const { flags, ticket } = account;
-  if (flags.finished || flags.done) return "done";
+  if (flags.done) return "done";
+  if (flags.finished) return partWords(ticket) ?? FINISHED_OPEN;
   if (account.rework && inReworkStage(ticket)) return PICK_UP;
   if (account.delayed) return "next: try again";
   const need = account.attention.find((row) => row.tier === "need" && !row.handled && !(account.rework && row.cause === "rework"));

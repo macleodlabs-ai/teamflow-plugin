@@ -41,7 +41,8 @@ export function writeBlock(file, text, written, { begin = BEGIN, end = END, head
   const before = fs.existsSync(file) ? fs.readFileSync(file, 'utf8') : '';
   const marked = new RegExp(`${escapeRe(begin)}[\\s\\S]*?${escapeRe(end)}\\n?`);
   let after;
-  if (marked.test(before)) after = before.replace(marked, block);
+  // A function, so a `$'` or `$&` in the block is text, not a pattern (MACLEOD-845).
+  if (marked.test(before)) after = before.replace(marked, () => block);
   else if (before) after = `${before.replace(/\n*$/, '\n')}\n${block}`;
   else after = header ? `${header}\n${block}` : block;
   if (after === before) {

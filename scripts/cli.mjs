@@ -97,6 +97,9 @@ const USAGE = `teamflow \u2014 delivery reporting for TeamFlow
                                    the pool of tickets a run works through;
                                    \`teamflow workflow --help\` lists its flags
   teamflow sync                    publish the current state now
+  teamflow worktree tidy [--dry-run]
+                                   remove worktrees that are merged, clean and not in use
+  teamflow checkin on|off|status   the check-in a minute after a session goes idle
   teamflow tidy [--dry-run]        repair every divergence between the runs, the
                                    cards, the executions and the trackers
   teamflow reconcile --merged [--dry-run]
@@ -122,6 +125,9 @@ const USAGE = `teamflow \u2014 delivery reporting for TeamFlow
                                    to do next (on for plan runs by default)
   teamflow agent-view on|off|status whether this computer sends what your agents
                                    say to their tickets (off by default)
+  teamflow two-way on|off|status [--wait <seconds>]
+                                   whether you can answer your agents from
+                                   TeamFlow on this computer (off by default)
   teamflow hooks status | install           report automatically from that tool
   teamflow hooks uninstall --all            take all of it back out again
   teamflow hook --for <tool>                the hook entry itself; tools call this
@@ -443,8 +449,16 @@ async function bind(argument = args.filter((a) => a !== '--local').join(' '), { 
     // event will find it, so a failure here is not a failed bind.
     try { saveSession(state); } catch {}
   }
+  // The key travels with the work (MACLEOD-845): a commit trailer, and
+  // the branch name when renaming it is safe. Never fails the bind.
+  let carried = '';
+  try {
+    const { carryKey, carryLine } = await import('./ticketkey.mjs');
+    carried = carryLine(carryKey(cwd, ref.key));
+  } catch { /* the binding still attributes the work */ }
   print(`TeamFlow bound this project to ${ref.tracker} issue ${ref.key}${found?.title ? ` — ${found.title}` : ''}`
     + `${inRepo ? ', in this working copy (.teamflow/binding.json)' : ''}. `
+    + `${carried ? `${carried} ` : ''}`
     + 'Run /teamflow:sync to publish immediately.');
 }
 
@@ -459,13 +473,14 @@ async function workOn() {
   await bind(undefined, { local: args.includes('--local') || isWorktree(cwd) });
 }
 
-function unbind() {
+async function unbind() {
   // Every file that could speak for this repository, including the
   // shared one an older plugin wrote: unbinding that leaves one behind
   // is a binding that comes back (MACLEOD-586).
   for (const file of [...userBindingPaths(cwd, config), localBindingPath(cwd)]) {
     try { fs.unlinkSync(file); } catch {}
   }
+  try { (await import('./ticketkey.mjs')).clearKeyFile(cwd); } catch {}
   const state = latestSessionForCwd(cwd, config);
   if (state) {
     delete state.binding;
@@ -1053,7 +1068,7 @@ try {
     const { main } = await import('./adhoc.mjs');
     process.exit(await main(args, { cwd, config, info }));
   }
-  else if (command === 'unbind') unbind();
+  else if (command === 'unbind') await unbind();
   else if (command === 'sync') await sync();
   else if (command === 'tidy') {
     // The whole reconcile pass on demand (MACLEOD-601). `deep` because
@@ -1077,6 +1092,12 @@ try {
     // (MACLEOD-726). Keys from the board are only compared, never run.
     const { main } = await import('./merged.mjs');
     process.exit(await main(args, { cwd, config }));
+  }
+  else if (command === 'worktree') {
+    // `teamflow worktree tidy [--dry-run]` (MACLEOD-845): removes merged,
+    // clean worktrees this machine is not using. Local only.
+    const { main } = await import('./worktree.mjs');
+    process.exit(await main(args, { cwd, print }));
   }
   else if (command === 'config') {
     // `teamflow config set intake on|off`: whether this machine takes
@@ -1103,6 +1124,19 @@ try {
         : 'TeamFlow will not tell a stopped session what to do next. `teamflow continue on` turns it back on.');
     }
   }
+  else if (command === 'checkin') {
+    // `teamflow checkin on|off|status` (MACLEOD-845): the one-minute
+    // check-in that tidies up after an idle session's agents.
+    const { checkinLine, setCheckin } = await import('./checkin.mjs');
+    const [verb = 'status'] = args;
+    if (verb === 'status') print(`Check-in: ${checkinLine(latestSessionForCwd(cwd, config)?.sessionId)}`);
+    else {
+      const on = setCheckin(verb) === 'on';
+      print(on
+        ? 'TeamFlow will check an idle session after a minute and tidy up its agents.'
+        : 'TeamFlow will not check an idle session. `teamflow checkin on` turns it back on.');
+    }
+  }
   else if (command === 'agent-view') {
     // `teamflow agent-view on|off|status` (MACLEOD-793): this person's own
     // switch. The organisation's switch is the other half; both must be on.
@@ -1115,6 +1149,21 @@ try {
         : 'TeamFlow will not send what your agents say. `teamflow agent-view on` turns it back on.');
     }
     print(`Agent view: ${agentViewLine(config)}`);
+  }
+  else if (command === 'two-way') {
+    // `teamflow two-way on|off|status [--wait <seconds>]` (MACLEOD-848):
+    // this machine's switch for answers from TeamFlow. The organisation's
+    // agent view and two-way option are the other halves; all must be on.
+    const { setTwoWay, twoWayLine } = await import('./two-way.mjs');
+    const [verb = 'status'] = args;
+    const at = args.indexOf('--wait');
+    if (verb !== 'status') {
+      const held = setTwoWay(verb, at >= 0 ? { waitSeconds: Number(args[at + 1]) } : {});
+      print(held.on
+        ? 'You can answer your agents from TeamFlow, when your organisation has it on. Your agents act on your answers.'
+        : 'Your agents take answers only in Claude Code. `teamflow two-way on` turns answers from TeamFlow back on.');
+    }
+    print(`Two-way: ${twoWayLine()}`);
   }
   else if (command === 'statusline-tap') {
     // Chained from a statusline command: reads its JSON, prints nothing (MACLEOD-641).

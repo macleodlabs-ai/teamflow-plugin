@@ -4258,6 +4258,8 @@ export function issuePayload(state, config, info) {
     // and when it changed stage. Absent rather than empty when there is
     // nothing to say, so an older document is not rewritten with lists.
     ...(state.waitingOn ? { waitingOn: state.waitingOn } : {}),
+    // MACLEOD-845: what a person is asked, only while waitingOn is human.
+    ...(state.waitingOn === 'human' && state.asks?.kind ? { asks: state.asks } : {}),
     ...(state.reworkLog?.length ? { rework: state.reworkLog.slice(-REWORK_MAX) } : {}),
     ...(state.lastFailure ? { lastFailure: state.lastFailure } : {}),
     ...(state.transitions?.length ? { transitions: state.transitions.slice(-TRANSITIONS_MAX) } : {}),
@@ -4394,7 +4396,11 @@ export function sanitizePayload(value, { kind = 'issue' } = {}) {
   // A reviewer of a step (MACLEOD-714): its lens, the fixed result and
   // counts. Never the words the reviewer wrote; there is no field for them.
   const reviewOnly = new Set(['lens', 'result', 'round', 'findings', 'high', 'medium', 'low', 'stated']);
-  const issueRoot = new Set(['actions']);
+  // `asks` (MACLEOD-845): what the session waits for a person to answer.
+  const issueRoot = new Set(['actions', 'asks']);
+  // Its kind and, for a permission, a built-in tool's name. Never the
+  // question, the command or a path: there is no field for them.
+  const asksOnly = new Set(['kind', 'tool']);
   /*
    * MACLEOD-548: the one event shape. `at` is when the event happened and
    * `source` is who says so — the two fields that replace `updatedAt` on an
@@ -4461,7 +4467,7 @@ export function sanitizePayload(value, { kind = 'issue' } = {}) {
   // line of the plugin's own words, and whether it is still to come.
   const directionOnly = new Set(['at', 'text', 'next']);
   const nested = {
-    testsPassed: testsPassedOnly, directions: directionOnly,
+    testsPassed: testsPassedOnly, directions: directionOnly, asks: asksOnly,
     agent: agentOnly, session: sessionOnly,
     rework: reworkOnly, lastFailure: failureOnly, transitions: transitionOnly,
     attempts: attemptOnly, retry: retryOnly, supersededBy: supersededOnly, actions: actionOnly,
@@ -4496,6 +4502,10 @@ export function sanitizePayload(value, { kind = 'issue' } = {}) {
 // tenant, so a reporter needs no AWS credentials and no bucket policy.
 // The S3 path is unchanged for installs that predate the service.
 
+// The hosted service, used only when nothing is configured. A self-hosted
+// service (MACLEOD-816) is reached by setting `serviceUrl` — the global file
+// or TEAMFLOW_SERVICE_URL — and everything that talks to the service reads
+// it through `serviceUrl(config)` below.
 const DEFAULT_SERVICE_URL = 'https://codercat.io';
 
 export function serviceUrl(config = {}) {
@@ -4769,6 +4779,30 @@ export function apiKeyUsable(config = {}) {
 const HOSTED_ORIGINS = new Set([
   'https://codercat.io', 'https://www.codercat.io', 'https://teamflow.macleodlabs.com',
 ]);
+
+/**
+ * Whether the configured service is the hosted one (MACLEOD-816).
+ *
+ * A self-hosted TeamFlow runs in the buyer's own AWS account, at their
+ * domain, set once as `serviceUrl` (the global file or
+ * TEAMFLOW_SERVICE_URL; never a repository's `.teamflow.json`). Anything
+ * that would send a person to the hosted site — a pricing page, the fair
+ * use guide — asks this first, and the self-hosted service's own words
+ * are used instead.
+ */
+export function isHostedService(config = loadConfig(process.cwd())) {
+  const origin = originOf(serviceUrl(config));
+  if (!origin || HOSTED_ORIGINS.has(origin)) return true;
+  // Only an address the user named themselves is their own TeamFlow: the
+  // global file, or an origin they trusted by signing in there. An
+  // environment variable alone is not, because a repository can set one.
+  return !(serviceUrlSource(config) === 'global' || trustedOrigins().includes(origin));
+}
+
+/** `isHostedService`, reading hosted when the config cannot be read. */
+function hostedOr(config) {
+  try { return isHostedService(config); } catch { return true; }
+}
 
 /** The one line about an ignored key, or undefined when there is none to say. */
 export function ignoredKeyReason(config = {}) {
@@ -5553,7 +5587,7 @@ async function postEnvelope(endpoint, envelope, idempotencyKey, config, account 
   const status = response.status;
   if (status === 402) {
     notePaymentRequired(config, body);
-    const refusal = refusalOf(body, 'no reporting seat on this account');
+    const refusal = refusalOf(body, 'no reporting seat on this account', { hosted: hostedOr(config) });
     // `payment_failed` may arrive as a 402 as well as a 403; either way it
     // is a pause that lifts by itself, and is remembered like one.
     noteSoftRefusal(account, refusal);
@@ -5576,7 +5610,7 @@ async function postEnvelope(endpoint, envelope, idempotencyKey, config, account 
     // 400, 401, 403, 413. Re-posting the same body cannot change the
     // answer, and one refused report must never dam the outbox in
     // front of the good reports behind it.
-    const refusal = refusalOf(body, `service refused the report (${status})`);
+    const refusal = refusalOf(body, `service refused the report (${status})`, { hosted: hostedOr(config) });
     noteSoftRefusal(account, refusal);
     return answer({
       ok: false,

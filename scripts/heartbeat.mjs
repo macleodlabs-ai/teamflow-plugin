@@ -109,11 +109,30 @@ export function pausePath(sessionId) {
  * No reset time: Claude's five-hour window from now, marked estimated.
  */
 export function limitOf(input = {}, now = Date.now()) {
-  const reason = LIMITS[String(input.error_type || '')];
+  // The hooks reference names the field `error`; `error_type` is the
+  // matcher's name and what older builds sent. Both are read (MACLEOD-845:
+  // reading only `error_type` turned every real limit stop into a crash).
+  const reason = LIMITS[String(input.error || input.error_type || '')];
   if (!reason) return undefined;
   const reset = Number(input.rate_limit_reset_time) * 1000;
   const known = Number.isFinite(reset) && reset > now && reset - now <= PAUSE_MAX_MS;
   return { reason, until: new Date(known ? reset : now + PAUSE_DEFAULT_MS).toISOString(), estimated: !known };
+}
+
+// A turn that stops on a usage limit but arrives as a plain Stop: the
+// words Claude Code shows for a claude.ai limit or an empty balance.
+// Only limit words: an API error or an overload is not a pause.
+const LIMIT_TEXT = /\b(usage limit|limit reached|hit your limit|limit will reset|limit resets|credit balance is too low)\b/i;
+
+/**
+ * The HALTED pattern (MACLEOD-845): a Stop whose last words say a usage
+ * limit stopped it is a pause, like a StopFailure `rate_limit`. Reads
+ * only the end of the message and keeps none of it.
+ */
+export function limitFromText(message, now = Date.now()) {
+  const tail = String(message || '').slice(-600);
+  if (!LIMIT_TEXT.test(tail)) return undefined;
+  return limitOf({ error: /credit balance/i.test(tail) ? 'billing_error' : 'rate_limit' }, now);
 }
 
 /**

@@ -20,13 +20,32 @@ import {
   credentialNotice, installHooks, installWorkflowRule, removalReport, uninstallHooks, uninstallWorkflowRule,
   WORKFLOW_RULE,
 } from './hooks.mjs';
+import {
+  loadConfig, originOf, serviceUrl, serviceUrlSource, trustedOrigins,
+} from './core.mjs';
 import { capability } from './tools.mjs';
 import {
   mergeJson, removeBlock, removeEmptyDir, removeFile, unmergeJson, writeBlock, writeFile,
   writeTomlTable,
 } from './write.mjs';
 
-const SERVICE_URL = 'https://codercat.io';
+// The service other tools' MCP configs point at (MACLEOD-816): the
+// configured one, so a self-hosted TeamFlow's editors reach the buyer's own
+// host, and the hosted service when nothing is set. Only an address the
+// user named themselves counts — their global file, or an origin they
+// trusted by signing in there. An environment variable alone does not: a
+// repository's `.claude/settings.json` can set one, and this writes the
+// address into another tool's config, where it would stay.
+function configuredServiceUrl() {
+  try {
+    const config = loadConfig(process.cwd());
+    const url = serviceUrl(config);
+    const source = serviceUrlSource(config);
+    if (source === 'global' || trustedOrigins().includes(originOf(url))) return url;
+  } catch { /* the hosted service, below */ }
+  return serviceUrl({});
+}
+const SERVICE_URL = configuredServiceUrl();
 const MCP_URL = `${SERVICE_URL}/mcp`;
 // Customers install from the public GitHub mirror, not from npmjs. The
 // package is still named @macleodlabs/teamflow so a later npm publish

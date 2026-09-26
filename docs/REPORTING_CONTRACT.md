@@ -901,6 +901,31 @@ before this carries the older `wrote_back` row, and that still counts as
 proof: reading only the new one would comment a second time on every ticket
 TeamFlow has ever verified.
 
+## Questions in the agent view stream (MACLEOD-852)
+
+Agent view (opt-in, organisation and machine) may carry a pending question's words and its option labels, in a line marked `asks`, cleaned like every other line. Outside agent view nothing new leaves the machine: a report carries only `asks.kind` and, for a permission, a built-in tool name (MACLEOD-845).
+
+With two-way on (MACLEOD-848, organisation and machine, off by default), a question's stream line adds `askId` (a hash, `ask_<hex>`) and `questions` (a count), and each safe chunk adds `machine` (this machine's random id). No new field reaches a report.
+
+## Tracker comments, read on demand (MACLEOD-840)
+
+A tracker's comments are dropped at the connector and never stored. The one
+exception is a read: when a signed-in member (viewers included, Team plan and
+up) opens a card's About this card box or its dialog, the dashboard asks
+`GET /v1/members/cards/{key}/comments`, and the service reads that issue's
+newest ten comments from the tracker in the same request — Linear through
+the organisation's authorised token, GitHub through the App installation's
+minted token, Jira Cloud through its signed-in token — and hands back each
+one's author name, time and text, cut at 1,000 characters. The organisation
+comes from the credential and the tracker from the card's own tracker
+record. Nothing of the answer is kept: no store document, board view,
+bundle, report, Events row or log line holds it (the log names the key and a
+count), the response says `Cache-Control: no-store`, and the dashboard holds
+it only while the box is open. A connection made by pasting a webhook has no
+token, so it answers in words that comments need a signed-in tracker.
+`tests/test_tracker_comments.py` proves the route writes nothing and logs
+neither the text nor the token.
+
 ## Caching
 
 Static assets: long/content-hashed caching. Current state: short TTL plus ETag / `If-None-Match`. Missing runtime sidecars are normal.
@@ -918,6 +943,7 @@ Four more fields on the issue document, plugin-written, and one more on the `age
 | Field | Shape | Why it exists |
 | --- | --- | --- |
 | `waitingOn` | one of `review`, `ci`, `deploy`, `human`, `dependency` | A card that sits in a column says why. `git push` of the bound branch and `gh pr create` / `gh pr ready` write `MERGE` `waiting` with `review`; it is cleared by the next move. |
+| `asks` (MACLEOD-845) | `{kind, tool?}`: `kind` is one of `permission`, `question`, `choice`, `elicitation`; `tool` is a built-in tool's name matching `^[A-Z][A-Za-z]{0,29}$`, for a permission only | Sent only with `status: waiting` and `waitingOn: human`, so Needs you can show what the session asks. From PermissionRequest, the `permission_prompt`, `elicitation_dialog` and `elicitation_url_dialog` notifications, and AskUserQuestion. A question seen only in the turn's last words is sent after `idle_prompt` confirms nobody answered for a minute. Never the question, the tool's input, a command, a URL or a path. A typed prompt or a tool that ran clears it. |
 | `rework[]` | `{gate, at, clearedAt?, summary, by}`, the latest 16 | Every loop the ticket has been round, so a card can say which gate sent it back and when, rather than `×69` with no reason. `clearedAt` is stamped when the gate passes again; an entry is never erased. `gate` is a `DeliveryStage`, `summary` is the classifier's own line (`Local tests failed`) capped at 120, `by` is the agent's name or the tool's. `loopCount` is redefined as the number of loops **this plan cycle** — it resets when the ticket is verified or done, or when a new `/teamflow:build` run picks it up — so the number a card shows is the number a reader can act on. |
 | `lastFailure` | `{stage, at, summary}` | The most recent failed gate, kept after its loop is cleared. |
 | `transitions[]` | `{stage, at, by}`, the latest 32 | When the ticket changed stage and who moved it, so "in CI/CD for 41 h" is a fact the plugin recorded, not a guess from `updatedAt`. Written on every stage change the plugin makes. Transitions the **service** observes — a tracker moving the issue, a pull request event — are written to the service-owned `hygiene` sidecar (WS-D) and the read side merges the two lists; nothing the service writes lives on this document, because every report replaces it whole. |
@@ -1461,8 +1487,11 @@ said in between is dropped, never kept for later.
 `{key, session, agent, seq, sent_at, encoding: "gzip+base64", data}`:
 
 - `key`: the ticket the agent is bound to.
-- `session`: the first 16 hex characters of sha256 of the Claude Code
-  session id, never the id itself.
+- `session`: the first 12 hex characters of sha256 of the Claude Code
+  session id, never the id itself. It is the same value a report's
+  `session.id` carries (`core.digest`, `streamSession` in
+  `plugin/scripts/agent-view.mjs`), so a board row and its stream share
+  one key, `<session>/<agent>`.
 - `agent`: `main`, or the subagent's id. Background agents are subagents.
 - `seq`: counts up per session and agent.
 - `data`: gzip-compressed JSON lines, at most 256 KB compressed per chunk.
@@ -1529,5 +1558,46 @@ default; while it is off, or unknown to the machine, nothing below leaves.
 
 A chunk the service could not be reached for waits in a spool on the
 machine, at most about 5 MB, oldest dropped first. The service keeps
-chunks apart from the board, for 7 days, and never reads them into a
-report, a digest, the classifier or the board's views.
+chunks apart from the board, under `agentview/<account>/`, for 7 days,
+and never reads them into a report, a digest, the classifier or the
+board's views.
+
+What the service does with a chunk (checked against
+`adapters/teamflow/agent_view.py` on 2026-09-25):
+
+- It seals every chunk with the organisation's own `agent_view` data key
+  (the kit's `tenant_crypto`, MACLEOD-811), separate from the key that
+  seals the board. Turning agent view off shreds that key, so no stored
+  copy opens again.
+- A superadmin reads chunks only through break glass (the kit's
+  `mcpkit.break_glass`, MACLEOD-813): a reason, one hour, one
+  organisation. Every open and every read is on the organisation's
+  events feed and on agent view's History.
+
+## Feedback screenshots and recordings (MACLEOD-828, not on main yet)
+
+Feedback is not a report. A person writes it in the dashboard's
+Feedback form and chooses what to attach. The plugin sends nothing here.
+This section says what may cross the wire once branch
+`MACLEOD-828-feedback-media` and its kit half merge.
+
+- `POST /v1/feedback` takes `{message, page?, email?, image?,
+  attachments?}`, with no credential, as it does today. `image` is one
+  inline picture of at most 2 MB.
+- A screenshot or a screen recording goes first to storage:
+  `POST /v1/feedback/uploads {contentType, bytes}` returns a presigned
+  `PUT`, and the note names the upload by its `ref`.
+- Only `image/png`, `image/jpeg`, `video/webm` and `video/mp4`. A
+  recording stops at 2 minutes or 50 MB. The microphone is off unless
+  the person turns it on.
+- The browser's own picker chooses what is captured: a screen, a window
+  or a tab. Nothing is captured before the person clicks.
+- Uploads land under `feedback-media/pending/` and move to
+  `feedback-media/linked/` when a note names them. Pending uploads are
+  deleted after one day; linked ones after `demo.feedback_media_days`.
+- Only a superadmin's Feedback tab can read them, through links that
+  expire in minutes. The person who sent them cannot read them back.
+
+A recording can show anything on the person's screen, code included. So
+this is a second exception to "derived facts only", made by the person
+for one message, never by the plugin.

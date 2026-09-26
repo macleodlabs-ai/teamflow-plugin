@@ -105,15 +105,37 @@ export function readableReason(text) {
  * degrades to an HTTP number while the service was telling us in words.
  * `reasonCode` comes back beside `reason` so a caller can branch on the
  * code instead of string-matching a sentence.
+ *
+ * `hosted` is false for a self-hosted service (MACLEOD-816; the caller
+ * knows, through `isHostedService` in core.mjs, which this module may not
+ * import). Some of the plugin's sentences send a person to the hosted
+ * site — its prices, its fair use guide — which a buyer's own TeamFlow
+ * does not have. For those, the self-hosted service's own words are used,
+ * or the plugin's sentence without the hosted links.
  */
-export function refusalOf(body, fallback) {
+export function refusalOf(body, fallback, { hosted = true } = {}) {
   const text = (value) => (typeof value === 'string' && value.trim() ? value : undefined);
   const code = text(body?.reason_code) || text(body?.error);
-  const named = code ? REFUSAL_REASONS[code] : undefined;
+  let named = code ? REFUSAL_REASONS[code] : undefined;
   const sentence = text(body?.message) || text(body?.detail) || text(body?.error);
   const said = sentence ? readableReason(sentence) : undefined;
+  if (!hosted && named && HOSTED_LINK.test(named)) {
+    named = said || withoutHostedLinks(named);
+  }
   return {
     reasonCode: code,
     reason: named || said || fallback,
   };
+}
+
+const HOSTED_LINK = /https:\/\/codercat\.io\//;
+
+/** The sentence with every line and clause that links to the hosted site removed. */
+export function withoutHostedLinks(sentence) {
+  return String(sentence)
+    .split('\n')
+    .filter((line) => !/^\s*Fair use: https:\/\/codercat\.io\//.test(line))
+    .map((line) => line.replace(/\s*[^.]*https:\/\/codercat\.io\/\S*\s*/g, ' ').replace(/\s+/g, ' ').trim())
+    .filter(Boolean)
+    .join('\n');
 }

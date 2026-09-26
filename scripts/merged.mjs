@@ -16,7 +16,8 @@
 //   arrived on the default branch through a merge. A
 //   branch that was only created from the default branch, with no work
 //   on it, is not a merge: its tip is on the default branch's own line.
-// - A commit counts when its subject names the key and it arrived on the
+// - A commit counts when its `TeamFlow-Key` trailer, or with no trailer
+//   its subject, names the key (MACLEOD-845), and it arrived on the
 //   default branch through a merge: reachable from it, but not on its own
 //   first-parent line. A commit made straight on the default branch never
 //   counts, however many name the key: in a repository whose main session
@@ -84,14 +85,17 @@ export function defaultRef(root, run = git) {
  * names, the newest such arrival.
  */
 export function historyOf(root, ref, run = git) {
-  const got = run(root, ['log', ref, `--max-count=${COMMITS_MAX}`, '--format=%H %P%x09%ct%x09%s']);
+  // The TeamFlow-Key trailer (MACLEOD-845) before the subject, so a tab
+  // in a subject cannot shift it.
+  const got = run(root, ['log', ref, `--max-count=${COMMITS_MAX}`, '--format=%H %P%x09%ct%x09%(trailers:key=TeamFlow-Key,valueonly,separator=%x2C)%x09%s']);
   const commits = new Map();
   const order = [];
   for (const line of got.ok ? got.stdout.split('\n') : []) {
-    const [ids, time, subject = ''] = line.split('\t');
+    const [ids, time, trailer = '', ...rest] = line.split('\t');
     const [sha, ...parents] = String(ids || '').split(' ').filter(Boolean);
     if (!SHA.test(sha || '')) continue;
-    commits.set(sha, { parents, time: Number(time) * 1000, subject });
+    const keys = trailer.split(',').map(keyOk).filter(Boolean);
+    commits.set(sha, { parents, time: Number(time) * 1000, subject: rest.join('\t'), keys });
     order.push(sha);
   }
   // The default branch's own line: its tip, then each first parent.
@@ -112,12 +116,15 @@ export function historyOf(root, ref, run = git) {
   }
   const onLine = new Set(line);
   const byKey = new Map();
-  for (const [sha, { subject }] of commits) {
+  for (const [sha, { subject, keys }] of commits) {
     const when = arrival.get(sha);
     // Only work that arrived through a merge: a commit made straight on
     // the default branch names its ticket while the work goes on.
     if (when === undefined || onLine.has(sha)) continue;
-    for (const key of keysIn(subject)) byKey.set(key, Math.max(byKey.get(key) ?? 0, when));
+    // A trailer names the ticket the working copy was bound to, and it
+    // is the one key the commit counts for: a subject that names another
+    // key is the wrong-key case, moved to the bound ticket (MACLEOD-845).
+    for (const key of keys.length ? keys : keysIn(subject)) byKey.set(key, Math.max(byKey.get(key) ?? 0, when));
   }
   return { arrival, line: onLine, byKey };
 }

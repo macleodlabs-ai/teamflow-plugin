@@ -3,6 +3,29 @@
 What changed in each published version of the TeamFlow plugin, newest first.
 Only what a person using it would notice.
 
+## 0.3.48
+
+- **TeamFlow is the AI software factory.** The plugin's description says so.
+  Nothing else changes when you use it.
+
+- **Answer your agent from TeamFlow, off by default.** When your
+  organisation turns on answers and you run `teamflow two-way on`, you can
+  pick an agent's choice, allow or deny a permission, or say continue in
+  TeamFlow. Only you can answer your own agent. Nobody else can.
+
+- **Your agents' questions show in TeamFlow.** With agent view on, a
+  question your agent waits on shows with its options. It also shows in
+  Needs you.
+
+- **A one-minute check-in.** A quiet session gets a nudge after one minute.
+  TeamFlow also tidies finished branches and old worktrees for you.
+
+- **`teamflow worktree tidy`** removes worktrees whose work is merged. It
+  keeps new files that were never committed.
+
+- **A usage limit is not a stall.** A session paused on a usage limit says
+  so, and TeamFlow waits for the limit to reset.
+
 ## 0.3.47
 
 - **A region name in a pasted message is not a ticket.** Text such as

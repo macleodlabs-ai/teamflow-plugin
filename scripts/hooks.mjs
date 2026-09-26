@@ -132,6 +132,30 @@ export function gitHookBody(event) {
   ].join('\n');
 }
 
+// The ticket-key trailer ticketkey.mjs installs (MACLEOD-845).
+export const TRAILER = 'TeamFlow-Key';
+
+/**
+ * The `prepare-commit-msg` block. It reads the key from the working
+ * copy's own git directory, checks its shape, and adds or replaces the
+ * trailer. Every path ends in success.
+ */
+export function trailerHookBody() {
+  return [
+    '# TeamFlow ticket key (MACLEOD-845). Adds a TeamFlow-Key trailer that names',
+    '# the ticket this working copy is bound to. It never stops a commit.',
+    'tf_msg="$1"',
+    'tf_dir=$(git rev-parse --absolute-git-dir 2>/dev/null)',
+    'if [ -n "$tf_msg" ] && [ -n "$tf_dir" ] && [ -f "$tf_dir/teamflow-key" ]; then',
+    '  tf_key=$(head -c 40 "$tf_dir/teamflow-key" | tr -d \'\\r\\n\')',
+    "  if printf '%s' \"$tf_key\" | grep -Eq '^[A-Z][A-Z0-9]{0,19}-[0-9]{1,9}$'; then",
+    `    git interpret-trailers --in-place --if-exists replace --trailer "${TRAILER}: $tf_key" "$tf_msg" >/dev/null 2>&1 || true`,
+    '  fi',
+    'fi',
+    'true',
+  ].join('\n');
+}
+
 // Where this repository's hooks actually live, and never anywhere else.
 //
 // `git rev-parse --git-path hooks` looks like the answer and is a trap:
@@ -143,7 +167,10 @@ export function gitHookBody(event) {
 // followed or silently ignored: git would not read .git/hooks at all in
 // that case, so writing there would install nothing and say it worked.
 export function gitHooksDir(root) {
-  const gitDir = safeExec('git', ['-C', root, 'rev-parse', '--git-dir'], { cwd: root, timeout: 2000 });
+  // --git-common-dir, not --git-dir: in a linked worktree --git-dir is
+  // `.git/worktrees/<name>`, and git never reads hooks from there
+  // (MACLEOD-845). In an ordinary checkout the two are the same.
+  const gitDir = safeExec('git', ['-C', root, 'rev-parse', '--git-common-dir'], { cwd: root, timeout: 2000 });
   if (!gitDir.ok || !gitDir.stdout.trim()) return undefined;
   const local = path.resolve(root, gitDir.stdout.trim(), 'hooks');
 
@@ -184,6 +211,12 @@ export function installGitHooks({ root = process.cwd(), dryRun = false } = {}) {
       mode: 0o755,
     });
   }
+  // The ticket-key trailer (MACLEOD-845): a commit names the bound ticket.
+  if (!dryRun) {
+    writeBlock(path.join(dir, 'prepare-commit-msg'), trailerHookBody(), written, {
+      begin: GIT_BEGIN, end: GIT_END, header: '#!/bin/sh', mode: 0o755,
+    });
+  } else written.push({ file: path.join(dir, 'prepare-commit-msg'), action: 'would write' });
   // And the rule (MACLEOD-639), into the instructions file the repository
   // keeps: CLAUDE.md when there is one, else AGENTS.md, which every other
   // agent tool reads.
@@ -212,6 +245,7 @@ export function uninstallGitHooks({ root = process.cwd(), dryRun = false } = {})
     }
     removeBlock(file, written, { begin: GIT_BEGIN, end: GIT_END, header: '#!/bin/sh' });
   }
+  if (!dryRun) removeBlock(path.join(dir, 'prepare-commit-msg'), written, { begin: GIT_BEGIN, end: GIT_END, header: '#!/bin/sh' });
   return { scope: 'git', dir, written };
 }
 

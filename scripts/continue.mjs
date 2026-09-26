@@ -262,7 +262,7 @@ export function waitOf(actor, runs = [], { main, subagent = false, now = Date.no
 // replaces it. Nothing types into a terminal and nothing starts `claude`.
 
 const waitsPath = (sessionId) => path.join(core.dataDir(), 'continue', `${core.digest(sessionId)}.waits.json`);
-const watchPath = (sessionId) => path.join(core.dataDir(), 'continue', `${core.digest(sessionId)}.watch`);
+export const watchPath = (sessionId) => path.join(core.dataDir(), 'continue', `${core.digest(sessionId)}.watch`);
 
 /** Remember that an actor stopped to wait, for the watcher. */
 export function recordWait(sessionId, agentKey, direction, now = Date.now()) {
@@ -524,9 +524,12 @@ const cardPath = (sessionId, agentKey) => path.join(core.dataDir(), 'continue', 
 /** One line for the actor's card. A wait is a next step; a repeat of the last line is not added. */
 export function noteDirection(sessionId, agentKey, direction, now = Date.now()) {
   if (!sessionId || !direction) return false;
+  // `note`: a fact the plugin wrote itself in fixed words, such as a
+  // commit moved to its right ticket (MACLEOD-845).
   const entry = direction.kind === 'wait'
     ? { at: new Date(now).toISOString(), text: `Start when ${direction.until}`.slice(0, 120), next: true }
-    : CARD_WORDS[direction.kind] && { at: new Date(now).toISOString(), text: CARD_WORDS[direction.kind] };
+    : direction.kind === 'note' && direction.text ? { at: new Date(now).toISOString(), text: String(direction.text).slice(0, 120) }
+      : CARD_WORDS[direction.kind] && { at: new Date(now).toISOString(), text: CARD_WORDS[direction.kind] };
   if (!entry) return false;
   const file = cardPath(sessionId, agentKey);
   const held = core.readJson(file) || [];

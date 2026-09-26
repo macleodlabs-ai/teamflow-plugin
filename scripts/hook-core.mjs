@@ -60,10 +60,11 @@ import {
 } from './core.mjs';
 import { NO_PROJECT_SENTENCE, resolveProject } from './project.mjs';
 import {
-  clearPause, ensureHeartbeat, limitOf, markHandoff, markLimit, rotating, sessionLines, stopHeartbeat,
+  clearPause, ensureHeartbeat, limitFromText, limitOf, markHandoff, markLimit, rotating, sessionLines, stopHeartbeat,
 } from './heartbeat.mjs';
 import { pruneSnapshots, resumeNotice, saveSnapshot } from './resume.mjs';
-import { WORK_TOOLS, cardDirections, publishDirections } from './continue.mjs';
+import { WORK_TOOLS, cardDirections, noteDirection, publishDirections } from './continue.mjs';
+import { applyAsk, askStep, isAskEvent } from './asking.mjs';
 import {
   afterFindings, claimReview, findingsOf, lensOf, parseReview, reportReview, reviewCommandOf, reviewPayload, settleReview,
 } from './review.mjs';
@@ -689,8 +690,12 @@ export async function handleEvent(input = {}) {
       if (event === 'SessionEnd') {
         if (rotating()) markHandoff(sessionId);
         else if (DELIBERATE_END.has(input.reason)) clearPause(sessionId, { handoff: true });
-      } else if (event !== 'SubagentStop') {
+      } else if (event !== 'SubagentStop' && event !== 'Notification') {
+        // A notification is not the session carrying on (MACLEOD-845):
+        // `idle_prompt` a minute after a limit stop must not end the pause.
         clearPause(sessionId, { handoff: event === 'UserPromptSubmit' });
+        // A limit that ends the turn as a plain Stop is a pause too (MACLEOD-845).
+        if (event === 'Stop') markLimit(sessionId, limitFromText(input.last_assistant_message));
       }
     } catch { /* a mark left behind is read as fresh for ten minutes at most */ }
   }
@@ -1006,8 +1011,19 @@ export async function handleEvent(input = {}) {
     state.agent = { ...state.agent, role: { ...state.agent.role, outcome: reviewed ? 'review' : 'work' } };
   }
 
-  const transition = classifyTool(resolved, state, config);
+  // Asking a person (MACLEOD-845) is not a stage: a permission request
+  // for an Edit is not an edit. Those events only set what it waits on.
+  const asking = isAskEvent(input);
+  const transition = asking ? undefined : classifyTool(resolved, state, config);
   state = applyTransition(state, transition);
+  let asked = {};
+  if (!input.reporter_tool) {
+    try { asked = askStep(input); state = applyAsk(state, asked); } catch { /* the card keeps its last status */ }
+    // A person typed: the check-in's streak starts again (MACLEOD-845).
+    if (event === 'UserPromptSubmit' && !agentKey) {
+      try { (await import('./checkin.mjs')).resetStreak(sessionId); } catch { /* the streak cap still holds */ }
+    }
+  }
   // A merge or a deploy of this session's work (MACLEOD-770): ask for the
   // card's plain line when it has none, or one older than the work.
   if (!agentKey && transition && transition.status !== 'failed' && ['MERGE', 'DEPLOY_DEV'].includes(transition.stage)) {
@@ -1061,11 +1077,26 @@ export async function handleEvent(input = {}) {
     state.summary = 'Ad hoc work ended';
     state.updatedAt = new Date().toISOString();
   }
+  /*
+   * A commit under the wrong key (MACLEOD-845): the working copy is bound
+   * to A and the commit's subject names B, not A. The owner ruled it
+   * moves to A by itself. The commit's trailer already names A, so git
+   * proof counts it there (merged.mjs); the card says so in one line of
+   * keys and a short sha. The command is matched here and never sent.
+   */
+  if (event === 'PostToolUse' && input.tool_name === 'Bash' && state.binding?.key
+    && /\bgit\b[^\n]*\bcommit\b/.test(String(input.tool_input?.command || ''))) {
+    try {
+      const { lastCommit, moveLine, recordMove, wrongKeyOf } = await import('./ticketkey.mjs');
+      const move = wrongKeyOf(state.binding.key, lastCommit(cwd));
+      if (move && recordMove(move)) noteDirection(sessionId, agentKey, { kind: 'note', text: moveLine(move) });
+    } catch { /* the trailer still names the bound ticket */ }
+  }
   saveSession(state);
 
   // Synchronous SessionStart/UserPromptSubmit must stay fast so they never hold up the tool.
   // Async tool/task/stop hooks publish to the service (or legacy S3).
-  if (!LOCAL_ONLY.includes(event) && state.binding?.key) {
+  if ((!LOCAL_ONLY.includes(event) || asked.ask) && state.binding?.key) {
     // What TeamFlow told this agent (MACLEOD-726/733), for the card's Progress line.
     const told = cardDirections(sessionId, agentKey, state.workAt);
     if (told.length) state.directions = told;
@@ -1376,8 +1407,10 @@ export async function handleEvent(input = {}) {
    */
   if (!input.reporter_tool) {
     try {
-      const { kick } = await import('./agent-view.mjs');
-      kick(event, input, sessionId, cwd);
+      const { kick, noteAsk } = await import('./agent-view.mjs');
+      // A question to the person shows in the stream at once, and its end
+      // too (MACLEOD-852). Read-only: the answer stays in Claude Code.
+      if (!(asked.ask && noteAsk(input, sessionId, cwd))) kick(event, input, sessionId, cwd, { force: Boolean(asked.clear) });
     } catch { /* nothing is sent this event */ }
   }
 

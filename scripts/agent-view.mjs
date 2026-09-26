@@ -25,6 +25,8 @@ import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import * as core from './core.mjs';
 import { cleanLine, redactSecrets } from './redact.mjs';
+import { askLines } from './asking.mjs';
+import { twoWaySwitch } from './two-way.mjs';
 
 const SCRIPT = fileURLToPath(import.meta.url);
 
@@ -454,6 +456,21 @@ export async function runPass({ sessionId, transcriptPath, cwd, config, now = Da
         }
       }
     }
+    // A question the session asks now (MACLEOD-852): after the transcript's
+    // lines, so it is the newest line its reader sees.
+    for (const held of takeAsks(sessionId)) {
+      const who = held.agent;
+      for (const l of held.lines) {
+        if (since && Date.parse(l.t) < since) continue;
+        if (!byAgent.has(who)) byAgent.set(who, []);
+        byAgent.get(who).push(l);
+      }
+      for (const l of held.detail) {
+        if (since && Date.parse(l.t) < since) continue;
+        if (!detailBy.has(who)) detailBy.set(who, []);
+        detailBy.get(who).push(l);
+      }
+    }
 
     const org = await orgOn(config, now, getSetting);
     if (org === 'off') {
@@ -472,6 +489,9 @@ export async function runPass({ sessionId, transcriptPath, cwd, config, now = Da
         bodies.push({
           key, session: streamSession(sessionId), agent, seq: state.seq[agent],
           sent_at: new Date(now).toISOString(), encoding: 'gzip+base64', data,
+          // MACLEOD-848: which machine asked, so an answer goes to it only.
+          // Only while this machine takes answers from TeamFlow.
+          ...(twoWaySwitch().on && core.machineId() ? { machine: core.machineId() } : {}),
         });
       }
     }
@@ -549,11 +569,11 @@ export async function runPass({ sessionId, transcriptPath, cwd, config, now = Da
  * Reads one config file and one stamp, and nothing when the person's
  * switch is off.
  */
-export function kick(event, input = {}, sessionId = undefined, cwd = process.cwd(), { spawnImpl = spawn, now = Date.now() } = {}) {
-  if (!KICK_EVENTS.has(event) || !sessionId || !input.transcript_path) return false;
+export function kick(event, input = {}, sessionId = undefined, cwd = process.cwd(), { spawnImpl = spawn, now = Date.now(), force = false } = {}) {
+  if ((!force && !KICK_EVENTS.has(event)) || !sessionId || !input.transcript_path) return false;
   if (!personSwitch().on) return false;
   const stamp = path.join(home(), 'kicks', `${core.digest(sessionId, 16)}`);
-  if (!ALWAYS.has(event)) {
+  if (!force && !ALWAYS.has(event)) {
     try { if (now - fs.statSync(stamp).mtimeMs < KICK_EVERY_MS) return false; } catch { /* first kick */ }
   }
   fs.mkdirSync(path.dirname(stamp), { recursive: true });
@@ -562,6 +582,44 @@ export function kick(event, input = {}, sessionId = undefined, cwd = process.cwd
     { cwd, detached: true, stdio: 'ignore', shell: false });
   child?.unref?.();
   return true;
+}
+
+// --- a pending question (MACLEOD-852) ----------------------------------------
+
+const asksPath = (sessionId) => path.join(home(), 'asks', `${core.digest(sessionId, 16)}.jsonl`);
+
+/**
+ * A question the session asks its person now, kept for the next pass and
+ * sent at once. Only while this person's switch is on; the pass drops it
+ * while the organisation's is off, as it drops every other line. Read-only
+ * for the board: nothing here, or anywhere, takes an answer back.
+ */
+export function noteAsk(input = {}, sessionId = undefined, cwd = process.cwd(), { spawnImpl = spawn, now = Date.now() } = {}) {
+  if (!sessionId || !input.transcript_path || !personSwitch().on) return false;
+  const { lines, detail } = askLines(input, now);
+  if (!lines.length) return false;
+  const agent = input.agent_id ? String(input.agent_id).slice(0, 80) : 'main';
+  const file = asksPath(sessionId);
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.appendFileSync(file, `${JSON.stringify({ agent, lines, detail })}\n`, { mode: 0o600 });
+  return kick(input.hook_event_name, input, sessionId, cwd, { spawnImpl, now, force: true });
+}
+
+/** The questions kept since the last pass, removed as they are read. */
+export function takeAsks(sessionId) {
+  const file = asksPath(sessionId);
+  const taking = `${file}.${process.pid}.taking`;
+  try { fs.renameSync(file, taking); } catch { return []; }
+  try {
+    return fs.readFileSync(taking, 'utf8').split('\n').filter(Boolean).flatMap((text) => {
+      try {
+        const held = JSON.parse(text);
+        return Array.isArray(held?.lines) ? [{ agent: String(held.agent || 'main'), lines: held.lines, detail: Array.isArray(held.detail) ? held.detail : [] }] : [];
+      } catch { return []; }
+    });
+  } finally {
+    fs.rmSync(taking, { force: true });
+  }
 }
 
 if (process.argv[1] && fs.realpathSync(process.argv[1]) === fs.realpathSync(SCRIPT) && process.argv[2] === 'run') {

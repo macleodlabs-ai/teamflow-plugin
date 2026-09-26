@@ -263,6 +263,13 @@ export function tokenOriginAllowed(session = readSession()) {
   // of its own: an unrecorded one reads as hosted, and the hosted
   // provider is the line above.
   if (!session?.serviceOrigin) return false;
+  // MACLEOD-816: a self-hosted TeamFlow signs people in with the buyer's
+  // own Cognito pool, on a domain of theirs that is neither the service's
+  // origin nor the issuer's. The service names that token endpoint in its
+  // `/v1/capabilities` at sign-in. A session issued by a service the user
+  // trusted in their own global file may use the endpoint it named;
+  // `tokenRequest` still refuses anything that is not https.
+  if (trustedOrigins().includes(session.serviceOrigin)) return true;
   return token === session.serviceOrigin
     || token === originOf(session.issuer)
     || trustedOrigins().includes(token);
