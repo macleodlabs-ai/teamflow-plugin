@@ -61,6 +61,7 @@ import {
   staleBuildNotice,
 } from './core.mjs';
 import { NO_PROJECT_SENTENCE, resolveProject } from './project.mjs';
+import { drivenBy } from './driven.mjs';
 import {
   clearPause, ensureHeartbeat, limitFromText, limitOf, markHandoff, markLimit, rotating, sessionLines, stopHeartbeat,
 } from './heartbeat.mjs';
@@ -926,7 +927,10 @@ export async function handleEvent(input = {}) {
   // session itself, or a named agent launching another. An unnamed
   // actor's launch is not recorded, so a node minted for it would be
   // nobody's.
-  let dispatching = !agentKey || state.agent ? dispatchOf(event, resolved) : undefined;
+  // A session another tool drives (MACLEOD-908) runs its own plan: no
+  // run is auto-created and no ad hoc node is minted for its agents.
+  let dispatching = (!agentKey || state.agent) && !drivenBy(input, process.env, cwd)
+    ? dispatchOf(event, resolved) : undefined;
   // An `Agent` PostToolUse is a dispatch only when its PreToolUse left no
   // launch for this tool call (MACLEOD-640); a payload with no call id
   // cannot be told from one that did, so it records nothing twice.

@@ -27,6 +27,11 @@ import { sayCheck, SAY_WORDS } from './words.mjs';
 
 export const ASK_USAGE = 'Usage: teamflow card ask <KEY> --for <person|owner|admins> --kind check|decision|approval "<one plain sentence>" [--options "A|B|C"], or teamflow card ask <KEY> --clear <id>';
 export const TEXT_MAX = 200;
+// An option is a short label, checked on its own: the service's
+// OPTION_MAX and ANSWER_RULES (adapters/teamflow/needs.py), so the two
+// sides refuse the same labels (MACLEOD-914).
+export const OPTION_MAX = 60;
+const OPTION_RULES = new Set(['empty', 'too_long', 'url', 'email', 'secret', 'path', 'code']);
 const KEY = /^(?:[A-Za-z][A-Za-z0-9]{0,19}-\d{1,9}|[\w.-]{1,80}\/[\w.-]{1,80}#\d{1,9}|#\d{1,9})$/;
 const KINDS = ['check', 'decision', 'approval'];
 const ID = /^need_[0-9a-f]{16}$/;
@@ -35,11 +40,22 @@ const KIND_WORDS = { check: 'a check', decision: 'a decision', approval: 'an app
 
 const seenPath = () => path.join(core.dataDir(), 'needs', 'seen.json');
 
-/** The problems a question has, in plain words, or []. */
+/** The problems a question has, in plain words, or []. A path says
+ *  what to write in its place (MACLEOD-914). */
 export function askProblems(text) {
   return [...new Set(sayCheck(text, TEXT_MAX).map((p) => (p.rule === 'too_long'
     ? `Keep it to ${TEXT_MAX} characters.`
-    : p.rule === 'empty' ? 'Write one plain sentence.' : SAY_WORDS[p.rule] || 'Use plain words.')))];
+    : p.rule === 'empty' ? 'Write one plain sentence.'
+      : p.rule === 'path' ? 'Leave out file names and paths. Name the thing in words, such as "the MCP list" for "/mcp".'
+        : SAY_WORDS[p.rule] || 'Use plain words.')))];
+}
+
+/** The problems one option has, or []. A label, not a sentence. */
+export function optionProblems(option) {
+  return [...new Set(sayCheck(option, OPTION_MAX).filter((p) => OPTION_RULES.has(p.rule)).map((p) => (p.rule === 'too_long'
+    ? `Keep each option to ${OPTION_MAX} characters.`
+    : p.rule === 'path' ? 'Leave out file names and paths. Name the thing in words.'
+      : SAY_WORDS[p.rule] || 'Use plain words.')))];
 }
 
 /** Parse `card ask` arguments. Returns `{ body }`, `{ clear }` or `{ error }`. */
@@ -51,8 +67,14 @@ export function parseAsk(args = []) {
   const flags = {};
   const words = [];
   for (let i = 0; i < rest.length; i += 1) {
+    // `--options=Yes|No` is the same flag as `--options "Yes|No"`: read
+    // as words, it put the options into the sentence and failed the
+    // words check as code (MACLEOD-914).
+    const eq = /^--(for|kind|options|clear)=(.*)$/s.exec(rest[i]);
     const m = /^--(for|kind|options|clear)$/.exec(rest[i]);
-    if (m) {
+    if (eq) {
+      flags[eq[1]] = eq[2];
+    } else if (m) {
       if (rest[i + 1] === undefined) return { error: ASK_USAGE };
       flags[m[1]] = rest[i + 1];
       i += 1;
@@ -73,6 +95,8 @@ export function parseAsk(args = []) {
     if (flags.kind !== 'decision') return { error: 'Only a decision has options.' };
     const options = flags.options.split('|').map((o) => o.trim()).filter(Boolean);
     if (options.length < 2 || options.length > 5) return { error: 'A decision has two to five short options.' };
+    const bad = [...new Set(options.flatMap(optionProblems))];
+    if (bad.length) return { error: `TeamFlow did not send it. ${bad.join(' ')}` };
     body.options = options;
   }
   return { body };
@@ -129,11 +153,14 @@ function whoWords(item) {
   return String(item.to || 'a person').split('@')[0];
 }
 
-/** One line per item waiting for this person. */
-export function forYouLines(items = []) {
+/** One line per item waiting for this person. An item this person asked
+ *  (its id is in `asked`) is "from you", not their own name (MACLEOD-914). */
+export function forYouLines(items = [], asked = []) {
+  const mine = new Set(asked.map((item) => item?.id).filter(Boolean));
   return items.map((item) => {
     const opts = item.options?.length ? ` Options: ${item.options.join(', ')}.` : '';
-    return `${item.key} · ${KIND_WORDS[item.kind] || 'a request'} from ${String(item.by || 'someone').split('@')[0]}: ${item.text}${opts} (${item.id})`;
+    const from = mine.has(item.id) ? 'you' : String(item.by || 'someone').split('@')[0];
+    return `${item.key} · ${KIND_WORDS[item.kind] || 'a request'} from ${from}: ${item.text}${opts} (${item.id})`;
   });
 }
 
@@ -176,7 +203,9 @@ export async function askMain(args = [], ctx = {}) {
   const out = await send('POST', '', parsed.body, config);
   if (!out.ok) { fail(`TeamFlow did not send it: ${out.reason}`); return out.status === 400 ? 2 : 1; }
   const need = out.body?.need || {};
-  print(`TeamFlow put ${KIND_WORDS[need.kind] || 'the item'} for ${whoWords(need)} on ${parsed.key}. It shows in their Needs you. Id: ${need.id}.`);
+  // parseAsk returns `{ body }`: the key is `body.key`, and the service
+  // echoes it on `need.key` (MACLEOD-914: this read `parsed.key`, undefined).
+  print(`TeamFlow put ${KIND_WORDS[need.kind] || 'the item'} for ${whoWords(need)} on ${need.key || parsed.body.key}. It shows in their Needs you. Id: ${need.id}.`);
   return 0;
 }
 
@@ -187,7 +216,7 @@ export async function needsMain(_args = [], ctx = {}) {
   const config = ctx.config || {};
   const got = await (ctx.request || request)('GET', '', undefined, config);
   if (!got.ok) { fail(`TeamFlow could not read Needs you: ${got.reason}`); return 1; }
-  const mine = forYouLines(got.body?.forYou);
+  const mine = forYouLines(got.body?.forYou, got.body?.asked || []);
   print(mine.length ? 'Waiting for you:' : 'Nothing waits for you.');
   for (const line of mine) print(`  ${line}`);
   const open = (got.body?.asked || []).filter((item) => item.status === 'open');

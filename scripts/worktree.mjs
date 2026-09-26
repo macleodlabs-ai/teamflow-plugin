@@ -12,6 +12,10 @@
 //   When gh cannot answer, the worktree stays;
 // - nothing in it is modified or staged;
 // - no commit on it is missing from the default branch or a remote;
+// - TeamFlow made or bound it (MACLEOD-909): a Claude Code `worktree-`
+//   branch, a `work-on` key file or binding in it, or a session this
+//   machine knows worked in it. A worktree under ~/.archon/ or on a branch
+//   another tool made (`archon/*`) is that tool's, and is never removed;
 // - it is not locked, it is not the folder this command runs in, and no
 //   session or agent this machine knows worked in it in the last 6 hours
 //   and has not ended.
@@ -27,7 +31,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 
 import * as core from './core.mjs';
-import { branchOk, defaultRef, historyOf, prCheck } from './merged.mjs';
+import { branchOk, defaultRef, foreignBranch, historyOf, prCheck } from './merged.mjs';
 
 export const IN_USE_MS = 6 * 60 * 60 * 1000;
 const SHA = /^[0-9a-f]{40}$/;
@@ -72,6 +76,34 @@ export function inUse(dir, { actors = core.allActors(), now = Date.now(), here =
   return actors.some((a) => !a.ended && inside(dir, a.cwd) && now - (Date.parse(a.updatedAt) || 0) < IN_USE_MS);
 }
 
+/** True when `dir` sits in a folder another tool keeps its worktrees in (~/.archon/). */
+export function foreignDir(dir) {
+  return path.resolve(String(dir || '')).split(path.sep).includes('.archon');
+}
+
+/** This worktree's own git folder, from the `.git` file git writes in it. */
+function gitDirOf(dir) {
+  try {
+    const line = fs.readFileSync(path.join(dir, '.git'), 'utf8').match(/^gitdir: (.+)$/m)?.[1]?.trim();
+    return line ? path.resolve(dir, line) : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * True when TeamFlow made or bound this worktree: Claude Code named its
+ * branch (TeamFlow binds the agent sent there), `work-on` ran in it, or a
+ * session this machine knows worked in it, ended or not.
+ */
+export function ours(tree, actors = []) {
+  if (tree.branch?.startsWith('worktree-')) return true;
+  if (fs.existsSync(path.join(tree.dir, '.teamflow', 'binding.json'))) return true;
+  const own = gitDirOf(tree.dir);
+  if (own && fs.existsSync(path.join(own, 'teamflow-key'))) return true;
+  return actors.some((a) => inside(tree.dir, a?.cwd));
+}
+
 /** What `git status` says: counts of changed (modified or staged) and new files. */
 export function statusOf(dir, run = git) {
   // No optional locks: another session may be committing in that worktree.
@@ -99,10 +131,14 @@ export function unsavedCommits(root, sha, ref, run = git) {
 export function assess(root, { run = git, actors, now = Date.now(), here = process.cwd(), pr } = {}) {
   const trees = worktreesOf(root, run).filter((t) => !t.main && !t.bare);
   if (!trees.length) return [];
+  const known = actors ?? core.allActors();
   const ref = defaultRef(root, run);
   const history = ref ? historyOf(root, ref, run) : undefined;
   return trees.map((tree) => {
     const verdict = { ...tree, remove: false };
+    // Another tool's worktree is its own to remove (MACLEOD-909).
+    if (foreignDir(tree.dir) || foreignBranch(tree.branch)) return { ...verdict, why: 'another tool' };
+    if (!ours(tree, known)) return { ...verdict, why: 'not ours' };
     if (!history) return { ...verdict, why: 'no default branch' };
     if (tree.locked) return { ...verdict, why: 'locked' };
     if (!tree.head || history.line.has(tree.head)) return { ...verdict, why: 'not merged' };
@@ -116,7 +152,7 @@ export function assess(root, { run = git, actors, now = Date.now(), here = proce
       if (said?.state !== 'merged') return { ...verdict, why: 'not merged' };
       byPr = true;
     }
-    if (inUse(tree.dir, { actors, now, here })) return { ...verdict, why: 'in use' };
+    if (inUse(tree.dir, { actors: known, now, here })) return { ...verdict, why: 'in use' };
     const status = statusOf(tree.dir, run);
     if (!status) return { ...verdict, why: 'unreadable' };
     if (status.changed) return { ...verdict, why: 'unsaved work', changed: status.changed, untracked: status.untracked };
@@ -272,6 +308,8 @@ export function copyIntoWorktree(dir, { run = git } = {}) {
 }
 
 const WHY_WORDS = {
+  'another tool': 'are from another tool',
+  'not ours': 'are not from TeamFlow',
   'unsaved work': 'have changes that are not committed',
   'unpushed commits': 'have commits that are not on main or pushed',
   'not merged': 'are not merged',

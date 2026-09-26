@@ -68,7 +68,9 @@ it creates a run marked as auto-created, mints an ad hoc node for each agent
 sent to a worktree (titled from the agent's name and description, never its
 prompt), and binds the agent to it. \`teamflow status\` then reads
 "N agents dispatched, 0 unrepresented", and the auto-created run still wants
-\`depends\` before the board can draw its phases.`;
+\`depends\` before the board can draw its phases.
+
+When another tool runs the plan, do not create TeamFlow runs. TeamFlow reads that tool's run instead.`;
 
 /**
  * Put the rule in the project's instructions, idempotently.

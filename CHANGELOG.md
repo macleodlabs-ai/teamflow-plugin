@@ -3,6 +3,17 @@
 What changed in each published version of the TeamFlow plugin, newest first.
 Only what a person using it would notice.
 
+## 0.3.52
+
+- **TeamFlow does the reminding.** When work is sent back or stops, TeamFlow
+  asks the session to carry on. Nobody is asked to remind a developer.
+- **Quiet in other tools' sessions.** When another tool runs the agents,
+  such as Archon or a script, TeamFlow only reports. It does not steer them.
+- **Other tools' branches are left alone.** TeamFlow does not rename them,
+  read ticket numbers from them or tidy their work copies.
+- **Ask a person with choices.** `teamflow card ask` takes `--options` in
+  either form, and its reply names the ticket.
+
 ## 0.3.51
 
 - **A plan can be a file.** `teamflow workflow apply plan.yaml` builds a

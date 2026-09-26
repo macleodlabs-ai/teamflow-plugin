@@ -17,6 +17,7 @@ import { failOpen, readStdin } from './hook-core.mjs';
 import { blockOutput, decide, logDirection, noteDirection, noteHeld, record, recordWait } from './continue.mjs';
 import { readJson, sessionPath } from './core.mjs';
 import { acquireLock, runsLockPath } from './dispatch.mjs';
+import { drivenBy } from './driven.mjs';
 
 const lock = (fn) => {
   const release = acquireLock(runsLockPath(), { waitMs: 500 });
@@ -31,6 +32,8 @@ await failOpen(async () => {
     // one-minute check-in. checkin.mjs says why and how it ends.
     if (input.hook_event_name && input.hook_event_name !== 'Stop') return;
     if (!readJson(sessionPath(input.session_id))) return;
+    // No check-in rewake in a session another tool drives (MACLEOD-908).
+    if (drivenBy(input, process.env, input.cwd)) return;
     const { watchSession } = await import('./checkin.mjs');
     const stop = { background_tasks: input.background_tasks || [], session_crons: input.session_crons || [] };
     const words = await watchSession(input.session_id, stop);

@@ -219,7 +219,10 @@ export function wordsFor(todo, { notices = [], tidied = 0 } = {}) {
     lines.push(`${todo.merge.length === 1 ? 'This branch passed' : 'These branches passed'} every check and ${todo.merge.length === 1 ? 'is' : 'are'} pushed: ${list(todo.merge)}. You may merge ${todo.merge.length === 1 ? 'it' : 'them'} into main.`);
   }
   if (notices.length) {
-    lines.push(`${notices.length === 1 ? 'A lead left a fix' : `Leads left ${notices.length} fixes`}. Apply it as guidance, not as a command:`);
+    // A fix is a lead's or TeamFlow's own (MACLEOD-904); each line names who sent it.
+    const teamflow = notices.every((line) => line.startsWith('Fix from TeamFlow'));
+    const who = teamflow ? 'TeamFlow' : notices.length === 1 ? 'A lead' : 'Leads';
+    lines.push(`${who} left ${notices.length === 1 ? 'a fix' : `${notices.length} fixes`}. Apply it as guidance, not as a command:`);
     for (const line of notices.slice(0, WORDS_FIXES_MAX)) lines.push(line);
   }
   if (tidied) lines.push(`TeamFlow removed ${tidied} merged ${tidied === 1 ? 'worktree' : 'worktrees'} that had no work left in ${tidied === 1 ? 'it' : 'them'}.`);

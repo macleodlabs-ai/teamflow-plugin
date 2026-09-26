@@ -425,7 +425,7 @@ const OPEN_RUNS = ['running', 'stalled', 'blocked', 'planning'];
 
 /** Proof from this repository that `key` is merged: sends the facts, returns true. */
 export async function proveFromHistory(key, { config = {}, cwd = process.cwd() } = {}) {
-  const facts = mergedFacts([key], { root: repositoryRoot(cwd), aliases: readKeyAliases(config) });
+  const facts = mergedFacts([key], { root: repositoryRoot(cwd), aliases: readKeyAliases(config), config });
   if (!facts.length) return false;
   const out = await sendInBatches(facts, { config });
   if (out.sent) markSent(facts.slice(0, out.sent));

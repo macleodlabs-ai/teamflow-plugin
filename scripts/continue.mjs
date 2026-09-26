@@ -39,6 +39,7 @@ import path from 'node:path';
 
 import * as core from './core.mjs';
 import { launchesOf } from './dispatch.mjs';
+import { drivenBy } from './driven.mjs';
 import { keyOf, pauseOf } from './heartbeat.mjs';
 import { STEP } from './resume.mjs';
 import { BRANCH } from './workflow.mjs';
@@ -396,13 +397,15 @@ export function continuesOf(sessionId) {
  * Returns `{ continue: false, why }` or `{ continue: true, direction }`,
  * and a `waiting` direction to log when the plan has nothing ready.
  */
-export function decide(input = {}, { now = Date.now(), setting = settingOf(), remoteHead = gitRemoteHead } = {}) {
+export function decide(input = {}, { now = Date.now(), setting = settingOf(), remoteHead = gitRemoteHead, env = process.env } = {}) {
   const no = (why, extra = {}) => ({ continue: false, why, ...extra });
   const event = input.hook_event_name;
   const subagent = event === 'SubagentStop';
   if (event !== 'Stop' && !subagent) return no('not a stop');
   const sessionId = input.session_id;
   if (!sessionId || sessionId === 'unknown-session') return no('no session');
+  // Another tool runs this session's loop (MACLEOD-908): never hold it open.
+  if (drivenBy(input, env, input.cwd)) return no('driven by another tool');
   if (setting === 'off') return no('setting off');
   if (input.permission_mode === 'plan') return no('plan mode');
   if (endsWithQuestion(input.last_assistant_message)) return no('question');

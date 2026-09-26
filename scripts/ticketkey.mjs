@@ -27,7 +27,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 
 import * as core from './core.mjs';
-import { branchOk, keyOk, keysIn } from './merged.mjs';
+import { branchOk, foreignBranch, keyOk, keysIn } from './merged.mjs';
 import { GIT_BEGIN, GIT_END, TRAILER, gitHooksDir, trailerHookBody } from './hooks.mjs';
 import { removeBlock, writeBlock } from './write.mjs';
 
@@ -133,6 +133,10 @@ export function branchCarryKey(root, key, run = git) {
   if (keysIn(branch).has(ok)) return { branch, kept: 'has the key' };
   if (DEFAULTS.has(branch)) return { branch, kept: 'default branch' };
   if (branch.startsWith('worktree-')) return { branch, kept: 'a branch Claude Code named' };
+  // Another tool made it and finds it by its name: renaming `archon/task-x`
+  // lost Archon its branch (MACLEOD-909). The key file and hook still name
+  // the ticket in each commit, and carryLine says nothing about the name.
+  if (foreignBranch(branch)) return { branch, kept: 'another tool made it' };
   if (run(root, ['rev-parse', '--abbrev-ref', '--symbolic-full-name', '@{u}']).ok) return { branch, kept: 'pushed' };
   const next = `${ok}-${branch}`.slice(0, 200);
   if (!branchOk(next)) return { branch, kept: 'name' };

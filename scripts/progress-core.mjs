@@ -1027,31 +1027,31 @@ function rowsFor(card, ctx) {
   const column = card.gate?.label ?? STAGE_LABELS[card.ticket.stage];
   const asks = card.ticket.status === "waiting" && card.ticket.waitingOn === "human" ? card.ticket.asks : void 0;
   if (asks && !card.flags.finished && !card.flags.done) {
-    out.push(row("asks_you", silentFor, `${card.key} needs your answer: ${askWords(asks)} \xB7 ${owner}`, "ping"));
+    out.push(row("asks_you", silentFor, `${card.key} needs your answer: ${askWords(asks)} \xB7 ${owner}`, "open_card"));
   }
   const said = card.liveness;
   const lost = said && !card.flags.finished && !card.flags.backlog && !card.flags.done ? livenessSentence(card.key, said, column, now) : void 0;
   if (said?.state === "paused") {
   } else if (said && lost) {
     const rule = said.state === "crashed" ? "agent_crashed" : said.state === "hung" ? "agent_hung" : "agent_offline";
-    out.push(row(rule, livenessAge(said, now), `${lost} \xB7 ${owner}${plan}`, "ping"));
+    out.push(row(rule, livenessAge(said, now), `${lost} \xB7 ${owner}${plan}`, "send_fix"));
   } else if (card.flags.stalled && !card.noVerdict && !card.delayed) {
-    out.push(row("silent", silentFor, `${card.key} ${VOCABULARY.card.word} \xB7 no report for ${ageLabel(silentFor)} in ${column} \xB7 ${owner}${plan}`, "ping"));
+    out.push(row("silent", silentFor, `${card.key} ${VOCABULARY.card.word} \xB7 no report for ${ageLabel(silentFor)} in ${column} \xB7 ${owner}${plan}`, "send_fix"));
   } else if (card.flags.idle && !card.flags.backlog && !card.flags.finished && card.waitingOn && !asks) {
-    out.push(row("idle", silentFor, `${card.key} waiting on ${waitingWords(card.waitingOn)} \xB7 no report for ${ageLabel(silentFor)} \xB7 ${owner}`, "ping"));
+    out.push(row("idle", silentFor, `${card.key} waiting on ${waitingWords(card.waitingOn)} \xB7 no report for ${ageLabel(silentFor)} \xB7 ${owner}`, "open_card"));
   } else if (card.flags.idle && !card.flags.backlog && !card.flags.finished && !card.flags.live) {
-    out.push(row("unfinished", silentFor, `${card.key} left unfinished in ${column} \xB7 last report ${ageLabel(silentFor)} ago \xB7 ${owner}${plan}`, "ping"));
+    out.push(row("unfinished", silentFor, `${card.key} left unfinished in ${column} \xB7 last report ${ageLabel(silentFor)} ago \xB7 ${owner}${plan}`, "send_fix"));
   }
   const together = sharedSince(card.sessions);
   if (together && now - together > TWO_SESSIONS_AFTER_MS && !card.flags.finished) {
     const many = card.sessions.length === 2 ? "two" : String(card.sessions.length);
-    out.push(row("two_sessions", now - together, `${card.key} has ${many} sessions working on it. Check that they do not collide.`, "ping"));
+    out.push(row("two_sessions", now - together, `${card.key} has ${many} sessions working on it. Check that they do not collide.`, "open_card"));
   }
   const named = card.mixedName;
   if (named) {
     const age = Math.max(0, now - time3(named.lastEventAt ?? named.lastBeatAt ?? ""));
     if (named.sameName) {
-      out.push(row("agent_same_name", age, `Two agents on ${card.key} use the name "${named.name}". The board may mix up their work \xB7 ${owner}`, "ping"));
+      out.push(row("agent_same_name", age, `Two agents on ${card.key} use the name "${named.name}". The board may mix up their work \xB7 ${owner}`, "open_card"));
     } else {
       out.push(row("agent_renamed", age, `An agent on ${card.key} showed the name "${named.formerName}" by mistake. Its name is "${named.name}".`, "snooze"));
     }
@@ -1059,7 +1059,7 @@ function rowsFor(card, ctx) {
   const git = card.ticket.git;
   const awaitsReview = Boolean(git?.head) && git?.pushed !== false && git?.commitsSinceMain !== 0;
   if (card.gate?.id.includes("audit") && silentFor > DAY_MS && awaitsReview && !card.ticket.transitions?.some((t) => t.stage === "MERGE")) {
-    out.push(row("audit_no_review", silentFor, `${card.key} passed its audit and the code is pushed. Nobody has reviewed it for ${ageLabel(silentFor)} \xB7 ${owner}`, "ping"));
+    out.push(row("audit_no_review", silentFor, `${card.key} passed its audit and the code is pushed. Nobody has reviewed it for ${ageLabel(silentFor)} \xB7 ${owner}`, "open_card"));
   }
   const frozen = (card.ticket.attention ?? []).some((mark) => mark.kind === "autonomy_off");
   return autonomyRows(card, out, row, now).map((held) => followUpOf(frozen ? { ...held, frozen } : held, card, now));
@@ -1079,7 +1079,7 @@ function needRows(cards, ctx) {
       sentence: `${need.key} \xB7 ${asker} asks you for ${NEED_WORDS[need.kind] ?? "an answer"}: ${need.text}`,
       ownerId: card?.lane ?? need.by,
       ownerLabel: card?.laneLabel ?? asker,
-      primary: "ping",
+      primary: "open_card",
       need
     };
   });
@@ -1093,14 +1093,34 @@ function doneRows(card, row, now) {
 var FIX_GRACE_MS = 2 * 60 * 6e4;
 var OLDER_AFTER_MS = 48 * 60 * 6e4;
 var PASSIVE = /* @__PURE__ */ new Set(["idle", "unfinished", "agent_offline", "audit_no_review", "blocked", "mutual"]);
+var AUTOMATIC = /* @__PURE__ */ new Set(["rework", "delayed", "silent", "unfinished", "agent_crashed", "agent_hung", "agent_offline"]);
+var STOPPED_WORK = /* @__PURE__ */ new Set(["silent", "unfinished", "agent_crashed", "agent_hung", "agent_offline"]);
+var HUMAN_INPUT = /* @__PURE__ */ new Set(["asks_you", "for_you", "audit_no_review", "teamflow_stopped"]);
+var CARRY_ON_TRIES = 2;
+var PARK_AFTER_MS = 48 * 60 * 6e4;
 var FOLLOW_KINDS = /* @__PURE__ */ new Set(["fix", "bump", "rerun_gate", "resume_plan", "skip_gate"]);
 var followable = (entry) => FOLLOW_KINDS.has(entry.kind);
+var parkedWords = (tries) => `No session took up this work after ${tries} asks from TeamFlow. TeamFlow put it aside.`;
+function needsInput(row, card) {
+  if (row.frozen || HUMAN_INPUT.has(row.cause)) return true;
+  if (row.cause === "idle" && card?.waitingOn === "review") return true;
+  return card?.ticket.autonomy?.state === "stopped" || card?.ticket.policy?.criticality === "critical";
+}
 function followUpOf(row, card, now) {
   const began = now - row.ageMs;
   const queued = (card.ticket.actionQueue ?? []).filter((entry) => followable(entry) && entry.status !== "not_needed" && time3(entry.at) >= began - 6e4);
   const last = queued[queued.length - 1];
-  const quiet = row.tier === "need" && !card.run && PASSIVE.has(row.cause) && row.ageMs > OLDER_AFTER_MS;
-  if (!last) return quiet ? { ...row, quiet } : row;
+  const person = needsInput(row, card);
+  const quiet = row.tier === "need" && !card.run && (PASSIVE.has(row.cause) || !person && STOPPED_WORK.has(row.cause)) && row.ageMs > OLDER_AFTER_MS;
+  const base = last ? withFollowUp(row, last, card, now) : row;
+  if (base.handled) return base;
+  if (quiet) return { ...base, quiet };
+  if (person || row.tier !== "need") return base;
+  const tries = queued.filter((entry) => entry.by === "teamflow").length;
+  const aside = AUTOMATIC.has(row.cause) && tries >= CARRY_ON_TRIES && row.ageMs > PARK_AFTER_MS && !card.flags.live;
+  return aside ? { ...base, quiet: true, decide: parkedWords(tries) } : { ...base, handled: true };
+}
+function withFollowUp(row, last, card, now) {
   const served = last.status !== "pending" && last.status !== "expired";
   const followUp = { kind: last.kind, by: last.by, at: last.at, status: "waiting", served };
   if (last.status === "expired") {
@@ -1115,7 +1135,7 @@ function followUpOf(row, card, now) {
     const again = card.rework && time3(card.rework.at) > since;
     if (again || now - since > FIX_GRACE_MS) followUp.status = "failed";
   }
-  return { ...row, followUp, handled: followUp.status === "waiting", ...quiet && followUp.status !== "waiting" ? { quiet } : {} };
+  return { ...row, followUp, handled: followUp.status === "waiting" };
 }
 function autonomyRows(card, out, row, now) {
   const auto = card.ticket.autonomy;
@@ -2604,6 +2624,7 @@ function doingOf(row, card, now, pipeline, fromRuns = []) {
   const retry = card.delayed?.retry ?? [...card.gates.values()].map((v) => v.run.retry).find(Boolean);
   if (retry && card.flags.rework) return { text: `Fixing: ${failedWords(card, pipeline)}, retry ${retry.attempt} of ${retry.of}` };
   if (card.flags.rework && card.flags.live) return { text: `Fixing: ${failedWords(card, pipeline)}` };
+  if (card.flags.rework) return { text: `TeamFlow asks for a fix. ${card.rework?.summary ? plainer(card.rework.summary) : failedWords(card, pipeline)}` };
   if (row.state === "blocked") {
     const on = card.openEdges.map((edge) => edge.on);
     return { text: on.length ? `Waiting for ${on.slice(0, 2).join(", ")}${on.length > 2 ? ` and ${on.length - 2} more` : ""} to finish` : "Waiting for the plan to unblock it" };

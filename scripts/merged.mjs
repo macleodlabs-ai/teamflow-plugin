@@ -55,11 +55,30 @@ export function branchOk(name) {
   return typeof name === 'string' && BRANCH.test(name);
 }
 
-/** Every tracker key named in a line of text, upper-cased. */
-export function keysIn(text) {
+/**
+ * Every tracker key named in a line of text, upper-cased. With `known`
+ * (core.knownPrefixes), only keys whose prefix this machine knows, the
+ * way dispatch's namedKey reads them: `archon/issue-42` is not ISSUE-42
+ * (MACLEOD-909).
+ */
+export function keysIn(text, known = undefined) {
   const out = new Set();
-  for (const match of String(text ?? '').matchAll(KEY_IN_TEXT)) out.add(match[1].toUpperCase());
+  for (const match of String(text ?? '').matchAll(KEY_IN_TEXT)) {
+    const key = match[1].toUpperCase();
+    if (core.believable(key, known)) out.add(key);
+  }
   return out;
+}
+
+// Branches other tools make and own (MACLEOD-909). Archon names its own
+// `archon/issue-42`, `archon/pr-17`, `archon/thread-3f9a`; renaming one
+// lost Archon its branch. TeamFlow never renames one, never reads a key
+// from one, and never removes a worktree on one.
+const FOREIGN_BRANCH = /^(archon|codex|cursor|copilot|devin|jules|dependabot|renovate)\//i;
+
+/** True when another tool made this branch, by its name's prefix. */
+export function foreignBranch(name) {
+  return FOREIGN_BRANCH.test(String(name ?? ''));
 }
 
 function git(root, args) {
@@ -200,13 +219,17 @@ export function prCheck(root, { max = 20, memo = false, now = Date.now(), run } 
   };
 }
 
-/** Local branches with their tips; a name that fails the pattern is skipped. */
-export function branchesOf(root, run = git) {
+/**
+ * Local branches with their tips; a name that fails the pattern is
+ * skipped. A branch another tool made names no key, and with `known`
+ * only keys with a known prefix count (MACLEOD-909).
+ */
+export function branchesOf(root, run = git, known = undefined) {
   const got = run(root, ['for-each-ref', 'refs/heads', '--format=%(refname:short)%09%(objectname)']);
   const out = [];
   for (const row of got.ok ? got.stdout.split('\n') : []) {
     const [name, sha] = row.split('\t');
-    if (branchOk(name) && SHA.test(sha || '')) out.push({ name, sha, keys: keysIn(name) });
+    if (branchOk(name) && SHA.test(sha || '')) out.push({ name, sha, keys: foreignBranch(name) ? new Set() : keysIn(name, known) });
   }
   return out;
 }
@@ -276,7 +299,7 @@ export function aliasTargets(aliases = {}) {
  * a ticket reports as the ticket, and the ticket's evidence includes the
  * ad hoc key's (ADHOC-10's merge counts for MACLEOD-688).
  */
-export function mergedFacts(keys, { root, run = git, aliases = {}, pr } = {}) {
+export function mergedFacts(keys, { root, run = git, aliases = {}, pr, config = {} } = {}) {
   const became = aliasTargets(aliases);
   const wanted = new Set();
   for (const raw of keys || []) {
@@ -287,7 +310,9 @@ export function mergedFacts(keys, { root, run = git, aliases = {}, pr } = {}) {
   const ref = defaultRef(root, run);
   if (!ref) return [];
   const history = historyOf(root, ref, run);
-  const branches = branchesOf(root, run);
+  // The prefixes this machine knows: its config and the keys it asks about.
+  const known = core.knownPrefixes(config, [...wanted, ...became.keys()]);
+  const branches = branchesOf(root, run, known);
   const bound = boundBranches(root, run, { branches });
   const facts = [];
   for (const key of [...wanted].sort()) {
@@ -430,7 +455,7 @@ export async function main(args = [], ctx = {}) {
   }
   const { keys, aliases } = boardKeys(result.document);
   const root = core.repositoryRoot(cwd);
-  const facts = mergedFacts(keys, { root, run: ctx.run, aliases, pr: ctx.pr && root ? ctx.pr(root) : undefined });
+  const facts = mergedFacts(keys, { root, run: ctx.run, aliases, config, pr: ctx.pr && root ? ctx.pr(root) : undefined });
   if (!facts.length) {
     print(`The board has ${keys.length} open cards. Git shows none of them merged into main.`);
     return 0;
@@ -460,7 +485,7 @@ export async function main(args = [], ctx = {}) {
 export async function reportMerged(keys, {
   root, config = {}, run, aliases = core.readKeyAliases(config), repo, now = Date.now(), send = core.sendMerged,
 } = {}) {
-  const facts = unsent(mergedFacts(keys, { root, run, aliases }));
+  const facts = unsent(mergedFacts(keys, { root, run, aliases, config }));
   if (!facts.length) return { ok: true, sent: 0 };
   const out = await sendInBatches(facts, { repo, now, send, config });
   markSent(facts.slice(0, out.sent));

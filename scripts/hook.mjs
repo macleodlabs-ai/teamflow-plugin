@@ -6,11 +6,14 @@
 // in hook-core.mjs. Every other tool's entry is hook-cli.mjs, which
 // translates first and then calls the same pipeline.
 import { claudeContext, failOpen, handleEvent, readStdin } from './hook-core.mjs';
+import { drivenBy } from './driven.mjs';
 
 await failOpen(async () => {
   const input = await readStdin();
   const { state, justBound, event, project, signedIn, refused, credentialRefused, notices } = await handleEvent(input);
   const output = claudeContext(
     event, state, justBound, undefined, project, signedIn, refused, credentialRefused, notices);
-  if (output) process.stdout.write(output);
+  // A session another tool drives (MACLEOD-908) still reports, but hears
+  // nothing from TeamFlow that could steer its work.
+  if (output && !drivenBy(input, process.env, input.cwd)) process.stdout.write(output);
 });

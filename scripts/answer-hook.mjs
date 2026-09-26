@@ -10,10 +10,14 @@
 // and nothing received is run. Any error prints nothing and exits 0.
 import { failOpen, readStdin } from './hook-core.mjs';
 import { twoWaySwitch, waitForAnswer } from './two-way.mjs';
+import { drivenBy } from './driven.mjs';
 
 await failOpen(async () => {
   if (!twoWaySwitch().on) return;
   const input = await readStdin();
+  // Another tool drives this session (MACLEOD-908): it answers its own
+  // questions, so exit at once and let it.
+  if (drivenBy(input, process.env, input.cwd)) return;
   const output = await waitForAnswer(input);
   if (output) process.stdout.write(JSON.stringify(output));
 });
