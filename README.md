@@ -1,6 +1,6 @@
 # TeamFlow Claude Code plugin
 
-TeamFlow is the AI software factory. This plugin is its local half. It shows leads every agent at work in real time, against Jira, Linear or GitHub Issues, and it fixes stalled, orphaned and crashed agents. It sends derived state only, so your code stays on your machine. Normal use requires **zero TeamFlow commands**.
+TeamFlow is the control centre for your AI software factory. This plugin is its local half. It shows leads every agent at work in real time, against Jira, Linear or GitHub Issues, and it fixes stalled, orphaned and crashed agents. It sends derived state only, so your code stays on your machine. Normal use requires **zero TeamFlow commands**.
 
 The plugin is self-contained: its Claude Code hooks, TeamFlow skills and the Atlassian, Linear and GitHub MCP declarations live inside the plugin package. Installing or uninstalling the plugin installs/removes those components together.
 

@@ -1,7 +1,7 @@
 {
   "name": "teamflow",
-  "description": "TeamFlow, the AI software factory. Shows every agent at work in real time, fixes stuck agents and keeps your code on your machine.",
-  "version": "0.3.48",
+  "description": "TeamFlow, the control centre for your AI software factory. Shows every agent at work in real time, fixes stuck agents and keeps your code on your machine.",
+  "version": "0.3.49",
   "author": {
     "name": "MacleodLabs"
   },
