@@ -2159,6 +2159,10 @@ export function claimLaunch(sessionId, agentId, type = undefined, toolUseId = un
   // events in any order, and "the newest" would swap their names.
   const own = toolUseId ? unclaimed.find((entry) => entry.name === `${launchId(toolUseId)}.json`) : undefined;
   if (own) return claimFile(own, agentId);
+  // Claimed already, by a guess at start that this call's id now proves
+  // wrong (MACLEOD-641, audit K8): put each launch with its own agent.
+  const fixed = toolUseId ? reclaimLaunch(sessionId, agentId, toolUseId) : undefined;
+  if (fixed) return fixed;
   const candidates = unclaimed
     .filter((entry) => !type || !entry.launch.type || entry.launch.type === type)
     .reverse();                              // newest first: this is the one just started
@@ -2167,6 +2171,56 @@ export function claimLaunch(sessionId, agentId, type = undefined, toolUseId = un
     if (won) return won;
   }
   return undefined;
+}
+
+/** Move one claimed launch file to `agentId`, or back to unclaimed when there is none. */
+function moveClaim(entry, agentId) {
+  const base = entry.name.slice(0, entry.name.indexOf(CLAIMED));
+  const to = path.join(path.dirname(entry.file), agentId ? `${base}${CLAIMED}${digest(agentId, 16)}.json` : `${base}.json`);
+  try {
+    fs.renameSync(entry.file, to);
+  } catch {
+    return undefined;                       // somebody else moved it first
+  }
+  const launch = { ...entry.launch, agentId, reclaimedAt: new Date().toISOString() };
+  if (!agentId) delete launch.agentId;
+  try { writeJson(to, launch); } catch { /* the name is the claim */ }
+  return launch;
+}
+
+/**
+ * Agents launched together can take each other's launch (MACLEOD-641,
+ * audit K8). `matchLaunch` guesses first in, first out on `SubagentStart`,
+ * which comes before the `PostToolUse` that names the agent by its tool
+ * call. When that call's launch is claimed by another agent, the two
+ * claims swap: this launch goes to `agentId`, and the launch `agentId`
+ * took goes to the agent that held this one. Each agent's next event
+ * reads its own launch again (`launchOf`), so the board keeps the id and
+ * shows the name the agent was launched with. Returns the launch, or
+ * `undefined` when nothing disagreed. Local files only.
+ */
+export function reclaimLaunch(sessionId, agentId, toolUseId) {
+  if (!agentId || !toolUseId) return undefined;
+  const files = launchFiles(sessionId);
+  const mark = `${CLAIMED}${digest(agentId, 16)}.json`;
+  const own = files.find((entry) => entry.name.startsWith(`${launchId(toolUseId)}${CLAIMED}`));
+  if (!own || own.name.endsWith(mark)) return undefined;
+  const guessed = own.launch.agentId;
+  const other = files.find((entry) => entry !== own && entry.name.endsWith(mark));
+  const launch = moveClaim(own, agentId);
+  if (!launch) return undefined;
+  if (other) moveClaim(other, guessed && guessed !== agentId ? guessed : undefined);
+  return { ...launch, swappedWith: guessed };
+}
+
+/** The launch claimed for `agentId`, or `undefined`. One listing and one read. */
+export function launchOf(sessionId, agentId) {
+  if (!sessionId || !agentId) return undefined;
+  let names = [];
+  try { names = fs.readdirSync(launchesPath(sessionId)); } catch { return undefined; }
+  const mark = `${CLAIMED}${digest(agentId, 16)}.json`;
+  const name = names.find((one) => one.endsWith(mark));
+  return name ? readJson(path.join(launchesPath(sessionId), name)) || undefined : undefined;
 }
 
 /**
@@ -2937,6 +2991,15 @@ export function candidate(key, confidence, source, ref = {}) {
   return out;
 }
 
+const CODE_NAME_RE = /(?<![A-Za-z0-9-])([a-z][a-z0-9]{1,19})-(\d{1,9})(?![A-Za-z0-9-])/g;
+
+/** The text with each lower-case key-shaped word of an unknown prefix removed. */
+export function codeNamesOut(text, known) {
+  if (text === undefined || text === null) return text;
+  return String(text).replace(CODE_NAME_RE, (word, prefix) => (
+    known?.has(prefix.toUpperCase()) || isAdHocKey(word) ? word : ' '));
+}
+
 // Pure half of detectCandidates: git and disk stay in the caller so detection is testable.
 // `known` is the prefix set the branch and the commit message are checked against
 // (knownPrefixes); the caller builds it because two of its three sources are on disk.
@@ -2972,8 +3035,11 @@ export function issueCandidates(input = {}, info = {}, manual = undefined, confi
   // A key glued to a word before it is part of that word, not a ticket:
   // "EU-WEST-1" in a pasted AWS email bound a session to WEST-1 (2026-09-25).
   // Prompts only; a branch such as fix-CORE-217 still binds as before.
-  add(detectIssueRef(ownPromptText(input.prompt).replace(GLUED_KEY_RE, ' '), config, info), 100, 'prompt');
-  add(detectIssueRef(input.task_subject, config, info), 98, 'task');
+  // A key written in lower case is a code name, not a ticket, unless its
+  // prefix is one this machine knows (MACLEOD-888): an agent called
+  // `redmain-881` made a REDMAIN-881 card.
+  add(detectIssueRef(codeNamesOut(ownPromptText(input.prompt).replace(GLUED_KEY_RE, ' '), known), config, info), 100, 'prompt');
+  add(detectIssueRef(codeNamesOut(input.task_subject, known), config, info), 98, 'task');
   // The two sources nobody wrote to name a ticket, and the two the prefix rule
   // guards: a dependency bump's branch and its commit message say `express-6.9.21`
   // and mean a package version (MACLEOD-536).
@@ -3520,6 +3586,22 @@ function commandOf(input) {
  */
 const IN_REVIEW = Object.freeze({ stage: 'MERGE', status: 'waiting', summary: 'in review', waitingOn: 'review', sticky: true });
 const MERGED = Object.freeze({ stage: 'MERGE', status: 'success', summary: 'Merged', sticky: true, clearRework: true });
+/*
+ * A merge that found nothing new (MACLEOD-641, audit K9): no stage, so the
+ * card stays where it is and is not counted as merged or finished.
+ */
+const NOTHING_MERGED = Object.freeze({ summary: 'Nothing to merge', heartbeat: true });
+const NOTHING_MERGED_RE = /\balready up[ -]to[ -]date\b/i;
+
+/** The merge command's output says it brought in no commit. */
+export function nothingMerged(input = {}) {
+  const out = input.tool_response;
+  try {
+    return NOTHING_MERGED_RE.test(typeof out === 'string' ? out : JSON.stringify(out ?? ''));
+  } catch {
+    return false;                           // an output it cannot read says nothing
+  }
+}
 
 export function classifyTool(input, state, config) {
   const event = input.hook_event_name;
@@ -3616,6 +3698,8 @@ export function classifyTool(input, state, config) {
     // A pull request names no branch on the command line, so its merge
     // is the bound ticket's own (MACLEOD-639).
     if (PR_MERGE_RE.test(command)) return MERGED;
+    // A merge that brought in no commit is not a merge (MACLEOD-641, K9).
+    if (nothingMerged(input)) return NOTHING_MERGED;
     const merged = mergedBranchKey(command);
     // The other tickets whose work this merge landed (MACLEOD-640),
     // credited beside whichever ticket the merge itself is.
@@ -4224,6 +4308,26 @@ export function adHocAbout(state = {}, title = adHocTitle(state)) {
   return [...words(said)].every((w) => known.has(w)) ? undefined : said;
 }
 
+/**
+ * The `spend` block an issue report carries (MACLEOD-882): this actor's
+ * totals on the ticket it is bound to now, as `spend.mjs` tallied them from
+ * the tool's own usage data. Numbers and a model id; absent when nothing
+ * was counted.
+ */
+export function spendBlock(state = {}) {
+  const totals = state.spend?.keys?.[state.binding?.key];
+  if (!totals || !(totals.input || totals.output || totals.cacheRead || totals.cacheWrite)) return undefined;
+  return {
+    id: executionId(state),
+    ...(state.spend.model ? { model: state.spend.model } : {}),
+    input: totals.input || 0,
+    output: totals.output || 0,
+    cacheRead: totals.cacheRead || 0,
+    cacheWrite: totals.cacheWrite || 0,
+    ...(totals.usd !== undefined ? { usd: totals.usd } : {}),
+  };
+}
+
 export function issuePayload(state, config, info) {
   if (!state.binding?.key) return undefined;
   const key = state.binding.key;
@@ -4269,6 +4373,8 @@ export function issuePayload(state, config, info) {
     ...(state.testsPassed ? { testsPassed: state.testsPassed } : {}),
     // MACLEOD-726/733: what TeamFlow told the agent on this card, newest last.
     ...(state.directions?.length ? { directions: state.directions.slice(-10) } : {}),
+    // MACLEOD-882: what the model used on this card in this session, as numbers.
+    ...(spendBlock(state) ? { spend: spendBlock(state) } : {}),
     // MACLEOD-510. Set by refreshDelivery, and absent rather than empty
     // outside a repository or when the branch has no pull request.
     git: state.git,
@@ -4397,7 +4503,9 @@ export function sanitizePayload(value, { kind = 'issue' } = {}) {
   // counts. Never the words the reviewer wrote; there is no field for them.
   const reviewOnly = new Set(['lens', 'result', 'round', 'findings', 'high', 'medium', 'low', 'stated']);
   // `asks` (MACLEOD-845): what the session waits for a person to answer.
-  const issueRoot = new Set(['actions', 'asks']);
+  const issueRoot = new Set(['actions', 'asks', 'spend']);
+  // MACLEOD-882: what the model used, as numbers and a model id. Nothing else.
+  const spendOnly = new Set(['id', 'model', 'input', 'output', 'cacheRead', 'cacheWrite', 'usd']);
   // Its kind and, for a permission, a built-in tool's name. Never the
   // question, the command or a path: there is no field for them.
   const asksOnly = new Set(['kind', 'tool']);
@@ -4467,7 +4575,7 @@ export function sanitizePayload(value, { kind = 'issue' } = {}) {
   // line of the plugin's own words, and whether it is still to come.
   const directionOnly = new Set(['at', 'text', 'next']);
   const nested = {
-    testsPassed: testsPassedOnly, directions: directionOnly, asks: asksOnly,
+    testsPassed: testsPassedOnly, directions: directionOnly, asks: asksOnly, spend: spendOnly,
     agent: agentOnly, session: sessionOnly,
     rework: reworkOnly, lastFailure: failureOnly, transitions: transitionOnly,
     attempts: attemptOnly, retry: retryOnly, supersededBy: supersededOnly, actions: actionOnly,
@@ -5249,6 +5357,17 @@ function queueOutbox(item) {
   fs.mkdirSync(outboxDir(), { recursive: true });
   const name = `${Date.now()}-${crypto.randomUUID()}.json`;
   writeJson(path.join(outboxDir(), name), item);
+  // The queue never grows without limit (MACLEOD-886): past the bound
+  // the oldest go, whoever queued them.
+  try {
+    const names = fs.readdirSync(outboxDir()).filter((file) => file.endsWith('.json')).sort();
+    const over = names.slice(0, Math.max(0, names.length - OUTBOX_MAX_ITEMS));
+    let full = 0;
+    for (const file of over) {
+      try { fs.unlinkSync(path.join(outboxDir(), file)); full += 1; } catch {}
+    }
+    noteDiscards({ full });
+  } catch {}
 }
 
 // The service drops unknown fields and reports them back, so sending
@@ -5286,10 +5405,26 @@ export function reportIdempotencyKey(kind, slot, document) {
 }
 
 // 120 requests a minute is shared by a Claude session, its subagents
-// and CI, so 429 is reachable in ordinary use. It is the one 4xx worth
-// retrying: the same body posted later gets a different answer.
+// and CI, so 429 is reachable in ordinary use. It and 408 are the 4xx
+// worth retrying: the same body posted later gets a different answer.
 const OUTBOX_BASE_BACKOFF_MS = 15000;
 const OUTBOX_MAX_BACKOFF_MS = 300000;
+
+/**
+ * How many times a queued report may be refused for good before it is
+ * dropped (MACLEOD-886). A 400, 403, 404 or 410, or a key the
+ * organisation does not know, gets the same answer every time; a few
+ * tries with backoff cover a credential that was refreshed in between,
+ * and then the report goes and `teamflow doctor` says so.
+ */
+export const OUTBOX_REFUSED_TRIES = 3;
+
+/**
+ * The most reports the queue holds (MACLEOD-886). Each is a full-state
+ * document, so the newest ones say everything the oldest did; past the
+ * bound the oldest go, and `teamflow doctor` says how many.
+ */
+export const OUTBOX_MAX_ITEMS = 500;
 
 // Seconds or an HTTP-date, per RFC 9110. Undefined when absent or
 // unparseable, so a malformed header falls back to the backoff rather
@@ -5308,13 +5443,15 @@ export function parseRetryAfter(value, now = Date.now()) {
 // capped: a reporter that sleeps for an hour on one header is a
 // reporter that has stopped reporting.
 //
-// Zero for 5xx and network failures, which keeps their long-standing
-// behaviour: they go out on the next flush, because whatever triggered
-// that flush already proved the service is answering again.
+// A 5xx or a network failure goes out on the next flush the first time,
+// because whatever triggered that flush may prove the service is back;
+// after that it backs off like a 429 does, one step behind (MACLEOD-886),
+// so a service that stays down is not asked on every hook.
 export function retryDelayMs(attempts, { status, retryAfterMs } = {}) {
   if (retryAfterMs !== undefined) return Math.min(retryAfterMs, OUTBOX_MAX_BACKOFF_MS);
-  if (status !== 429) return 0;
-  return Math.min(OUTBOX_BASE_BACKOFF_MS * 2 ** Math.max(0, attempts - 1), OUTBOX_MAX_BACKOFF_MS);
+  const step = status === 429 || status === 408 || (status >= 400 && status < 500) ? attempts - 1 : attempts - 2;
+  if (step < 0) return 0;
+  return Math.min(OUTBOX_BASE_BACKOFF_MS * 2 ** step, OUTBOX_MAX_BACKOFF_MS);
 }
 
 function scheduleRetry(item, result) {
@@ -5597,17 +5734,17 @@ async function postEnvelope(endpoint, envelope, idempotencyKey, config, account 
     });
   }
   const retryAfterMs = parseRetryAfter(response.headers.get('retry-after'));
-  if (status === 429) {
-    // The only retryable 4xx. Nothing about the report is wrong; the
-    // caller simply arrived too fast, and the same body posted later
-    // is accepted.
-    return answer({ ok: false, retry: true, status, retryAfterMs, ...refusalOf(body, 'rate limited') });
+  if (status === 429 || status === 408) {
+    // The retryable 4xx. Nothing about the report is wrong; the caller
+    // arrived too fast (429) or the service gave up waiting for it (408),
+    // and the same body posted later is accepted.
+    return answer({ ok: false, retry: true, status, retryAfterMs, ...refusalOf(body, status === 429 ? 'rate limited' : 'request timed out') });
   }
   if (status >= 500) {
     return answer({ ok: false, retry: true, status, retryAfterMs, ...refusalOf(body, `service returned ${status}`) });
   }
   if (status >= 400) {
-    // 400, 401, 403, 413. Re-posting the same body cannot change the
+    // 400, 401, 403, 404, 410, 413. Re-posting the same body cannot change the
     // answer, and one refused report must never dam the outbox in
     // front of the good reports behind it.
     const refusal = refusalOf(body, `service refused the report (${status})`, { hosted: hostedOr(config) });
@@ -5690,19 +5827,46 @@ function discardsPath() {
  */
 export function readDiscards() {
   const kept = readJson(discardsPath(), {}) || {};
-  return { ownerless: Number(kept.ownerless) || 0, expired: Number(kept.expired) || 0 };
+  const out = {
+    ownerless: Number(kept.ownerless) || 0,
+    expired: Number(kept.expired) || 0,
+    // MACLEOD-886: refused for good, and pushed out of a full queue.
+    refused: Number(kept.refused) || 0,
+    full: Number(kept.full) || 0,
+  };
+  if (out.refused && Number(kept.refusedStatus)) out.refusedStatus = Number(kept.refusedStatus);
+  return out;
 }
 
-export function noteDiscards({ ownerless = 0, expired = 0 } = {}) {
-  if (!ownerless && !expired) return;
+export function noteDiscards({ ownerless = 0, expired = 0, refused = 0, full = 0, refusedStatus } = {}) {
+  if (!ownerless && !expired && !refused && !full) return;
   const kept = readDiscards();
   try {
     writeJson(discardsPath(), {
       ownerless: kept.ownerless + ownerless,
       expired: kept.expired + expired,
+      refused: kept.refused + refused,
+      full: kept.full + full,
+      ...(refusedStatus || kept.refusedStatus ? { refusedStatus: refusedStatus || kept.refusedStatus } : {}),
       updatedAt: new Date().toISOString(),
     });
   } catch {}
+}
+
+/**
+ * A report the service refused for good on its first try is not queued
+ * (one refused report must not dam the rest), but it is dropped, so it
+ * is counted for `teamflow doctor` (MACLEOD-886). A seat that needs
+ * paying is a pause with its own line, not a refusal.
+ */
+function noteRefused(result) {
+  if (!result || result.ok || result.retry || result.paymentRequired || !(result.status >= 400)) return;
+  noteDiscards({ refused: 1, refusedStatus: result.status });
+}
+
+/** Whether a flush has dropped anything a person has not been told of yet. */
+export function anyDiscarded(discarded = {}) {
+  return Boolean(discarded.ownerless || discarded.expired || discarded.refused || discarded.full);
 }
 
 export function clearDiscards() {
@@ -5743,6 +5907,11 @@ export function legacyQueued() {
   return queueFiles(legacyOutboxDir()).length;
 }
 
+/** How many times the service has refused this queued report for good. */
+function refusedFor(item) {
+  return Number(item?.refused) || 0;
+}
+
 export async function flushOutbox(config, limit = 5) {
   const mode = transportOf(config);
   const now = Date.now();
@@ -5763,6 +5932,8 @@ export async function flushOutbox(config, limit = 5) {
   let deferred = 0;
   let foreign = 0;
   let ownerless = 0;
+  let refused = 0;
+  let refusedStatus;
   let attempted = 0;
   for (const file of files) {
     if (attempted >= limit) break;
@@ -5824,9 +5995,20 @@ export async function flushOutbox(config, limit = 5) {
         writeJson(full, scheduleRetry(item, result));
         break;
       }
+      if (!result.ok && refusedFor(item) < OUTBOX_REFUSED_TRIES - 1) {
+        // Refused (MACLEOD-886): tried again later with backoff, a few
+        // times, and never a stop: one refused report must not dam the
+        // good ones behind it.
+        writeJson(full, { ...scheduleRetry(item, { status: result.status || 400 }), refused: refusedFor(item) + 1 });
+        continue;
+      }
       fs.unlinkSync(full);
       if (result.ok) sent += 1;
-      else dropped += 1;
+      else {
+        dropped += 1;
+        refused += 1;
+        refusedStatus = result.status || refusedStatus;
+      }
       continue;
     }
     if (item?.uri && item?.payload) {
@@ -5844,7 +6026,7 @@ export async function flushOutbox(config, limit = 5) {
     fs.unlinkSync(full);
     dropped += 1;
   }
-  noteDiscards({ ownerless, expired });
+  noteDiscards({ ownerless, expired, refused, refusedStatus });
   const remaining = fs.existsSync(outboxDir())
     ? fs.readdirSync(outboxDir()).filter((name) => name.endsWith('.json')).length
     : 0;
@@ -5902,6 +6084,13 @@ export function outboxLine(summary) {
   if (summary.discarded.expired) {
     parts.push(`${summary.discarded.expired} discarded: queued more than seven days ago`);
   }
+  // MACLEOD-886: plain words, one fact each.
+  const { refused, refusedStatus, full } = summary.discarded;
+  if (refused) {
+    parts.push(`${refused} dropped: TeamFlow refused ${refused === 1 ? 'it' : 'them'} again and again`
+      + (refusedStatus ? ` (answer ${refusedStatus})` : ''));
+  }
+  if (full) parts.push(`${full} dropped: the queue was full, so the oldest went`);
   return parts.join('; ');
 }
 
@@ -5925,6 +6114,7 @@ export async function sendReport(kind, slot, payload, config, { account, flush =
     queueOutbox(scheduleRetry({ endpoint, envelope, idempotencyKey, owner: result.owner }, result));
     return { ok: false, queued: true, status: result.status, reason: result.reason };
   }
+  noteRefused(result);
   /*
    * `flush: false` is for a sender that is itself already a bounded
    * background pass (MACLEOD-601 audit, finding 9). A flush is up to
@@ -5976,6 +6166,19 @@ export async function sendMerged(payload, config) {
 }
 
 /**
+ * Work moved from a wrong ticket to the right one (MACLEOD-845,
+ * MACLEOD-886): `{ at, moved: [{ key, named, sha, at }] }`, two keys, a
+ * short commit id and a time each. Free like a merged fact, and never
+ * queued: the list stays on the machine until the service takes it.
+ */
+export async function sendMoved(payload, config) {
+  if (!credentialKind(config)) return { ok: false, skipped: true, reason: 'no service credential configured' };
+  const envelope = { kind: 'moved', payload };
+  const idempotencyKey = crypto.createHash('sha256').update(JSON.stringify(envelope)).digest('hex');
+  return postEnvelope(`${serviceUrl(config)}/v1/report`, envelope, idempotencyKey, config, reportScope(config));
+}
+
+/**
  * A card's plain line (MACLEOD-770): `{ jiraKey, line, by, at }`, built
  * field by field here and checked by the words checker before it is
  * called (say.mjs) and again by the service. Free like a merged fact.
@@ -5992,6 +6195,7 @@ export async function sendSay({ jiraKey, line, by, at }, config) {
     queueOutbox(scheduleRetry({ endpoint, envelope, idempotencyKey, owner: result.owner }, result));
     return { ok: false, queued: true, status: result.status, reason: result.reason };
   }
+  noteRefused(result);
   return result;
 }
 

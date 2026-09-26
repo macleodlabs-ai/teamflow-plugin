@@ -129,6 +129,77 @@ export function historyOf(root, ref, run = git) {
   return { arrival, line: onLine, byKey };
 }
 
+// The pull request as a second proof (MACLEOD-884). A squash merge puts
+// a new commit on the default branch, so the branch tip never arrives
+// there and git alone reads the work as not merged. `gh pr view` knows.
+// Three answers, kept apart: 'merged', 'not merged' (a PR that is open or
+// closed, or gh saying there is no PR) and 'unknown' (gh missing, not
+// signed in, no network, a timeout, any answer it cannot read). Unknown
+// is never "no PR": a caller treats it as not proven.
+//
+// gh runs with no shell, fixed arguments and a short timeout. The branch
+// is a name git printed, checked by `branchOk`; nothing from the service
+// reaches it. A branch name of digits only is refused, because gh reads
+// it as a PR number.
+export const PR_TIMEOUT_MS = 5000;
+const PR_FIELDS = 'state,mergedAt,headRefOid';
+const NO_PR = /no (?:open )?pull requests? found/i;
+
+function gh(root, args) {
+  return core.safeExec(core.ghBinary(), args, {
+    cwd: root, timeout: PR_TIMEOUT_MS,
+    env: { ...process.env, GH_PROMPT_DISABLED: '1', GH_NO_UPDATE_NOTIFIER: '1', NO_COLOR: '1' },
+  });
+}
+
+/**
+ * `{ state: 'merged', mergedAt }`, `{ state: 'not merged' }` or
+ * `{ state: 'unknown' }` for `branch`. With `head`, a merged PR counts
+ * only when its head is that commit: a commit made after the merge is
+ * work the PR does not hold.
+ */
+export function prState(root, branch, { head, run = gh } = {}) {
+  if (!root || !branchOk(branch) || /^[0-9]+$/.test(branch)) return { state: 'unknown' };
+  let got;
+  try { got = run(root, ['pr', 'view', branch, '--json', PR_FIELDS]); } catch { return { state: 'unknown' }; }
+  if (!got?.ok) return { state: NO_PR.test(String(got?.stderr || '')) ? 'not merged' : 'unknown' };
+  let pr;
+  try { pr = JSON.parse(got.stdout); } catch { return { state: 'unknown' }; }
+  if (pr?.state === 'OPEN' || pr?.state === 'CLOSED') return { state: 'not merged' };
+  if (pr?.state !== 'MERGED') return { state: 'unknown' };
+  if (head && pr.headRefOid !== head) return { state: 'not merged' };
+  const at = Date.parse(pr.mergedAt);
+  return Number.isFinite(at) ? { state: 'merged', mergedAt: new Date(at).toISOString() } : { state: 'unknown' };
+}
+
+export const PR_MEMO_MS = 30 * 60 * 1000;
+const memoPath = () => path.join(core.dataDir(), 'pr-state.json');
+
+/**
+ * A `(branch, head) => answer` that asks gh at most `max` times. With
+ * `memo`, an answer is kept for 30 minutes by branch and head, so the
+ * check-in each minute does not ask gh about the same branches again.
+ * Past `max`, the answer is 'unknown'.
+ */
+export function prCheck(root, { max = 20, memo = false, now = Date.now(), run } = {}) {
+  let asked = 0;
+  const held = memo ? core.readJson(memoPath(), {}) || {} : {};
+  return (branch, head) => {
+    const id = `${branch}@${head || ''}`;
+    const kept = held[id];
+    if (kept && now - (Date.parse(kept.at) || 0) < PR_MEMO_MS) return kept.answer;
+    if (asked >= max) return { state: 'unknown' };
+    asked += 1;
+    const answer = prState(root, branch, { head, ...(run ? { run } : {}) });
+    if (memo) {
+      for (const [k, v] of Object.entries(held)) if (now - (Date.parse(v?.at) || 0) >= PR_MEMO_MS) delete held[k];
+      held[id] = { at: new Date(now).toISOString(), answer };
+      try { core.writeJson(memoPath(), held); } catch { /* ask again next time */ }
+    }
+    return answer;
+  };
+}
+
 /** Local branches with their tips; a name that fails the pattern is skipped. */
 export function branchesOf(root, run = git) {
   const got = run(root, ['for-each-ref', 'refs/heads', '--format=%(refname:short)%09%(objectname)']);
@@ -205,7 +276,7 @@ export function aliasTargets(aliases = {}) {
  * a ticket reports as the ticket, and the ticket's evidence includes the
  * ad hoc key's (ADHOC-10's merge counts for MACLEOD-688).
  */
-export function mergedFacts(keys, { root, run = git, aliases = {} } = {}) {
+export function mergedFacts(keys, { root, run = git, aliases = {}, pr } = {}) {
   const became = aliasTargets(aliases);
   const wanted = new Set();
   for (const raw of keys || []) {
@@ -226,7 +297,12 @@ export function mergedFacts(keys, { root, run = git, aliases = {} } = {}) {
     for (const name of names) take(history.byKey.get(name), 'commit');
     for (const branch of branches) {
       const says = [...branch.keys, ...(bound.get(branch.name) || [])].some((k) => names.has(k));
-      if (says && !history.line.has(branch.sha)) take(history.arrival.get(branch.sha), 'branch');
+      if (!says || history.line.has(branch.sha)) continue;
+      const arrived = history.arrival.get(branch.sha);
+      if (arrived) { take(arrived, 'branch'); continue; }
+      // A squash merge: git cannot see it, the merged PR can (MACLEOD-884).
+      const got = pr ? pr(branch.name, branch.sha) : undefined;
+      if (got?.state === 'merged') take(Date.parse(got.mergedAt), 'branch');
     }
     if (best) facts.push({ key, merged: true, mergedAt: new Date(best.at).toISOString(), via: best.via });
     if (facts.length >= FACTS_MAX) break;
@@ -354,7 +430,7 @@ export async function main(args = [], ctx = {}) {
   }
   const { keys, aliases } = boardKeys(result.document);
   const root = core.repositoryRoot(cwd);
-  const facts = mergedFacts(keys, { root, run: ctx.run, aliases });
+  const facts = mergedFacts(keys, { root, run: ctx.run, aliases, pr: ctx.pr && root ? ctx.pr(root) : undefined });
   if (!facts.length) {
     print(`The board has ${keys.length} open cards. Git shows none of them merged into main.`);
     return 0;

@@ -49,7 +49,7 @@
 import { currentBinding, mint, TITLE_MAX, TRACKER } from './adhoc.mjs';
 import { title } from './words.mjs';
 import {
-  agentLabel, dataDir, followKeyAliases, isAdHocKey, isAgentTool, isWorkflowTool, issuePayload, launchesPath, launchFields,
+  agentLabel, believable, dataDir, followKeyAliases, isAdHocKey, knownPrefixes, isAgentTool, isWorkflowTool, issuePayload, launchesPath, launchFields,
   organisationScope, readJson, readWorkflows, reportScope, saveSession, sendReport, sessionActors, workflowsPath, writeJson,
   writeWorkflows,
 } from './core.mjs';
@@ -122,6 +122,70 @@ export function nodeTitle(dispatch = {}) {
   const sources = [task, name, name && task ? `${name}: ${task}` : '', type ? `${type} agent` : ''];
   const said = sources.map((text) => title(text)).find((t) => t !== 'Agent work') || 'Agent work';
   return agentLabel(said, TITLE_MAX);
+}
+
+/*
+ * The ticket a launch names (MACLEOD-888).
+ *
+ * The owner, 2026-09-26: tickets minted for agents are noise. A brief
+ * that names its ticket ("MACLEOD-880", "Plan as a file (880)") binds the
+ * agent to THAT ticket; nothing is minted. Only a key of the tracker's
+ * own form counts: written in capitals, with a prefix this machine knows
+ * is real (knownPrefixes). A code name such as `redmain-881` is lower
+ * case and is never a key, so no REDMAIN-881 card is invented. A number
+ * in brackets takes the prefix of the session's own ticket, never an
+ * invented one. The name and description are read first, then the
+ * prompt's opening lines, in memory only. A source that names two or
+ * more tickets names none: guessing between them bound agents to the
+ * wrong one.
+ */
+const NAMED_KEY_RE = /(?<![A-Za-z0-9-])([A-Z][A-Z0-9]{1,19}-\d{1,9})(?![A-Za-z0-9-])/g;
+const BRACKET_NUMBER_RE = /\((\d{1,9})\)/g;
+const PROMPT_LEAD = 300;
+
+function keysNamed(text, known, prefix, brackets) {
+  const out = new Set();
+  for (const found of String(text || '').matchAll(NAMED_KEY_RE)) {
+    if (believable(found[1], known)) out.add(found[1]);
+  }
+  if (brackets && prefix) {
+    for (const found of String(text || '').matchAll(BRACKET_NUMBER_RE)) out.add(`${prefix}-${Number(found[1])}`);
+  }
+  return out;
+}
+
+export function namedKey(launch = {}, { config = {}, state = {}, keys = [] } = {}) {
+  try {
+    const known = knownPrefixes(config, [state.binding?.key, ...keys]);
+    // Nothing known: nobody to ask, so nothing is believed here. A dispatch
+    // is no reason to take a key on trust.
+    if (!known) return undefined;
+    const session = String(state.binding?.key || '');
+    const prefix = /^[A-Z][A-Z0-9]{1,19}-\d+$/.test(session) && !isAdHocKey(session)
+      ? session.split('-')[0]
+      : (known.size === 1 ? [...known][0] : undefined);
+    const sources = [
+      [launch.name, launch.description].filter(Boolean).join(' '),
+      String(launch.prompt || '').slice(0, PROMPT_LEAD),
+    ];
+    for (const [i, text] of sources.entries()) {
+      const found = keysNamed(text, known, prefix, i === 0);
+      if (found.size === 1) return [...found][0];
+      if (found.size > 1) return undefined;
+    }
+  } catch { /* no key is the safe answer */ }
+  return undefined;
+}
+
+/** The keys of the runs on this machine: what teaches the prefixes. */
+function runKeys(config) {
+  const out = [];
+  try {
+    for (const run of Object.values(readWorkflows(config).workflows || {})) {
+      for (const ticket of run.tickets || []) out.push(ticket.key);
+    }
+  } catch { /* none */ }
+  return out;
 }
 
 /** The run's name: the bound ticket and its title, or the date. */
@@ -348,11 +412,23 @@ export function planLaunch(config, { state = {}, dispatch = {}, cwd, info = {}, 
       out.reason = 'unbound';
       return out;
     }
-    const made = ensureRun(config, state, info, { cwd });
+    // The ticket the brief names is the agent's node (MACLEOD-888): it
+    // joins the run and nothing is minted for it.
+    const named = dispatch.kind === 'agent' && dispatch.type !== 'workflow'
+      ? namedKey(launch, { config, state, keys: runKeys(config) }) : undefined;
+    const made = ensureRun(config, state, info, { cwd, keys: named ? [named] : [] });
     if (made?.created) out.notice = createdNotice(made.run);
     if (made) out.run = { id: made.run.id, name: made.run.name };
     if (dispatch.kind !== 'agent') return out;
+    if (named) {
+      out.key = named;
+      out.under = named;
+      return out;
+    }
     if (sessionKey) out.under = sessionKey;
+    // Else a node of its own, on the board only. Under a session's ticket
+    // it is a step of that ticket: the service puts it on the ticket as a
+    // checklist line and never makes it a ticket (adhoc_tickets.py).
     if (dispatch.isolated || !sessionKey) out.pending = true;
   } catch (error) {
     out.reason = out.reason || `TeamFlow could not represent the dispatch: ${error instanceof Error ? error.message : String(error)}`;

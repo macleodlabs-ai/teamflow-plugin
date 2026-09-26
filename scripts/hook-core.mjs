@@ -32,12 +32,14 @@ import {
   enrichBinding,
   followKeyAliases,
   isAdHocKey,
+  trackerOf,
   isAgentTool,
   launchFields,
   loadConfig,
   findLaunch,
   isLinkedWorktree,
   launchId,
+  launchOf,
   matchLaunch,
   organisationScope,
   parseAgentId,
@@ -368,6 +370,8 @@ export function withAgentIdentity(event, input, state, sessionId, agentKey, laun
         },
       } : {}),
     };
+  } else if (input.agent_id) {
+    state = withOwnLaunch(state, sessionId);
   }
   if (event === 'SubagentStop') {
     // The agent's end ends the actor (MACLEOD-641, audit K3): `ended` as
@@ -381,6 +385,33 @@ export function withAgentIdentity(event, input, state, sessionId, agentKey, laun
     };
   }
   return state;
+}
+
+/**
+ * The agent takes its own launch back (MACLEOD-641, audit K8). When the
+ * launch claimed for its id names it differently from what it shows, a
+ * start-time guess gave it another agent's launch. It keeps its id and
+ * takes the launch's name, task and node; `formerName` says what it
+ * showed, so the beats and the board can tell. A node it is bound to by
+ * dispatch moves with the launch; its own `work-on` still wins.
+ */
+export function withOwnLaunch(state, sessionId) {
+  if (!state.agent?.id) return state;
+  const launch = launchOf(sessionId, state.agent.id);
+  if (!launch?.name || launch.name === state.agent.name) return state;
+  const agent = {
+    ...state.agent,
+    name: launch.name,
+    task: launch.task || state.agent.task,
+    formerName: state.agent.name,
+    renamedAt: new Date().toISOString(),
+  };
+  const moved = launch.key && launch.key !== state.dispatch?.key;
+  return {
+    ...state,
+    agent,
+    ...(moved ? { dispatch: { ...(launch.id ? { launchId: launch.id } : {}), key: launch.key, title: launch.title } } : {}),
+  };
 }
 
 function teamTasksPath(sessionId) {
@@ -918,10 +949,10 @@ export async function handleEvent(input = {}) {
     if (dispatching.kind === 'agent') state.represented = shown;
     if (shown.notice) state.dispatchNotice = shown.notice;
     // The card's plain line (MACLEOD-770): the session that sends an agent
-    // knows what the work gives a person. Keys named in the launch's
-    // name, description and opening lines, read in memory only.
-    if (dispatching.kind === 'agent') {
-      const ask = await sayAt('dispatch', [given.name, given.description, String(given.prompt || '').slice(0, 300)].join(' '));
+    // knows what the work gives a person. Only the one ticket the launch
+    // names (MACLEOD-888): a code name such as `redmain-881` is not one.
+    if (dispatching.kind === 'agent' && shown.key) {
+      const ask = await sayAt('dispatch', [shown.key]);
       if (ask) state.sayNotice = ask;
     }
     // A shell dispatch has no launch to settle; its run is published here,
@@ -985,8 +1016,17 @@ export async function handleEvent(input = {}) {
         state.dispatch = { ...state.dispatch, key: got?.key || known.key, title: got?.title || known.title };
       }
     }
-    if (state.dispatch?.key && !state.dispatch.bound) {
-      const own = candidate(state.dispatch.key, 1000, 'dispatch', { tracker: 'teamflow', boundAt: at });
+    // The agent's own `work-on` wins over any key given at dispatch
+    // (MACLEOD-888). A node minted late bound after it with a newer time
+    // and so outranked it: agents showed a minted ticket, or the previous
+    // agent's, instead of the key their brief bound.
+    const ownWord = state.binding?.source === 'manual'
+      && (state.binding.boundAt || '') >= (state.agent?.startedAt || '');
+    if (state.dispatch?.key && !state.dispatch.bound && ownWord) {
+      state.dispatch = { ...state.dispatch, bound: true, overruled: true };
+    } else if (state.dispatch?.key && !state.dispatch.bound) {
+      const tracker = isAdHocKey(state.dispatch.key) ? 'teamflow' : trackerOf(config);
+      const own = candidate(state.dispatch.key, 1000, 'dispatch', { tracker, boundAt: at });
       if (own) {
         state.binding = { ...own, sticky: true };
         state.jira = { ...(state.jira || {}), key: own.key, title: state.dispatch.title };
@@ -1098,6 +1138,17 @@ export async function handleEvent(input = {}) {
   // Async tool/task/stop hooks publish to the service (or legacy S3).
   if ((!LOCAL_ONLY.includes(event) || asked.ask) && state.binding?.key) {
     // What TeamFlow told this agent (MACLEOD-726/733), for the card's Progress line.
+    /*
+     * What the model used on this card (MACLEOD-882), read from Claude
+     * Code's own transcript usage at each stop: numbers and a model id.
+     * Claude Code only; another tool's transcript is not this shape.
+     */
+    if ((event === 'Stop' || event === 'SubagentStop') && !input.reporter_tool) {
+      try {
+        const { tally } = await import('./spend.mjs');
+        tally(state, event, input);
+      } catch { /* the card shows no spend this turn */ }
+    }
     const told = cardDirections(sessionId, agentKey, state.workAt);
     if (told.length) state.directions = told;
     await publishState(state, config, info, { force: event === 'Stop' });

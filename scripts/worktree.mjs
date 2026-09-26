@@ -7,6 +7,9 @@
 //
 // - its branch (or detached head) arrived on the default branch through a
 //   merge commit: reachable from it, and not on its own first-parent line;
+//   or, for a squash merge git cannot see, `gh pr view` says its pull
+//   request is merged with this very commit as its head (MACLEOD-884).
+//   When gh cannot answer, the worktree stays;
 // - nothing in it is modified or staged;
 // - no commit on it is missing from the default branch or a remote;
 // - it is not locked, it is not the folder this command runs in, and no
@@ -24,7 +27,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 
 import * as core from './core.mjs';
-import { branchOk, defaultRef, historyOf } from './merged.mjs';
+import { branchOk, defaultRef, historyOf, prCheck } from './merged.mjs';
 
 export const IN_USE_MS = 6 * 60 * 60 * 1000;
 const SHA = /^[0-9a-f]{40}$/;
@@ -93,7 +96,7 @@ export function unsavedCommits(root, sha, ref, run = git) {
  * The verdict for every linked worktree. `remove` is true only when all
  * the checks pass; otherwise `why` says which one kept it.
  */
-export function assess(root, { run = git, actors, now = Date.now(), here = process.cwd() } = {}) {
+export function assess(root, { run = git, actors, now = Date.now(), here = process.cwd(), pr } = {}) {
   const trees = worktreesOf(root, run).filter((t) => !t.main && !t.bare);
   if (!trees.length) return [];
   const ref = defaultRef(root, run);
@@ -102,14 +105,28 @@ export function assess(root, { run = git, actors, now = Date.now(), here = proce
     const verdict = { ...tree, remove: false };
     if (!history) return { ...verdict, why: 'no default branch' };
     if (tree.locked) return { ...verdict, why: 'locked' };
-    if (!tree.head || !history.arrival.has(tree.head) || history.line.has(tree.head)) return { ...verdict, why: 'not merged' };
+    if (!tree.head || history.line.has(tree.head)) return { ...verdict, why: 'not merged' };
+    // git ancestry first; for a squash merge, the merged PR whose head is
+    // this very commit (MACLEOD-884). Only a clear "merged" counts: an
+    // unknown answer keeps the worktree, and says so.
+    let byPr = false;
+    if (!history.arrival.has(tree.head)) {
+      const said = pr && tree.branch ? pr(tree.branch, tree.head) : undefined;
+      if (said?.state === 'unknown') return { ...verdict, why: 'merge unknown' };
+      if (said?.state !== 'merged') return { ...verdict, why: 'not merged' };
+      byPr = true;
+    }
     if (inUse(tree.dir, { actors, now, here })) return { ...verdict, why: 'in use' };
     const status = statusOf(tree.dir, run);
     if (!status) return { ...verdict, why: 'unreadable' };
     if (status.changed) return { ...verdict, why: 'unsaved work', changed: status.changed, untracked: status.untracked };
-    const unsaved = unsavedCommits(root, tree.head, ref, run);
-    if (unsaved !== 0) return { ...verdict, why: 'unpushed commits' };
-    return { ...verdict, remove: true, untracked: status.untracked };
+    // A merged PR holds this exact commit on the host, so its commits are
+    // saved even when the host deleted the branch after the merge.
+    if (!byPr) {
+      const unsaved = unsavedCommits(root, tree.head, ref, run);
+      if (unsaved !== 0) return { ...verdict, why: 'unpushed commits' };
+    }
+    return { ...verdict, remove: true, untracked: status.untracked, ...(byPr ? { byPr: true } : {}) };
   });
 }
 
@@ -135,10 +152,10 @@ export function saveUntracked(dir, { run = git, now = Date.now() } = {}) {
  * Tidy the repository at `root`. Returns `{ removed, kept, saved }`.
  * With `dryRun`, changes nothing and says what it would do.
  */
-export function tidy(root, { dryRun = false, run = git, actors, now = Date.now(), here = process.cwd(), limit = Infinity } = {}) {
+export function tidy(root, { dryRun = false, run = git, actors, now = Date.now(), here = process.cwd(), limit = Infinity, pr } = {}) {
   const top = run(root, ['rev-parse', '--show-toplevel']);
   const base = top.ok && top.stdout ? top.stdout : root;
-  const verdicts = assess(base, { run, actors, now, here });
+  const verdicts = assess(base, { run, actors, now, here, pr });
   const removed = [];
   const kept = [];
   const saved = [];
@@ -156,17 +173,109 @@ export function tidy(root, { dryRun = false, run = git, actors, now = Date.now()
     }
     const gone = run(mainDir, ['worktree', 'remove', ...(verdict.untracked ? ['--force'] : []), verdict.dir]);
     if (!gone.ok) { kept.push({ ...verdict, remove: false, why: 'git refused' }); continue; }
-    if (verdict.branch) run(mainDir, ['branch', '-d', verdict.branch]);
+    // git refuses `-d` for a squash merge; the merged PR holds this very
+    // commit, so `-D` loses nothing (MACLEOD-884).
+    if (verdict.branch) run(mainDir, ['branch', verdict.byPr ? '-D' : '-d', verdict.branch]);
     removed.push(verdict);
   }
   if (!dryRun && removed.length) run(mainDir, ['worktree', 'prune']);
   return { removed, kept, saved, dryRun };
 }
 
+// The copy list (MACLEOD-884). A new worktree holds only what git
+// tracks, so ignored files such as `.env` or local fixtures are missing
+// and its first test run fails and reads as rework. An owner who wants
+// them opts in with `.teamflow/worktree.json` in the main folder:
+// `{ "copy": [".env", "fixtures/local.json"] }`. The files are copied
+// from the main folder into the new worktree when `work-on` runs there,
+// and nowhere else: nothing leaves the machine. A path must stay inside
+// the repository: an absolute path, a `..` step, or a link that leads
+// out is refused. A file already in the worktree is never overwritten.
+export const COPY_FILE = path.join('.teamflow', 'worktree.json');
+export const COPY_MAX = 50;
+
+const realOf = (dir) => { try { return fs.realpathSync(dir); } catch { return path.resolve(dir); } };
+
+/** The paths the list names: `{ files, refused }`, each checked as text. */
+export function copyListOf(mainDir) {
+  const held = core.readJson(path.join(mainDir, COPY_FILE));
+  const list = Array.isArray(held?.copy) ? held.copy : [];
+  const files = [];
+  const refused = [];
+  for (const raw of list.slice(0, COPY_MAX)) {
+    const rel = typeof raw === 'string' ? raw.trim() : '';
+    const bad = !rel || rel.includes('\0') || path.isAbsolute(rel) || path.win32.isAbsolute(rel)
+      || rel.split(/[\\/]+/).includes('..') || path.normalize(rel) === '.';
+    if (bad) refused.push(String(raw));
+    else files.push(path.normalize(rel));
+  }
+  return { files, refused };
+}
+
+/** Copy the listed files from `mainDir` into `treeDir`. Returns `{ copied, missing, refused }`. */
+export function applyCopyList(mainDir, treeDir) {
+  const { files, refused } = copyListOf(mainDir);
+  const copied = [];
+  const missing = [];
+  const realMain = realOf(mainDir);
+  const realTree = realOf(treeDir);
+  if (realMain === realTree) return { copied, missing, refused };
+  for (const rel of files) {
+    const from = path.resolve(realMain, rel);
+    const to = path.resolve(realTree, rel);
+    if (!inside(realMain, from) || !inside(realTree, to)) { refused.push(rel); continue; }
+    let real;
+    try { real = fs.realpathSync(from); } catch { missing.push(rel); continue; }
+    // A link that leads out of the repository is not the repository's file.
+    if (!inside(realMain, real) || real === realMain) { refused.push(rel); continue; }
+    if (fs.existsSync(to)) continue;
+    try {
+      fs.mkdirSync(path.dirname(to), { recursive: true });
+      // A folder in the worktree that is a link out of it is refused too.
+      if (!inside(realTree, realOf(path.dirname(to)))) { refused.push(rel); continue; }
+      fs.cpSync(real, to, { recursive: true, force: false, errorOnExist: false });
+      copied.push(rel);
+    } catch {
+      missing.push(rel);
+    }
+  }
+  return { copied, missing, refused };
+}
+
+/** The plain lines a person reads after a copy, or none when the list is empty. */
+export function copyLines({ copied = [], missing = [], refused = [] } = {}) {
+  const lines = [];
+  if (copied.length) {
+    lines.push(`TeamFlow copied ${plural(copied.length, 'file', 'files')} from the main folder into this folder: ${copied.join(', ')}.`);
+    lines.push('Warning: these files can hold secrets, such as passwords and keys. TeamFlow keeps them on this computer only.');
+  }
+  if (missing.length) lines.push(`TeamFlow did not find ${plural(missing.length, 'file', 'files')} from your copy list: ${missing.join(', ')}.`);
+  if (refused.length) lines.push(`TeamFlow did not copy ${plural(refused.length, 'path', 'paths')} that point outside the repository: ${refused.join(', ')}.`);
+  return lines;
+}
+
+/**
+ * For `work-on` in a linked worktree: copy the main folder's list into
+ * it. Returns the lines to print. Never throws: a copy that fails must
+ * not stop the binding.
+ */
+export function copyIntoWorktree(dir, { run = git } = {}) {
+  try {
+    const top = run(dir, ['rev-parse', '--show-toplevel']);
+    if (!top.ok || !top.stdout) return [];
+    const mainDir = worktreesOf(top.stdout, run).find((t) => t.main)?.dir;
+    if (!mainDir || realOf(mainDir) === realOf(top.stdout)) return [];
+    return copyLines(applyCopyList(mainDir, top.stdout));
+  } catch {
+    return [];
+  }
+}
+
 const WHY_WORDS = {
   'unsaved work': 'have changes that are not committed',
   'unpushed commits': 'have commits that are not on main or pushed',
   'not merged': 'are not merged',
+  'merge unknown': 'have no answer from GitHub about a merge',
   'in use': 'are in use',
   locked: 'are locked',
   'could not save new files': 'have new files TeamFlow could not copy',
@@ -205,7 +314,7 @@ export async function main(args = [], { cwd = process.cwd(), print = console.log
     print(USAGE);
     return 2;
   }
-  const result = tidy(cwd, { dryRun: rest.includes('--dry-run') });
+  const result = tidy(cwd, { dryRun: rest.includes('--dry-run'), pr: prCheck(cwd) });
   print(summaryLine(result));
   return 0;
 }

@@ -187,7 +187,8 @@ export function buildInventory({
 
 /** Build and send one inventory. Never throws. */
 export async function sendInventory({
-  cwd = process.cwd(), send = core.sendInventory, sendMerged = core.sendMerged, settle = settleMovedAgents, ...rest
+  cwd = process.cwd(), send = core.sendInventory, sendMerged = core.sendMerged, sendMoved = core.sendMoved,
+  settle = settleMovedAgents, ...rest
 }) {
   try {
     const config = core.loadConfig(cwd);
@@ -207,6 +208,13 @@ export async function sendInventory({
         oweLines(merged.keys, 'merge');
       }
     } catch { /* the next pass is twenty minutes away */ }
+    // Work a commit filed under the wrong ticket, moved to the right one
+    // on the machine (MACLEOD-845); the service moves the card's history
+    // too (MACLEOD-886).
+    try {
+      const { reportMoves } = await import('./ticketkey.mjs');
+      await reportMoves({ config, send: sendMoved, now: rest.now });
+    } catch { /* the list stays until the next pass */ }
     // An agent that moved to another ticket and then went quiet never
     // settles its own node; this pass does it for it (MACLEOD-713).
     try {

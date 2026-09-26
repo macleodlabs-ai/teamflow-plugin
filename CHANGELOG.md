@@ -3,6 +3,38 @@
 What changed in each published version of the TeamFlow plugin, newest first.
 Only what a person using it would notice.
 
+## 0.3.51
+
+- **A plan can be a file.** `teamflow workflow apply plan.yaml` builds a
+  run from a file you can review. Add `--dry-run` to see the steps first.
+- **TeamFlow checks what it wrote.** After a ticket moves, TeamFlow reads
+  the board back and says so when the board disagrees.
+- **Refused reports stop retrying.** A report the service refuses again and
+  again is dropped, and `teamflow doctor` says so.
+- **Cost per ticket.** Your sessions report tokens and an estimated cost for
+  each ticket. Only numbers leave your computer.
+- **Ask a person.** `teamflow card ask` puts a check, a decision or an
+  approval in that person's Needs you list. `teamflow needs` lists yours.
+- **A merge with nothing new says so.** It reads "Nothing to merge", not
+  "Merged".
+- **No new ticket for an agent that has one.** An agent whose name or
+  task names its ticket, such as "(880)" or MACLEOD-880, works on that
+  ticket. TeamFlow does not make a ticket for it.
+- **Agent names are not tickets.** A name such as `redmain-881` no longer
+  becomes a card, and TeamFlow no longer asks for a line about it.
+- **Your agent's `work-on` wins.** An agent stays on the ticket its brief
+  chose, even when its board card arrives later.
+- **Steps are a checklist on the ticket.** The steps of a plan go on the
+  plan's ticket as lines, and TeamFlow ticks each one when it is done.
+  TeamFlow closes the old step tickets when their plan ends.
+- **Tidy now finds work that GitHub squash-merged.** When git cannot see the
+  merge, TeamFlow asks `gh` about the pull request. If `gh` cannot answer,
+  the worktree stays.
+- **New worktrees can get your ignored files.** List them in
+  `.teamflow/worktree.json`, for example `{"copy": [".env"]}`. `work-on`
+  copies them from the main folder. These files can hold secrets. They stay
+  on your computer, and paths outside the repository are refused.
+
 ## 0.3.50
 
 - **TeamFlow manages your AI software factory.** The plugin's description

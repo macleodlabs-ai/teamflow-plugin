@@ -427,6 +427,50 @@ export function cardLine(key, card, tracker, writeBack = {}) {
     + 'webhook never do). Move it yourself';
 }
 
+// Plain names for the stages a card can stand at, for the read-back line.
+const STAGE_WORDS = {
+  BACKLOG: 'Backlog', LOCAL_DEV: 'Local Dev', LOCAL_TEST: 'Local Test', LOCAL_AUDIT: 'Local Audit',
+  LOCAL_REWORK: 'Local Dev', MERGE: 'Merge', CI_BUILD: 'CI/CD', DEPLOY_DEV: 'CI/CD',
+  DEV_TEST: 'Test Dev', DEV_AUDIT: 'Dev Audit', DEV_REWORK: 'Local Dev', DEV_VERIFIED: 'Deployed',
+  DONE: 'Done', READY_PROD: 'Done',
+};
+const stageWords = (stage) => STAGE_WORDS[stage] || 'an unknown step';
+// A retired stage reads as the one it became (LEGACY_STAGES in dataSource.ts).
+const boardStage = (stage) => (stage === 'READY_PROD' ? 'DONE' : String(stage || ''));
+
+/**
+ * The write, read back once (MACLEOD-880). Exit 0 is not proof: a report
+ * the service accepted can still leave the card somewhere else, and a
+ * tracker can say a ticket is closed while the run still works on it.
+ *
+ * `board` is `fetchState` of `issues/<KEY>.json` after the card was sent;
+ * `tracker` is `readTracker`. One plain line when either disagrees with
+ * what the run just said, else nothing. Done on the board agrees with a
+ * finished card: the tracker closing it moves the card on, not back.
+ * Pure, so the disagreement is a test and not a live tenant.
+ */
+export function readBackLine(key, card, ticket = {}, board = {}, tracker = {}) {
+  if (!card) return '';
+  if (!board.ok) {
+    return `TeamFlow could not read ${key} back from the board, so it cannot confirm this step.`;
+  }
+  const there = boardStage(board.document?.stage);
+  const finished = ticket.state === 'done';
+  if (board.missing || !there) {
+    return `The board has no card for ${key} yet. Run \`teamflow workflow reconcile --dry-run\` to see why.`;
+  }
+  if (there !== card.stage && !(finished && there === 'DONE')) {
+    return `The board shows ${key} at ${stageWords(there)}, but the run put it at ${stageWords(card.stage)}. `
+      + 'Run `teamflow workflow reconcile --dry-run` to see why.';
+  }
+  const open = ticket.state && !['done', 'skipped'].includes(ticket.state);
+  if (open && tracker?.connected && FINISHED.has(tracker.event)) {
+    return `${tracker.provider || 'The tracker'} says ${key} is ${tracker.event}, but the run still works on it. `
+      + 'Check which one is right.';
+  }
+  return '';
+}
+
 /**
  * `cardLine`'s honesty, for a whole pass at once (MACLEOD-603).
  *

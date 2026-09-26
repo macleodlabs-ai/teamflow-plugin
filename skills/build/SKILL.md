@@ -114,7 +114,52 @@ you. Give each edge a short sentence saying why; "MACLEOD-540 waits on
 MACLEOD-538" with no reason is unreadable a week later, and the reason is what
 the board draws on the arrow.
 
-**Record them all in one call**, as JSON on stdin:
+**Write the plan as a file first, then apply it.** The file is what a person
+reviews, in a pull request if they want: the run's name, the keys in priority
+order, every edge with its reason, and the checks the run expects. It holds
+keys and reasons only. Never put a command in it; TeamFlow refuses any field
+but these four.
+
+```yaml
+# .teamflow/plans/backlog-sweep.yaml
+name: Backlog sweep
+keys:
+  - MACLEOD-538
+  - MACLEOD-540
+  - MACLEOD-541
+edges:
+  - from: MACLEOD-540
+    on: MACLEOD-538
+    reason: needs the reporter field that release adds
+  - from: MACLEOD-541
+    on: MACLEOD-538
+    reason: reads the same field
+gates: [lint]
+```
+
+JSON with the same four fields works too. The YAML is a small plain subset:
+lists with `- `, `key: value`, `[a, b]`, quotes and `#` comments. Anything
+fancier is refused with its line number.
+
+```bash
+teamflow workflow apply .teamflow/plans/backlog-sweep.yaml --dry-run
+teamflow workflow apply .teamflow/plans/backlog-sweep.yaml [--deploy]
+```
+
+**Always the dry run first.** It prints the phases, which check each of this
+repository's commands counts as, and how many times a check is tried before
+TeamFlow stops. It writes nothing and sends nothing. Show it to the user if
+the plan is large or surprising.
+
+`apply` creates the run if there is none by that name (it takes the same
+flags as `create`, such as `--deploy`), then adds only what the run lacks.
+Applying the same file twice changes nothing, so after an edit to the file
+you apply it again. It never drops a ticket or an edge the run already
+holds; it says how many the file does not list. A reason you changed in the
+file replaces the old one.
+
+**Without a file, record them all in one call**, as JSON on stdin. This is
+also the route for edges a team finds mid-build:
 
 ```bash
 cat <<'JSON' | teamflow workflow depends --batch --found planning
@@ -204,6 +249,12 @@ what to do — write-back off, no state mapped, a connection with no credential
 (every Jira connection and every hand-pasted GitHub webhook), a tracker that
 could not be read. **Only then** move the tracker's issue with its MCP, and
 run `teamflow workflow reconcile` afterwards to confirm it took.
+
+Every `workflow ticket --state` also reads the card back from the board once.
+When the board, or a tracker, disagrees with what the run just said, one more
+line says so — "The board shows MACLEOD-538 at Local Test, but the run put it
+at Local Dev", or "linear says MACLEOD-538 is done, but the run still works on
+it". Exit 0 is not proof. Act on that line before you move on.
 
 Do not treat a ticket as closed on the strength of having run the command. The
 line is the evidence; if you did not read it, you do not know.
@@ -303,6 +354,12 @@ A SonarQube gate needs nothing from you: TeamFlow asks SonarQube itself, and a
 failure comes back as a ticket sent back with the failed conditions.
 
 ### When a gate fails
+
+First, if a CI check failed, look at the same check on the default branch
+(`gh run list --branch main --workflow "<name>" --limit 1`). If it fails on
+main too, the change did not cause it: do not send the ticket back. Say "Also
+failing on main" in your summary and carry on. TeamFlow does the same on the
+board. A check that passes on main failed because of the change: send it back.
 
 Send the ticket back with the gate that failed, and say why:
 

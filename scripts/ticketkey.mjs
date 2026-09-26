@@ -177,6 +177,30 @@ export function movesOf() {
   return Array.isArray(held) ? held : [];
 }
 
+/** How many moves one report carries; the service takes 200. */
+export const MOVES_BATCH = 50;
+
+/**
+ * Tell the service about the moves it has not heard of (MACLEOD-886),
+ * so the wrong card's history follows the work. Two keys, a short
+ * commit id and a time each. A move is marked sent only when the
+ * service took it; anything else waits for the next pass. Never throws.
+ */
+export async function reportMoves({ config = {}, send = core.sendMoved, now = Date.now() } = {}) {
+  try {
+    const due = movesOf().filter((m) => !m.sent && m.key && m.named && SHORT.test(m.sha || '')).slice(0, MOVES_BATCH);
+    if (!due.length) return { sent: 0 };
+    const moved = due.map(({ key, named, sha, at }) => ({ key, named, sha, at }));
+    const out = await send({ at: new Date(now).toISOString(), moved }, config);
+    if (!out?.ok) return { sent: 0, reason: out?.reason };
+    const shas = new Set(due.map((m) => m.sha));
+    core.writeJson(movesPath(), movesOf().map((m) => (shas.has(m.sha) ? { ...m, sent: true } : m)));
+    return { sent: due.length };
+  } catch {
+    return { sent: 0 };
+  }
+}
+
 /** The card's line for a moved commit: keys and a short sha only, under 120 characters. */
 export function moveLine(move) {
   return `Commit ${move.sha} named ${move.named}. TeamFlow counts it on ${move.key}.`;

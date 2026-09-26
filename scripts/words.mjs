@@ -415,12 +415,12 @@ const SAY_PATH = /(?:^|[\s("'])(?:~|\.{1,2})?\/\w|\b[\w.-]+\/[\w.-]+\/[\w./-]*|\
 const SAY_CODE = /`|[{}<>;=|\\[\]]|\w\(|\b[a-z]+_[a-z0-9_]+\b|\b[a-z]+[A-Z]\w*|(?:^|\s)--?[a-z]/;
 const everywhere = (re) => new RegExp(re.source, `${re.flags}g`);
 
-/** The problems a card's plain line has, in order. Empty when it may be stored. */
-export function sayCheck(text) {
+/** The problems a card's plain line has, in order. Empty when it may be stored. `limit`: a Needs you item's is 200 (MACLEOD-894). */
+export function sayCheck(text, limit = SAY_MAX) {
   const line = String(text ?? '').replace(/\s+/g, ' ').trim();
   if (!line) return [{ rule: 'empty', found: '' }];
   const out = [];
-  if (line.length > SAY_MAX) out.push({ rule: 'too_long', found: `${line.length} characters` });
+  if (line.length > limit) out.push({ rule: 'too_long', found: `${line.length} characters` });
   const count = line.split(SAY_SPLIT).filter((s) => WORD.test(s)).length;
   if (count > SAY_SENTENCES) out.push({ rule: 'sentences', found: `${count} sentences` });
   for (const [rule, re] of [['url', SAY_URL], ['email', SAY_EMAIL], ['secret', SAY_SECRET]]) {

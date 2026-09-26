@@ -43,7 +43,7 @@ import * as core from './core.mjs';
 import { askingOf } from './asking.mjs';
 import { STREAK_MAX, runsFor, wakeCheck, watchPath } from './continue.mjs';
 import { keyOf, pauseOf } from './heartbeat.mjs';
-import { mergedFacts } from './merged.mjs';
+import { mergedFacts, prCheck } from './merged.mjs';
 import { inUse, statusOf, tidy as tidyWorktrees, worktreesOf } from './worktree.mjs';
 import { questionAnswer, twoWaySwitch, validAskId } from './two-way.mjs';
 
@@ -68,6 +68,9 @@ export function answerable(sessionId) {
 export const POLL_STEPS_MS = [60_000, 60_000, 2 * 60_000, 4 * 60_000, 8 * 60_000, 15 * 60_000];
 const WORDS_FIXES_MAX = 3;
 const TIDY_MAX = 20;
+// gh calls per check-in, each at most 5 seconds; answers are kept for
+// 30 minutes, so the next look asks about other branches (MACLEOD-884).
+const PR_CHECKS_MAX = 3;
 const DONE = new Set(['done', 'skipped']);
 const BUSY_DONE = new Set(['completed', 'failed', 'killed', 'stopped']);
 
@@ -244,7 +247,7 @@ export async function checkOnce(sessionId, stop = {}, {
   let tidied = 0;
   try {
     if (main.cwd) {
-      const got = tidy(main.cwd, { limit: TIDY_MAX });
+      const got = tidy(main.cwd, { limit: TIDY_MAX, pr: prCheck(main.cwd, { max: PR_CHECKS_MAX, memo: true, now }) });
       tidied = got.removed.length;
       if (tidied || got.kept.length) held.lastTidy = { at: new Date(now).toISOString(), removed: tidied, kept: got.kept.length };
     }

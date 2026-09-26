@@ -31,7 +31,13 @@ import { projectFor, projectsCachePath } from './project.mjs';
 import {
   POINT_TEXT_MAX, POINTS_MAX, POINTS_PER_ROUND_MAX, advance, pointLine,
 } from './points.mjs';
-import { cardFor, cardLine, planSession, publishCard, readTracker, readWriteBack } from './card.mjs';
+import {
+  cardFor, cardLine, planSession, publishCard, readBackLine, readTracker, readWriteBack,
+} from './card.mjs';
+import { readChecks } from './checks.mjs';
+import {
+  changesNothing, dryRunLines, planChanges, readPlan, unlistedLine,
+} from './planfile.mjs';
 
 // The plan's session block lives beside the card it is stamped on.
 export { planSession };
@@ -106,11 +112,23 @@ export const USAGE = `teamflow workflow — the pool of tickets a run works thro
       when a ticket's gate has had no verdict past twice its deadline,
       and cleared when that gate moves.
 
-  teamflow workflow plan [--keys A,B,C] [--to <name>]
+  teamflow workflow plan [--keys A,B,C] [--to <name>] [--dry-run]
       Fill the pool. --keys is the selection in tracker priority order,
       which is what a session with the tracker's MCP passes in. Without
       it, and for a GitHub project, the selection is made here with the
       same call and the same ordering rule as \`teamflow next\`.
+      --dry-run prints the phases, which check each of this repository's
+      commands counts as, and how many times a check is tried. It writes
+      nothing and sends nothing.
+
+  teamflow workflow apply <file> [--dry-run] [--deploy] [create flags]
+      The plan from a file you can review: a name, ticket keys, links with
+      a reason each, and check names. YAML (a small plain subset) or JSON.
+      Creates the run if there is none by that name, then adds what the
+      run lacks. Applying the same file twice changes nothing. It never
+      drops a ticket or a link the run already holds. The file holds keys
+      and reasons only, never a command. --dry-run is the plan dry run
+      above, with the file applied; it writes nothing.
 
   teamflow workflow depends <KEY> --on <KEY> [--reason <why>]
                             [--found planning|build] [--to <name>]
@@ -1474,6 +1492,55 @@ export async function main(args, {
     return 0;
   }
 
+  /*
+   * A plan from a reviewed file (MACLEOD-880). Before the workflow is
+   * resolved: the file names its run, and may be the thing that makes it.
+   */
+  if (sub === 'apply') {
+    const file = rest.filter((a) => !a.startsWith('--') && !FLAG_VALUE.has(rest[rest.indexOf(a) - 1]))[0];
+    const plan = readPlan(file);
+    const existing = find(state, plan.name);
+    if (rest.includes('--dry-run')) {
+      const draft = existing ? structuredClone(existing)
+        : { name: plan.name, tickets: [], dependencies: [], phases: [] };
+      const changes = planChanges(draft, plan);
+      applyPlan(draft, plan, changes);
+      print(existing
+        ? (changesNothing(changes) ? `"${plan.name}" already matches ${file}.`
+          : `Applying ${file} would add ${countWords(changes)} to "${plan.name}".`)
+        : `Applying ${file} would start "${plan.name}" with ${countWords(changes)}.`);
+      const extra = unlistedLine(changes);
+      if (extra) print(extra);
+      for (const line of dryRunLines(draft, {
+        checks: readChecks(cwd || process.cwd()), gates: draft.gates || [], policy: policyFor(config),
+      })) print(line);
+      return 0;
+    }
+    const run = existing || create(plan.name, rest, state, stated(config, info));
+    const changes = planChanges(run, plan);
+    if (existing && changesNothing(changes)) {
+      print(`"${run.name}" already matches ${file}. TeamFlow changed nothing.`);
+      const extra = unlistedLine(changes);
+      if (extra) print(extra);
+      return 0;
+    }
+    applyPlan(run, plan, changes);
+    if (run.status === 'planning' && run.tickets.length) run.status = 'running';
+    own(run, config, info);
+    save(state, config);
+    const sent = await publish(run, config);
+    print(`TeamFlow applied ${file} to "${run.name}": ${countWords(changes)}. `
+      + `It has ${run.phases.length} phase${run.phases.length === 1 ? '' : 's'}.`);
+    const extra = unlistedLine(changes);
+    if (extra) print(extra);
+    if (!sent.ok) {
+      print(sent.queued ? `It is on this machine and queued: ${sent.reason || 'the service did not answer'}.`
+        : `It is on this machine only. The service refused it: ${sent.reason || 'no reason given'}.`);
+    }
+    print(render(run, state));
+    return 0;
+  }
+
   const target = find(state, flag(rest, 'to'));
   if (!target) {
     if (Object.keys(state.workflows).length) {
@@ -1523,6 +1590,16 @@ export async function main(args, {
   if (sub === 'plan') {
     const listed = flag(rest, 'keys');
     let keys = listed ? listed.split(',').map((k) => k.trim()).filter(Boolean) : null;
+    // What the plan would be, on a copy (MACLEOD-880). Nothing is saved or sent.
+    if (rest.includes('--dry-run')) {
+      const draft = structuredClone(target);
+      if (keys) seed(draft, keys);
+      else relevel(draft);
+      for (const line of dryRunLines(draft, {
+        checks: readChecks(cwd || process.cwd()), gates: draft.gates || [], policy: policyFor(config),
+      })) print(line);
+      return 0;
+    }
     if (!keys) {
       // Same split as `teamflow next`: GitHub is a credential the
       // developer already has, and Linear and Jira are read through the
@@ -1725,10 +1802,17 @@ export async function main(args, {
      * in some team's worktree left on it -- 31 of them did.
      */
     const card = cardFor(ticket);
+    let board;
     if (card) {
       const sent = await publishCard(ticket.key, card, { workflow: target, config, info })
         .catch(() => ({ ok: false }));
       if (sent.ok || sent.queued) cardSaid(ticket, card);
+      // Read back once (MACLEOD-880): exit 0 is not proof the card moved.
+      // Only a card the service took; a queued one has nothing to read yet.
+      if (sent.ok) {
+        board = await fetchState(`issues/${encodeURIComponent(ticket.key)}.json`, config)
+          .catch(() => ({ ok: false }));
+      }
       /*
        * Done means done everywhere on this machine too. An agent whose
        * worktree was removed never sent a `SubagentStop`, so it stands
@@ -1780,6 +1864,10 @@ export async function main(args, {
         ? await readWriteBack(config).catch(() => ({ known: false }))
         : { known: false };
       print(cardLine(ticket.key, card, tracker, writeBack));
+      if (board) {
+        const disagree = readBackLine(ticket.key, card, ticket, board, tracker);
+        if (disagree) print(disagree);
+      }
     }
     print(open.phase
       ? `Phase ${open.phase.n} is ${open.phase.state}; ready: ${open.tickets.map((t) => t.key).join(', ') || 'nothing'}.`
@@ -2090,6 +2178,38 @@ export function dependsBatch(workflow, entries, { found } = {}) {
     : recordEdge(workflow, edge.from, edge.on, edge)));
   relevel(workflow);
   return edges;
+}
+
+// --- a plan from a file (MACLEOD-880) -----------------------------------
+
+// Create flags that take a value, so `apply --tracker linear plan.yaml`
+// does not read "linear" as the file.
+const FLAG_VALUE = new Set(['--tracker', '--project', '--state', '--label', '--order', '--order-text', '--to']);
+
+/**
+ * Add what `planChanges` found missing, through the same `seed` and
+ * `dependsBatch` a plan built by hand goes through. Nothing found missing
+ * is nothing touched, so a second apply of the same file leaves the run,
+ * its phases and its time stamps exactly as they were.
+ */
+export function applyPlan(workflow, plan, changes) {
+  if (changesNothing(changes)) return workflow;
+  workflow.tickets = workflow.tickets || [];
+  workflow.dependencies = workflow.dependencies || [];
+  if (changes.keys.length) seed(workflow, changes.keys);
+  if (changes.edges.length) dependsBatch(workflow, changes.edges);
+  if (changes.gates.length) workflow.gates = [...(workflow.gates || []), ...changes.gates];
+  if (!changes.keys.length && !changes.edges.length) workflow.updatedAt = now();
+  return workflow;
+}
+
+/** "2 tickets, 1 link and 1 check", or "nothing new". */
+function countWords(changes) {
+  const parts = [
+    [changes.keys.length, 'ticket'], [changes.edges.length, 'link'], [changes.gates.length, 'check'],
+  ].filter(([n]) => n).map(([n, word]) => `${n} ${word}${n === 1 ? '' : 's'}`);
+  if (!parts.length) return 'nothing new';
+  return parts.length === 1 ? parts[0] : `${parts.slice(0, -1).join(', ')} and ${parts[parts.length - 1]}`;
 }
 
 // --- a run the plugin makes for itself (MACLEOD-639, ADHOC-13) --------

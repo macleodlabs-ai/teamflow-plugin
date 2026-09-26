@@ -6,6 +6,7 @@ import { claudeBinary } from './claude-bin.mjs';
 import { NO_PROJECT, resolveProject } from './project.mjs';
 import {
   actor,
+  anyDiscarded,
   clearDiscards,
   bindingRefusal,
   bindingRefusalFor,
@@ -86,6 +87,11 @@ const USAGE = `teamflow \u2014 delivery reporting for TeamFlow
   teamflow card say <KEY> "<line>" [--by model|person]
                                    one plain line on the card about what a
                                    person gets from it; checked before it is sent
+  teamflow card ask <KEY> --for <person|owner|admins> --kind check|decision|approval
+                   "<one plain sentence>" [--options "A|B|C"] | --clear <id>
+                                   put it in that person's Needs you; they answer
+                                   in the app, and the answer comes back here
+  teamflow needs                   what waits for you, and answers to what you asked
   teamflow adhoc start "<what the work is>" | title "<...>" | done
                                    work that arrived without a ticket: TeamFlow
                                    mints the key; \`teamflow adhoc --help\` has the rest
@@ -269,7 +275,7 @@ async function status() {
   // why. A hook cannot say either — it exits 0 and prints nothing — so
   // this is where a person finds out, and saying it clears it.
   const outbox = await outboxSummary(config);
-  if (outbox.discarded.ownerless || outbox.discarded.expired) clearDiscards();
+  if (anyDiscarded(outbox.discarded)) clearDiscards();
   // A binding that belongs to another organisation (MACLEOD-586). The
   // hook that refused it exits 0 and prints nothing, so this is where a
   // person finds out why their ticket stopped moving.
@@ -318,6 +324,10 @@ async function status() {
   const asked = await intakePass(config, { key: state?.binding?.key, local: state, cwd });
   for (const line of asked.notices) print(`TeamFlow: ${line}`);
   for (const row of asked.performed) print(`TeamFlow ${row.outcome} ${row.kind} on ${row.key}${row.reason ? `: ${row.reason}` : ''}`);
+  // Answers to what this person asked someone for, once each, and what
+  // waits for them (MACLEOD-894).
+  const { statusLines: needLines } = await import('./needs.mjs');
+  for (const line of await needLines(config)) print(line);
   // The open failure points on the bound card (ADHOC-19): the checklist a
   // team picking the card up works from, so nobody has to ask what is left.
   const { openPointLines } = await import('./workflow.mjs');
@@ -369,7 +379,7 @@ async function status() {
     lastPublishResult: state?.lastPublishResult,
     // Machine-wide, and until a report is accepted again (MACLEOD-620).
     ...(readSoftRefusal(reportScope(config)) ? { reportingPaused: readSoftRefusal(reportScope(config)).reason } : {}),
-    ...(outbox.queued || outbox.legacy || outbox.discarded.ownerless || outbox.discarded.expired
+    ...(outbox.queued || outbox.legacy || anyDiscarded(outbox.discarded)
       ? { outbox: outboxLine(outbox) }
       : {}),
     ...(tidied ? { reconcile: tidied } : {}),
@@ -470,7 +480,16 @@ async function bind(argument = args.filter((a) => a !== '--local').join(' '), { 
 // worktree, so an agent there does not have to know to pass it. Outside
 // a worktree this is exactly `bind`.
 async function workOn() {
-  await bind(undefined, { local: args.includes('--local') || isWorktree(cwd) });
+  const tree = isWorktree(cwd);
+  await bind(undefined, { local: args.includes('--local') || tree });
+  // The owner's opt-in copy list, `.teamflow/worktree.json` (MACLEOD-884):
+  // ignored files such as `.env`, from the main folder, on this machine only.
+  if (tree) {
+    try {
+      const { copyIntoWorktree } = await import('./worktree.mjs');
+      for (const line of copyIntoWorktree(cwd)) print(line);
+    } catch { /* the binding stands without the copy */ }
+  }
 }
 
 async function unbind() {
@@ -540,7 +559,7 @@ async function doctor() {
   // something the next session will not do (MACLEOD-538).
   const stale = staleBuild();
   const outbox = await outboxSummary(config);
-  if (outbox.discarded.ownerless || outbox.discarded.expired) clearDiscards();
+  if (anyDiscarded(outbox.discarded)) clearDiscards();
   const refusedBinding = refusalLine(bindingRefusalFor(cwd, config));
   /*
    * What the last reconcile pass did, and what it left owed
@@ -569,7 +588,7 @@ async function doctor() {
       : 'current',
     node: process.version,
     gitRepository: info.repository || 'not detected',
-    ...(outbox.queued || outbox.legacy || outbox.discarded.ownerless || outbox.discarded.expired
+    ...(outbox.queued || outbox.legacy || anyDiscarded(outbox.discarded)
       ? { outbox: outboxLine(outbox) }
       : {}),
     reconcile: tidied || 'no pass recorded yet; run `teamflow tidy`',
@@ -1046,8 +1065,18 @@ try {
   else if (command === 'card') {
     // `teamflow card say KEY "<line>"` (MACLEOD-770): exit 2 on a line
     // that is not plain, which the words checker says why.
+    // `teamflow card ask KEY ...` (MACLEOD-894): the same exit codes.
+    if (args[0] === 'ask') {
+      const { askMain } = await import('./needs.mjs');
+      process.exit(await askMain(args, { config }));
+    }
     const { main } = await import('./say.mjs');
     process.exit(await main(args, { config }));
+  }
+  else if (command === 'needs') {
+    // What waits for this person, and answers to what they asked (MACLEOD-894).
+    const { needsMain } = await import('./needs.mjs');
+    process.exit(await needsMain(args, { config }));
   }
   else if (command === 'workflow') {
     const { main } = await import('./workflow.mjs');
@@ -1090,8 +1119,9 @@ try {
   else if (command === 'reconcile') {
     // What this repository proves merged, for every open card on the board
     // (MACLEOD-726). Keys from the board are only compared, never run.
-    const { main } = await import('./merged.mjs');
-    process.exit(await main(args, { cwd, config }));
+    // A merged PR is a second proof, for a squash merge (MACLEOD-884).
+    const { main, prCheck } = await import('./merged.mjs');
+    process.exit(await main(args, { cwd, config, pr: (root) => prCheck(root) }));
   }
   else if (command === 'worktree') {
     // `teamflow worktree tidy [--dry-run]` (MACLEOD-845): removes merged,

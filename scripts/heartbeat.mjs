@@ -540,6 +540,9 @@ export function agentRow(actor) {
  * the session's are the ones a report carries (`agentBlock`,
  * `sessionBlock`), so the board joins them on one value.
  */
+const MODEL_ID = /^[A-Za-z0-9][A-Za-z0-9._:\[\]-]{0,63}$/;
+const VERSION_ID = /^\d+(\.\d+){0,3}$/;
+
 export function buildBeat(sessionId, { at = new Date().toISOString(), alive = true, endedReason, continues, repo } = {}) {
   const actors = core.sessionActors(sessionId);
   const main = actors.find((one) => !one.agentKey);
@@ -551,6 +554,13 @@ export function buildBeat(sessionId, { at = new Date().toISOString(), alive = tr
   if (paused) beat.paused = paused;
   const bound = keyOf(main?.binding?.key);
   if (bound) beat.boundKey = bound;
+  // So the service can count its repairs by plugin version (MACLEOD-846).
+  const version = core.pluginVersion();
+  if (version) beat.pluginVersion = version;
+  // The model and Claude Code's version, as the session's own transcript
+  // named them at its last stop (spend.mjs, MACLEOD-882).
+  if (MODEL_ID.test(String(main?.spend?.model || ''))) beat.model = main.spend.model;
+  if (VERSION_ID.test(String(main?.spend?.claudeVersion || ''))) beat.claudeVersion = main.spend.claudeVersion;
   beat.agents = actors
     .filter((one) => one.agentKey && one.agent?.startedAt && !one.agent.endedAt && !one.ended && !one.absorbedInto)
     .sort((a, b) => (Date.parse(b.updatedAt) || 0) - (Date.parse(a.updatedAt) || 0))

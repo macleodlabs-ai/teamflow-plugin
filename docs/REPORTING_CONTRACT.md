@@ -26,7 +26,7 @@ Four properties of this transport are load-bearing:
 - **`X-Machine-Id` is an identifier, not content** (MACLEOD-620). It's `m_` and 32 random hex characters, made once and kept at `~/.local/share/teamflow/machine-id` — one per home directory, whatever `CLAUDE_PLUGIN_DATA` says, so every Claude Code config directory and every other tool on one laptop sends the same id for the one home-rooted device credential. It is never the hostname, the user name or anything derived from the machine. A devcontainer or remote shell that shares the home directory shares it. The service uses it only to keep a device credential to one machine at a time, and never stores it with a report. It's additive: a reporter that can't keep an id sends no header and is never asked, and so is an older plugin.
 - **The idempotency key is the report's content hash.** A heartbeat that repeats an unchanged report is the same request, replayed rather than counted again. Only real progress is a new report. Reporting is included in the seat and is not priced by volume: the count exists so that fair use can be told from a runaway loop, and nothing a person does at a keyboard reaches it.
 
-Answers: 2xx accepted (`replay: true` when it was a repeat); 402 the organisation has no reporting seat, which is logged once and never blocks; 403 `viewer_cannot_report`, refused and not retried; 401 `api_keys_disabled`, a key was presented and none is accepted — refused, not retried, and the key is dead; 403 (or 402) `reporting_paused`, `payment_failed`, `trial_ended`, `usage_exceeds_plan` or `credential_in_use`, a soft refusal: dropped rather than held, never counted, shown by `teamflow status`, `teamflow doctor` and once at session start, and lifted by itself, after which the next `Stop` re-sends current state; 429 rate limited, queued and retried after `Retry-After` or a capped backoff; any other 4xx the report was refused and is not retried; 5xx and network failures are queued and retried with the key they were queued with.
+Answers: 2xx accepted (`replay: true` when it was a repeat); 402 the organisation has no reporting seat, which is logged once and never blocks; 403 `viewer_cannot_report`, refused and not retried; 401 `api_keys_disabled`, a key was presented and none is accepted — refused, not retried, and the key is dead; 403 (or 402) `reporting_paused`, `payment_failed`, `trial_ended`, `usage_exceeds_plan` or `credential_in_use`, a soft refusal: dropped rather than held, never counted, shown by `teamflow status`, `teamflow doctor` and once at session start, and lifted by itself, after which the next `Stop` re-sends current state; 429 rate limited and 408 timed out, queued and retried after `Retry-After` or a capped backoff; any other 4xx (a 400, 404, 410, or a key the organisation does not know) the report was refused for good: never queued on its first answer, and a report already queued is tried at most three times with backoff, then dropped (MACLEOD-886); 5xx and network failures are queued and retried with the key they were queued with, the next flush first and then with a growing wait, until the seven-day horizon. The queue holds at most 500 reports; past that the oldest go. `teamflow status` and `teamflow doctor` say in one line how many were dropped and why.
 
 The legacy transport writes the same documents straight to S3 at the paths below with AWS credentials, and is selected when `dataUri` is configured and no service credential is available.
 
@@ -127,6 +127,7 @@ The account behind the credential being the tenant also decides what the plugin 
 - parent/related keys
 - actor, repository and branch
 - `git`: `branch`, `head.sha` and `head.subject`, `commitsSinceMain`, `ahead`, `behind`, `pushed`, `dirty` — where the branch stands, as counts and flags. Derived state: a count of commits is not the commits, and the subject line is capped at one line's length so a hunk cannot ride in as prose.
+- `spend`: `id`, `model`, `input`, `output`, `cacheRead`, `cacheWrite`, `usd` — what the AI model used on the card in one session, as token counts, an estimated cost and the model id (MACLEOD-882, below). Numbers and a name, never a word from the session.
 - `pr`: `number`, `url`, `state`, `mergeable`, `checks.{passing,failing,pending}`, `review` — what the forge already publishes about the pull request. Derived state: how many checks are in each state, never which ones and never their output.
 
 ### What the SERVICE adds: `member`
@@ -308,6 +309,56 @@ machine belongs in it: no hostname, no working directory, no user, no account,
 no path. `adapters/teamflow/schema.py`'s `REPORTER` table is the enforcement
 and drops anything else.
 
+### What the model used: the `spend` block (MACLEOD-882)
+
+An issue report may carry one `spend` block: what the AI model used on
+this card in one session or agent, counted on the machine.
+
+```jsonc
+"spend": {
+  "id": "claude-<session>[-<agent>]",   // the execution id this actor already reports under
+  "model": "claude-opus-4-8",           // the model id, as the tool named it; ≤ 64
+  "input": 1200,                        // tokens, whole numbers ≥ 0
+  "output": 300,
+  "cacheRead": 50000,
+  "cacheWrite": 2000,
+  "usd": 0.5                            // an estimate; absent when the model has no price
+}
+```
+
+- **Numbers and a model id only.** The block has no field for a word. The
+  plugin's allowlist gives it a scope of its own (`spendOnly` in
+  `sanitizePayload`) and the service's `SPEND` table in
+  `adapters/teamflow/schema.py` refuses a block whose counts are not whole
+  numbers, whose cost is not a number, or whose `id` has a path in it.
+- **Where the numbers come from.** For Claude Code, the session transcript
+  every hook is handed as `transcript_path`: each assistant line carries the
+  Messages API's `usage` object (`input_tokens`, `output_tokens`,
+  `cache_read_input_tokens`, `cache_creation_input_tokens`), the
+  `message.model` and the tool's `version`. That usage object is the public
+  API shape, so it is the least fragile field in the file, and the
+  transcript exists on every stop whether or not a statusline is set up.
+  `plugin/scripts/spend.mjs` reads only those numbers, the model and the
+  version from a line; the line's text, the prompt and the tool calls are
+  never read into anything. A message is counted once, from its last line,
+  and each stop reads only what is new since the last one. A `Stop` counts
+  the session's own transcript and a `SubagentStop` the agent's, and the
+  count goes on the ticket the actor is bound to at that stop. Other tools
+  send no block yet.
+- **The cost is an estimate.** Prices per model live in one table,
+  `PRICES` in `plugin/scripts/spend.mjs`, with the date they were read
+  (`PRICES_AT`). A model not in it is counted in tokens and gets no `usd`.
+- **What the SERVICE keeps.** An issue document is replaced whole on each
+  report, so the service carries `spent: {rows[], total}` on the card: one
+  row per `id` (with the report's `updatedAt` as `at`, at most 40), and
+  their sum (`adapters/teamflow/spend.py`). A report never writes `spent`;
+  one naming it has it dropped. A plan run's total is the sum of its
+  tickets' card totals, computed where it is shown (`run_total`, and
+  `runSpend` in `src/lib/spend.ts`), so it cannot drift from the cards.
+- **A report for leads, never billing.** Spend is shown on the card, on
+  the plan run and in the Status update. It is not a price and not a
+  reporting count, and it never feeds the service's own abuse meter.
+
 ### The workflow document
 
 `workflows/<id>.json` is the third document kind, beside the issue document
@@ -349,6 +400,15 @@ adapter's `WORKFLOW_CARRIED` is the list of fields that survive a republish
 this way, and nothing about it lets a report *clear* a field it did not set —
 a value is only ever replaced by another value (MACLEOD-588).
 
+### Repair rules and what they did (MACLEOD-846)
+
+Service-owned, never written by a report:
+
+| Document | Shape | Why |
+| --- | --- | --- |
+| `settings/rules.json` | `{version, rules: {<rule id>: {enabled?, values?: {<name>: whole number}}}, by, at, history[] {version, at, by, did[], before}}` | The organisation's copy of the rulebook in `adapters/teamflow/rulebook.py`. Only true, false and whole numbers in each setting's range: no text, so nothing a rule holds can be run. Every version is kept, with what it replaced. |
+| `rules/firings/<yyyy-mm-dd>.json` | `rows[] {rule, version, did, key?, at, model?, claudeVersion?, pluginVersion?}` | One row per repair, never purged by any job, off the board. `did` is the repair's own short word (`bumped`, `told`, `run done`), `version` is `<rulebook>.<organisation version>`. |
+
 ### The heartbeat (MACLEOD-641)
 
 `heartbeats/<sessionId>.json` is the fourth kind. A Claude Code session
@@ -364,8 +424,17 @@ stall, a crash or an orphaned agent from quiet work.
     "continues": "<12-hex digest>",          (a successor after a hand-off)
     "repo": "<12-hex digest>",               (the repository's name, hashed)
     "paused": { "reason": "rate_limit" | "billing", "until": "<ISO>", "estimated": true | false },
+    "model": "<model name>", "claudeVersion": "<version>", "pluginVersion": "<version>",
     "agents": [ { "agentId", "name", "key", "stage", "status", "lastEventAt" } ] } }
 ```
+
+- **Which model and which builds** (MACLEOD-846). `model` is a model name
+  (letters, digits, `.`, `-`, `:`, `[`, `]`, at most 64), `claudeVersion` and
+  `pluginVersion` a version number such as `2.1.3`. Anything else refuses the
+  beat. The service counts its repairs by them (below); nothing else about
+  the machine rides with them. The plugin sends all three: `model` and
+  `claudeVersion` are the ones the session's own transcript named at its
+  last stop, the same read that counts spend (MACLEOD-882, below).
 
 - **One process per session.** The hook starts it on the session's first
   event and checks it on every other one (a small file read and a
@@ -525,6 +594,34 @@ board lists as open for the organisation.
   finished, one somebody still works on, or one with new work after the
   merge is left alone. Sent again, it writes nothing.
 
+### Work moved to its right ticket (MACLEOD-886)
+
+A commit made in a working copy bound to one ticket whose subject names
+another is counted on the bound ticket (MACLEOD-845). The plugin keeps each
+such move (`moves.json` in its data directory) and sends the ones the
+service has not taken, after each inventory:
+
+```text
+{ "kind": "moved", "payload": {
+    "at": "<ISO>",
+    "moved": [ { "key": "<the bound, right ticket>", "named": "<the key the subject named>",
+                 "sha": "<7..12 hex>", "at": "<ISO>" } ] } }   (≤ 200; the plugin sends ≤ 50)
+```
+
+- **Two keys, a short commit id and a time.** Never the subject, a branch,
+  an author or a diff. The short commit id is the one the card's own line
+  already names.
+- **What the service does with it** (`adapters/teamflow/moved.py`): the
+  wrong card's history lists (transitions, rework, executions, verdicts,
+  points) move onto the right card and leave the wrong one, but only when
+  the wrong card is the reporting person's own (its `member` is the
+  credential's person) and the right card exists. Another person's card
+  keeps its history. Both cards get one History line (`reason: moved`) that
+  names the commit and the two keys. The account comes from the credential.
+  Sent again, it writes nothing (`outcome: already`).
+- **Free and never queued**, like a merged fact. A move is marked sent on
+  the machine only when the service took it.
+
 ### A card's plain line (MACLEOD-770)
 
 The seventh kind. One line about what a PERSON gets from the piece of work,
@@ -561,6 +658,49 @@ one older than the work under way; they never block.
   sent it, and the line as the note.
 - **Free**, like a merged fact: a sentence about the work, not work
   reported.
+
+### Needs you: what an agent asks of a named person (MACLEOD-894)
+
+Not a report kind: a member route. An agent asks a person for a check, a
+decision or an approval with `teamflow card ask <KEY> --for
+<person|owner|admins> --kind check|decision|approval "<sentence>"
+[--options "A|B|C"]`; the person answers in the app; `teamflow card ask
+<KEY> --clear <id>` takes it back and `teamflow needs` lists what waits.
+
+```text
+POST /v1/members/needs                { key, for, kind, text, options? }
+GET  /v1/members/needs                { forYou: [item], asked: [item] }
+POST /v1/members/needs/{id}/answer    { done: true } | { choice: <index> }
+                                      | { other: "<≤ 200>" } | { approve: bool }
+POST /v1/members/needs/{id}/withdraw
+
+item = { id: "need_<16 hex>", key, kind, text: "<≤ 200>", options: [≤ 5 × ≤ 60],
+         for: "person" | "owner" | "admins", to: "<member address, person only>",
+         by: "<asker address>", at, status: "open" | "answered" | "withdrawn",
+         answer?: { done | choice | other | approve, by, at }, closedAt? }
+```
+
+- **Plain words, checked twice**: the plugin runs `sayCheck(text, 200)`
+  before sending and the service `say_check(text, 200)`: the plain words
+  rules, at most 200 characters, no code, path, link, address, key or
+  token. Options and a short answer pass the same code, link and secret
+  rules. Anything else is refused with plain words; nothing is stored.
+- **Kept beside the board, never on the card**: `needs/open.json` under
+  the tenant, sealed like every document. `needs/` is not a board kind, so
+  no view, page or bundle carries an item, and the raw state route answers
+  404 for it. Open items stay until answered or withdrawn; closed ones
+  stay 7 days, so the asker can read the answer.
+- **Who sees and answers**: a `person` item only that person; `owner` the
+  organisation's owner; `admins` its owner and admins. Never a viewer
+  seat, which can neither ask nor be asked. The asker sees their own items
+  and the answers in `asked`. An item for somebody else is answered 404.
+- **History**: one row when asked (`reason: "asked"`, who was asked and the
+  kind, never the question) and one when answered (`reason: "answered"`,
+  the answer as the note). The Events feed gets `needs.asked` and
+  `needs.answered` with the key, kind and id only.
+- **Back to the session**: `teamflow status` and `teamflow needs` print
+  each answer once. The daily brief lists the open items asked of each
+  operator.
 
 ### What an open card is, and the `tidy` it may get (MACLEOD-770)
 
@@ -877,6 +1017,19 @@ is tried on the next report. The key is hashed because a GitHub key holds
 `/` and `#`. An informational row with the same id goes on the tracker
 sidecar's history. What the tracker answered is logged, never returned to
 the caller.
+
+**Sent after the report, never inside it (MACLEOD-746).** A report only
+decides, from the store, whether a comment or a transition is due. If one
+is, it adds a line to the organisation's own `writeback/queue.json`
+(`{items: [{id, key, kind, doc | verdicts, path?, queuedAt, tries,
+nextAt?}]}`, at most 200 lines). A stage line's `doc` holds `jiraKey`,
+`stage`, `status`, `summary` and `updatedAt` only; a verdict line holds the
+verdict entries not yet posted. The five-minute `delivery.live` pass sends
+them oldest first, and a later line of a ticket waits while an earlier one
+fails. Each send checks the store again (`already`, the claimed marker), so
+a line sent twice says nothing new. A refused line is tried again after 5,
+10, 20, 40 and 60 minutes and goes after 6 tries. What the tracker answered
+is never kept in the queue.
 
 **The transition carries no text at all.** With transitions on, TeamFlow
 also moves the issue to the workflow state the admin named on the members
@@ -1357,6 +1510,10 @@ The report's own `summary` is not in it, and neither is anything else: no prompt
 | `convertedFrom` | the converted ticket's issue document, `issues/<KEY>.json` | the ad hoc keys it was, sorted | Stamped by the move and carried by the service on every later report for that key, which merges the report's history lists (`transitions`, `rework`, `executions`, by identity) into the moved ones instead of replacing them; the report still wins every other field. |
 | `addedBy: "converted"` | a workflow ticket | one more value of the existing enum | The node was renamed from an ad hoc key in place; phase, rank, state, cycle, note and every edge are kept. |
 | `converted_from`, `converted_to`, `converted_tracker` | the `/v1/report` answer, never a document | keys and a tracker kind | Tells the plugin that sent a report under a converted key to rebind to the ticket. |
+
+### A plan's steps are lines on its ticket (MACLEOD-888)
+
+A dispatched node (`addedBy: dispatch`) in a run that holds a real ticket is a step of that ticket, never a ticket of its own; the automatic conversion skips it. The parent is the key the run is named after, else the first ticket a dispatch put in the run, else the first by rank. Where the organisation turned ad hoc tickets on, the five-minute job writes each step to the parent's description as `- [ ] <step title>` and ticks it `- [x]` when the node is done (Linear only today). What leaves is the step's plain title, the one a ticket would have had, and nothing else; the rest of the description is kept as it is. `settings/checklists.json` (`{parents: {<KEY>: {<ADHOC-n>: {text, done}}}}`, service-written) holds what was written, so a pass with nothing new writes nothing. A ticket made from a step before this rule closes once its run ends: Done when the step was done, else Cancelled, through the same path as a member's move; a ticket a person made or one already closed is never touched. A converted ticket's description names the run it came from.
 
 ## Pings: the service mails one member at another's request (MACLEOD-639)
 
