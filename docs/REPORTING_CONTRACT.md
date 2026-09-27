@@ -428,7 +428,8 @@ stall, a crash or an orphaned agent from quiet work.
     "boundKey": "<issue key>",
     "continues": "<12-hex digest>",          (a successor after a hand-off)
     "repo": "<12-hex digest>",               (the repository's name, hashed)
-    "paused": { "reason": "rate_limit" | "billing", "until": "<ISO>", "estimated": true | false },
+    "paused": { "reason": "rate_limit" | "billing", "until": "<ISO>", "estimated": true | false, "model": "<model name>" },
+    "limits": [ { "reason", "until", "estimated", "model", "agentId", "name", "key" } ],   (≤ 8, MACLEOD-920)
     "model": "<model name>", "claudeVersion": "<version>", "pluginVersion": "<version>",
     "agents": [ { "agentId", "name", "key", "stage", "status", "lastEventAt", "model" } ] } }
 ```
@@ -473,7 +474,21 @@ stall, a crash or an orphaned agent from quiet work.
   its path. If the process stays alive, every beat carries `paused` until
   the session's next hook event: the kind of limit and when it resets, from
   the event's `rate_limit_reset_time`, else five hours from the stop with
-  `estimated: true`. Two minutes after the reset, with no event since, the
+  `estimated: true`.
+- **Which model hit the limit, and when it resets** (MACLEOD-920). `paused`
+  and each `limits` row carry `model`: the event's own model when it names
+  one, else the newest real model in the transcript's last 256 KB (never
+  Claude Code's `<synthetic>` limit message), else the family the limit
+  line names (`fable`, `opus`, `sonnet`, `haiku`). `until` is the event's
+  reset time, else the reset in the transcript's own limit line ("resets
+  3pm (Europe/London)", "resets Oct 6, 3pm", or the older `…|<epoch>`),
+  parsed on the machine, else the five-hour estimate with `estimated:
+  true`. The limit line's words never leave the machine: only the model
+  name, the time and the flag. `limits` lists every limit this session and
+  its agents met that has not reset yet, at most 8. A row with `agentId`,
+  `name` (the agent block's) and `key` is an agent that stopped at the
+  limit while its session went on, so the service may tell the session to
+  send that work again on another model. A row is dropped at its reset. Two minutes after the reset, with no event since, the
   heartbeat runs a delivery round and shows a desktop notice with fixed
   words ("ADHOC-24 is waiting. The usage limit has reset. Type continue in
   Claude Code."), through `osascript` or `notify-send` with no shell.

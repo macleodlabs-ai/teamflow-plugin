@@ -108,15 +108,175 @@ export function pausePath(sessionId) {
  * for a rate limit, the reset in `rate_limit_reset_time` (Unix seconds).
  * No reset time: Claude's five-hour window from now, marked estimated.
  */
-export function limitOf(input = {}, now = Date.now()) {
+export function limitOf(input = {}, now = Date.now(), { read = limitFromTranscript } = {}) {
   // The hooks reference names the field `error`; `error_type` is the
   // matcher's name and what older builds sent. Both are read (MACLEOD-845:
   // reading only `error_type` turned every real limit stop into a crash).
   const reason = LIMITS[String(input.error || input.error_type || '')];
   if (!reason) return undefined;
-  const reset = Number(input.rate_limit_reset_time) * 1000;
-  const known = Number.isFinite(reset) && reset > now && reset - now <= PAUSE_MAX_MS;
-  return { reason, until: new Date(known ? reset : now + PAUSE_DEFAULT_MS).toISOString(), estimated: !known };
+  // Which model, and when it resets (MACLEOD-920): the event's own time
+  // first, else the reset in the transcript's own limit line, read here
+  // and never sent as text, else Claude's five-hour window.
+  const file = input.agent_transcript_path || input.transcript_path;
+  let seen = {};
+  try { seen = file ? read(String(file), now) || {} : {}; } catch { seen = {}; }
+  const event = Number(input.rate_limit_reset_time) * 1000;
+  const reset = inWindow(event, now) ? event : inWindow(seen.resetAt, now) ? seen.resetAt : undefined;
+  const out = { reason, until: new Date(reset ?? now + PAUSE_DEFAULT_MS).toISOString(), estimated: reset === undefined };
+  const model = modelOk(input.model) || seen.model;
+  if (model) out.model = model;
+  return out;
+}
+
+// --- which model hit a limit, and when it resets (MACLEOD-920) ----------
+//
+// The owner: "Clarify when waiting for limits resets and when those are."
+// Claude Code writes its limit line into the transcript ("Claude usage
+// limit reached. Your limit will reset at 3pm (Europe/London)", "Opus
+// limit reached ∙ resets Oct 6, 3pm", or the older "…|1760000000"). The
+// time is read from it on this machine; the words never leave it. The
+// model is the last one the transcript names, or the one the line names.
+
+// A reset later than this is not believed: the longest window is a week.
+export const LIMIT_MAX_MS = 8 * 24 * 60 * 60 * 1000;
+const FAMILIES = ['fable', 'opus', 'sonnet', 'haiku'];
+const MONTHS = ['jan', 'feb', 'mar', 'apr', 'may', 'jun', 'jul', 'aug', 'sep', 'oct', 'nov', 'dec'];
+const RESET_EPOCH = /limit reached\|(\d{10})\b/i;
+const RESET_CLOCK = new RegExp(
+  '\\bresets?\\b\\W{0,3}(?:at\\s+)?(?:(' + MONTHS.join('|') + ')[a-z]*\\.?\\s+(\\d{1,2}),?\\s+(?:at\\s+)?)?'
+  + '(\\d{1,2})(?::(\\d{2}))?\\s*(am|pm)?(?:\\s*\\(([A-Za-z_]+(?:/[A-Za-z_+-]+){0,2})\\))?', 'i',
+);
+const FAMILY_LIMIT = /\b(fable|opus|sonnet|haiku)\b[^.\n|]{0,24}\blimit\b/i;
+
+function inWindow(at, now) {
+  return Number.isFinite(at) && at > now && at - now <= LIMIT_MAX_MS;
+}
+
+function modelOk(value) {
+  const text = String(value || '').trim();
+  return MODEL_ID.test(text) && text !== '<synthetic>' ? text : undefined;
+}
+
+/** `fable`, `opus`, `sonnet` or `haiku` from a model id, or undefined. */
+export function familyOf(model) {
+  const text = String(model || '').toLowerCase();
+  return FAMILIES.find((f) => text.includes(f));
+}
+
+// The offset of `timeZone` from UTC at `at`, in ms. Throws on an unknown zone.
+function zoneOffset(at, timeZone) {
+  const parts = Object.fromEntries(new Intl.DateTimeFormat('en-US', {
+    timeZone, hourCycle: 'h23', year: 'numeric', month: 'numeric', day: 'numeric', hour: 'numeric', minute: 'numeric', second: 'numeric',
+  }).formatToParts(new Date(at)).map((p) => [p.type, Number(p.value)]));
+  return Date.UTC(parts.year, parts.month - 1, parts.day, parts.hour, parts.minute, parts.second) - Math.floor(at / 1000) * 1000;
+}
+
+// Wall-clock parts in a zone (or this machine's own) as epoch ms.
+function wallTime({ year, month, day, hour, minute }, timeZone) {
+  if (!timeZone) return new Date(year, month, day, hour, minute).getTime();
+  const guess = Date.UTC(year, month, day, hour, minute);
+  const first = guess - zoneOffset(guess, timeZone);
+  return guess - zoneOffset(first, timeZone);
+}
+
+function todayIn(now, timeZone) {
+  if (!timeZone) {
+    const d = new Date(now);
+    return { year: d.getFullYear(), month: d.getMonth(), day: d.getDate() };
+  }
+  const d = new Date(now + zoneOffset(now, timeZone));
+  return { year: d.getUTCFullYear(), month: d.getUTCMonth(), day: d.getUTCDate() };
+}
+
+/**
+ * When a limit line says the limit resets, as epoch ms, or undefined. A
+ * clock with no zone is this machine's own time, as Claude Code shows it.
+ * The next such time after `now`; a date moves it to that day.
+ */
+export function resetFromText(text, now = Date.now()) {
+  const said = String(text || '');
+  const epoch = RESET_EPOCH.exec(said);
+  if (epoch) {
+    const at = Number(epoch[1]) * 1000;
+    return inWindow(at, now) ? at : undefined;
+  }
+  const m = RESET_CLOCK.exec(said);
+  if (!m) return undefined;
+  let hour = Number(m[3]);
+  const minute = Number(m[4] || 0);
+  const half = (m[5] || '').toLowerCase();
+  if (!half && !m[4]) return undefined;       // "resets 3" is not a time
+  if (hour > 23 || minute > 59 || (half && (hour < 1 || hour > 12))) return undefined;
+  if (half === 'pm' && hour < 12) hour += 12;
+  if (half === 'am' && hour === 12) hour = 0;
+  let zone = m[6] && m[6] !== 'UTC' ? m[6] : m[6] === 'UTC' ? 'UTC' : undefined;
+  try { if (zone) zoneOffset(now, zone); } catch { zone = undefined; }
+  const today = todayIn(now, zone);
+  let at;
+  if (m[1]) {
+    const month = MONTHS.indexOf(m[1].slice(0, 3).toLowerCase());
+    at = wallTime({ year: today.year, month, day: Number(m[2]), hour, minute }, zone);
+    if (at <= now) at = wallTime({ year: today.year + 1, month, day: Number(m[2]), hour, minute }, zone);
+  } else {
+    at = wallTime({ ...today, hour, minute }, zone);
+    for (let i = 0; i < 2 && at <= now; i += 1) {
+      at = wallTime({ ...today, day: today.day + 1 + i, hour, minute }, zone);
+    }
+  }
+  return inWindow(at, now) ? at : undefined;
+}
+
+/** The model a limit line names ("Opus limit reached"), as a family word, or undefined. */
+export function modelFromText(text) {
+  const m = FAMILY_LIMIT.exec(String(text || ''));
+  return m ? m[1].toLowerCase() : undefined;
+}
+
+const TAIL_BYTES = 256 * 1024;
+
+function textOf(content) {
+  if (typeof content === 'string') return content;
+  if (!Array.isArray(content)) return '';
+  return content.map((c) => (c && typeof c.text === 'string' ? c.text : '')).join(' ');
+}
+
+/**
+ * What a transcript's end says about a limit: `{ model, resetAt }`, each
+ * only when found. Reads the file's last 256 KB from the end back: the
+ * newest real model (never `<synthetic>`, the limit line's own), and the
+ * reset in the newest limit line. Keeps no text.
+ */
+export function limitFromTranscript(file, now = Date.now()) {
+  let tail = '';
+  let fd;
+  try {
+    fd = fs.openSync(file, 'r');
+    const size = fs.fstatSync(fd).size;
+    const length = Math.min(size, TAIL_BYTES);
+    const buffer = Buffer.alloc(length);
+    fs.readSync(fd, buffer, 0, length, size - length);
+    tail = buffer.toString('utf8');
+  } catch { return {}; } finally { if (fd !== undefined) try { fs.closeSync(fd); } catch { /* read already */ } }
+  const out = {};
+  let named;
+  for (const line of tail.split('\n').reverse()) {
+    if (out.model && out.resetAt) break;
+    let entry;
+    try { entry = JSON.parse(line); } catch { continue; }
+    const message = entry?.message;
+    if (!message || typeof message !== 'object') continue;
+    if (!out.model && entry.type === 'assistant') out.model = modelOk(message.model);
+    if (out.resetAt === undefined) {
+      const text = textOf(message.content).slice(-600);
+      if (LIMIT_TEXT.test(text)) {
+        out.resetAt = resetFromText(text, now) ?? null;
+        named = modelFromText(text);
+      }
+    }
+  }
+  if (!out.resetAt) delete out.resetAt;
+  if (!out.model && named) out.model = named;
+  return out;
 }
 
 // A turn that stops on a usage limit but arrives as a plain Stop: the
@@ -129,10 +289,19 @@ const LIMIT_TEXT = /\b(usage limit|limit reached|hit your limit|limit will reset
  * limit stopped it is a pause, like a StopFailure `rate_limit`. Reads
  * only the end of the message and keeps none of it.
  */
-export function limitFromText(message, now = Date.now()) {
+export function limitFromText(message, now = Date.now(), { transcript } = {}) {
   const tail = String(message || '').slice(-600);
   if (!LIMIT_TEXT.test(tail)) return undefined;
-  return limitOf({ error: /credit balance/i.test(tail) ? 'billing_error' : 'rate_limit' }, now);
+  // The reset and the model the words name, read here (MACLEOD-920).
+  const reset = resetFromText(tail, now);
+  const named = modelFromText(tail);
+  const limit = limitOf({
+    error: /credit balance/i.test(tail) ? 'billing_error' : 'rate_limit',
+    ...(reset ? { rate_limit_reset_time: reset / 1000 } : {}),
+    ...(transcript ? { transcript_path: transcript } : {}),
+  }, now);
+  if (!limit.model && named) limit.model = named;
+  return limit;
 }
 
 /**
@@ -162,7 +331,53 @@ export function markHandoff(sessionId, now = Date.now()) {
 export function markLimit(sessionId, limit, now = Date.now()) {
   if (!limit || !markHandoff(sessionId, now)) return false;
   core.writeJson(pausePath(sessionId), { ...limit, at: new Date(now).toISOString() });
+  noteLimit(sessionId, limit, now);
   return true;
+}
+
+/** The limits this session and its agents met, until each resets (MACLEOD-920). */
+export function limitsPath(sessionId) {
+  return heartbeatPath(sessionId).replace(/\.json$/, '.limits');
+}
+
+export const LIMITS_MAX = 8;
+
+/**
+ * One limit kept until it resets: the session's own, or, with `agent`
+ * (`{ agentId, name, key }`), an agent's that stopped at it while its
+ * session went on. The beat sends the list so the service knows which
+ * models are limited for this person, and which agent's work waits.
+ */
+export function noteLimit(sessionId, limit, now = Date.now(), agent = undefined) {
+  if (!sessionId || sessionId === 'unknown-session' || !limit) return false;
+  const row = { reason: limit.reason, until: limit.until, estimated: limit.estimated !== false };
+  if (limit.model) row.model = limit.model;
+  if (agent && agentIdOk(agent.agentId)) {
+    row.agentId = agent.agentId;
+    if (agent.name) row.name = String(agent.name).slice(0, 64);
+    if (keyOf(agent.key)) row.key = agent.key;
+  }
+  const same = (r) => (r.agentId || '') === (row.agentId || '') && (r.model || '') === (row.model || '');
+  const kept = limitsOf(sessionId, now).filter((r) => !same(r));
+  core.writeJson(limitsPath(sessionId), [...kept, row].slice(-LIMITS_MAX));
+  return true;
+}
+
+/** The limits a beat carries: only those not reset yet, each checked. */
+export function limitsOf(sessionId, now = Date.now()) {
+  const held = core.readJson(limitsPath(sessionId));
+  if (!Array.isArray(held)) return [];
+  return held.filter((r) => r && Object.values(LIMITS).includes(r.reason) && Date.parse(isoOf(r.until) || '') > now)
+    .map((r) => {
+      const out = { reason: r.reason, until: isoOf(r.until), estimated: r.estimated !== false };
+      if (modelOk(r.model)) out.model = r.model;
+      if (agentIdOk(r.agentId)) {
+        out.agentId = r.agentId;
+        if (typeof r.name === 'string' && r.name) out.name = r.name.slice(0, 64);
+        if (keyOf(r.key)) out.key = r.key;
+      }
+      return out;
+    }).slice(-LIMITS_MAX);
 }
 
 /** The session carried on here: it no longer waits, and with `handoff` it is not moving either. */
@@ -185,8 +400,11 @@ export function pauseOf(sessionId, now = Date.now()) {
   const held = core.readJson(pausePath(sessionId));
   const until = isoOf(held?.until);
   const since = Date.parse(held?.at || '');
-  if (!until || !Object.values(LIMITS).includes(held.reason) || !(now - since < PAUSE_MAX_MS)) return undefined;
-  return { reason: held.reason, until, estimated: held.estimated !== false };
+  // Dropped a day after it began, unless it named a later reset (a weekly limit).
+  if (!until || !Object.values(LIMITS).includes(held.reason) || !(now - since < PAUSE_MAX_MS || now < Date.parse(until))) return undefined;
+  const out = { reason: held.reason, until, estimated: held.estimated !== false };
+  if (modelOk(held.model)) out.model = held.model;
+  return out;
 }
 
 /**
@@ -554,6 +772,9 @@ export function buildBeat(sessionId, { at = new Date().toISOString(), alive = tr
   if (ROOT_DIGEST.test(String(repo || ''))) beat.repo = repo;
   const paused = alive ? pauseOf(sessionId, Date.parse(at)) : undefined;
   if (paused) beat.paused = paused;
+  // Which models are limited, and which agents stopped at one (MACLEOD-920).
+  const limits = limitsOf(sessionId, Date.parse(at));
+  if (limits.length) beat.limits = limits;
   const bound = keyOf(main?.binding?.key);
   if (bound) beat.boundKey = bound;
   // So the service can count its repairs by plugin version (MACLEOD-846).

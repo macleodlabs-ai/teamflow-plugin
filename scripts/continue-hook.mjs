@@ -13,11 +13,33 @@
 //
 // Any error prints nothing a tool could act on and exits 0: the session
 // stops as it always did.
-import { failOpen, readStdin } from './hook-core.mjs';
-import { blockOutput, decide, logDirection, noteDirection, noteHeld, record, recordWait } from './continue.mjs';
-import { readJson, sessionPath } from './core.mjs';
-import { acquireLock, runsLockPath } from './dispatch.mjs';
+//
+// Only driven.mjs is loaded before the input is read: the watcher must end
+// at once in a session another tool drives, before the rest of the plugin
+// has even loaded (MACLEOD-910, whose SDK test saw it outlive a short run).
 import { drivenBy } from './driven.mjs';
+
+async function readInput() {
+  let text = '';
+  for await (const chunk of process.stdin) text += chunk;
+  return text.trim() ? JSON.parse(text) : {};
+}
+
+let input;
+try {
+  input = await readInput();
+} catch {
+  process.exit(0);
+}
+const watching = process.argv.includes('--watch');
+// No check-in rewake in a session another tool drives (MACLEOD-908).
+if (watching && ((input.hook_event_name && input.hook_event_name !== 'Stop')
+    || drivenBy(input, process.env, input.cwd))) process.exit(0);
+
+const { failOpen } = await import('./hook-core.mjs');
+const { blockOutput, decide, logDirection, noteDirection, noteHeld, record, recordWait } = await import('./continue.mjs');
+const { readJson, sessionPath } = await import('./core.mjs');
+const { acquireLock, runsLockPath } = await import('./dispatch.mjs');
 
 const lock = (fn) => {
   const release = acquireLock(runsLockPath(), { waitMs: 500 });
@@ -26,14 +48,10 @@ const lock = (fn) => {
 };
 
 await failOpen(async () => {
-  const input = await readStdin();
-  if (process.argv.includes('--watch')) {
+  if (watching) {
     // Every main-session Stop (MACLEOD-845): a plan's waits, and the
     // one-minute check-in. checkin.mjs says why and how it ends.
-    if (input.hook_event_name && input.hook_event_name !== 'Stop') return;
     if (!readJson(sessionPath(input.session_id))) return;
-    // No check-in rewake in a session another tool drives (MACLEOD-908).
-    if (drivenBy(input, process.env, input.cwd)) return;
     const { watchSession } = await import('./checkin.mjs');
     const stop = { background_tasks: input.background_tasks || [], session_crons: input.session_crons || [] };
     const words = await watchSession(input.session_id, stop);

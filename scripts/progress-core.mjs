@@ -477,6 +477,8 @@ function readLiveness(raw) {
       reason: text(row.reason),
       ...row.handoff === true ? { handoff: true } : {},
       ...text(row.pausedUntil) ? { pausedUntil: text(row.pausedUntil), estimated: row.estimated === true } : {},
+      ...text(row.pausedModel) ? { pausedModel: text(row.pausedModel) } : {},
+      ...row.agentLimit === true ? { agentLimit: true } : {},
       ...text(row.name) ? { name: text(row.name) } : {},
       ...text(row.formerName) ? { formerName: text(row.formerName) } : {},
       ...row.sameName === true ? { sameName: true } : {}
@@ -539,11 +541,18 @@ function livenessSentence(key, said, column, now) {
   if (said.state === "quiet") return `${key}'s computer has been offline for ${age}`;
   return void 0;
 }
+var FAMILIES = ["fable", "opus", "sonnet", "haiku"];
+function limitName(model) {
+  const lower = String(model ?? "").toLowerCase();
+  const family = FAMILIES.find((f) => lower.includes(f));
+  return family ? `the ${family[0].toUpperCase()}${family.slice(1)} limit` : "the usage limit";
+}
 function pausedWords(row) {
+  const name = limitName(row.pausedModel);
   const at = time2(row.pausedUntil);
-  if (!at) return "Waiting for the usage limit";
+  if (!at) return `Paused: ${name}.`;
   const clock = new Date(at).toISOString().slice(11, 16);
-  return `Waiting for the usage limit \xB7 resets at ${row.estimated ? "about " : ""}${clock} UTC`;
+  return `Paused: ${name}. It resets at ${row.estimated ? "about " : ""}${clock} UTC.`;
 }
 var TWO_SESSIONS_AFTER_MS = 15 * 6e4;
 function readSessions(raw) {
@@ -925,7 +934,8 @@ var SEVERITY_OF = {
   teamflow_stopped: "rework",
   asks_you: "blocked",
   for_you: "blocked",
-  plan_wait: "blocked"
+  plan_wait: "blocked",
+  usage_limit: "idle"
 };
 function severityRank(rule) {
   return SEVERITY.indexOf(SEVERITY_OF[rule]);
@@ -1038,6 +1048,10 @@ function rowsFor(card, ctx) {
   const said = card.liveness;
   const lost = said && !card.flags.finished && !card.flags.backlog && !card.flags.done ? livenessSentence(card.key, said, column, now) : void 0;
   if (said?.state === "paused") {
+    if (!card.flags.finished && !card.flags.done) {
+      const words = pausedWords(said.row);
+      out.push(row("usage_limit", livenessAge(said, now), `${card.key}: ${words} \xB7 ${owner}`, "open_card", { handled: true, handling: words }));
+    }
   } else if (said && lost) {
     const rule = said.state === "crashed" ? "agent_crashed" : said.state === "hung" ? "agent_hung" : "agent_offline";
     out.push(row(rule, livenessAge(said, now), `${lost} \xB7 ${owner}${plan}`, "send_fix"));
@@ -2330,6 +2344,9 @@ function mergeCardQueue(issue, hygiene, pings) {
   };
 }
 
+// src/lib/attentionCard.ts
+var PASS_MS = 5 * 6e4;
+
 // src/lib/cardActions.ts
 var DAY_MS3 = 24 * 60 * 6e4;
 var SNOOZE_KEY = "teamflow-snooze";
@@ -2455,7 +2472,8 @@ function sinceOf(keys, accounting, pipeline, since) {
       if (!isGateRun(run) || run.status !== "success" && run.status !== "failed") continue;
       const at = run.endedAt ?? run.updatedAt;
       if (time6(at) <= since) continue;
-      const gate = gateName(run, gateFor(run, pipeline));
+      const column = gateFor(run, pipeline);
+      const gate = column?.label ?? plainGateWords(gateName(run), void 0, pipeline);
       out.push({ at, key, kind: "verdict", text: `${gate} ${run.status === "success" ? "passed" : "failed"}` });
     }
     for (const entry of ticket.rework ?? []) {

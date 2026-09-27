@@ -3,6 +3,15 @@
 What changed in each published version of the TeamFlow plugin, newest first.
 Only what a person using it would notice.
 
+## 0.3.54
+
+- **Limits say when they end.** When a model hits its limit, TeamFlow notes
+  which model and when it resets, from the message on your machine. The
+  words of that message never leave it.
+- **Agents move to a model with room.** When an agent stops at one model's
+  limit and your session still runs, TeamFlow asks the session to send
+  that work again on the next model your organisation allows.
+
 ## 0.3.53
 
 - **Quiet in automated runs.** In a session a script or the Agent SDK

@@ -37,6 +37,7 @@ import {
   launchFields,
   loadConfig,
   findLaunch,
+  agentBlock,
   isLinkedWorktree,
   launchId,
   launchOf,
@@ -63,7 +64,7 @@ import {
 import { NO_PROJECT_SENTENCE, resolveProject } from './project.mjs';
 import { drivenBy } from './driven.mjs';
 import {
-  clearPause, ensureHeartbeat, limitFromText, limitOf, markHandoff, markLimit, rotating, sessionLines, stopHeartbeat,
+  clearPause, ensureHeartbeat, limitFromText, limitOf, markHandoff, markLimit, noteLimit, rotating, sessionLines, stopHeartbeat,
 } from './heartbeat.mjs';
 import { pruneSnapshots, resumeNotice, saveSnapshot } from './resume.mjs';
 import { WORK_TOOLS, cardDirections, noteDirection, publishDirections } from './continue.mjs';
@@ -728,7 +729,7 @@ export async function handleEvent(input = {}) {
         // `idle_prompt` a minute after a limit stop must not end the pause.
         clearPause(sessionId, { handoff: event === 'UserPromptSubmit' });
         // A limit that ends the turn as a plain Stop is a pause too (MACLEOD-845).
-        if (event === 'Stop') markLimit(sessionId, limitFromText(input.last_assistant_message));
+        if (event === 'Stop') markLimit(sessionId, limitFromText(input.last_assistant_message, Date.now(), { transcript: input.transcript_path }));
       }
     } catch { /* a mark left behind is read as fresh for ten minutes at most */ }
   }
@@ -1146,6 +1147,23 @@ export async function handleEvent(input = {}) {
     } catch { /* the trailer still names the bound ticket */ }
   }
   saveSession(state);
+
+  /*
+   * An agent that stopped at a usage limit while its session goes on
+   * (MACLEOD-920): which model, and when the limit resets, kept on this
+   * machine until then. The beat sends it; the service may tell the
+   * session to send the work again on another model. Never text.
+   */
+  if (event === 'SubagentStop' && agentKey && !input.reporter_tool) {
+    try {
+      const now = Date.now();
+      const limit = limitFromText(input.last_assistant_message, now, { transcript: input.agent_transcript_path });
+      if (limit) {
+        const block = agentBlock(state);
+        noteLimit(sessionId, limit, now, { agentId: block.id, name: block.name, key: state.binding?.key });
+      }
+    } catch { /* the agent reads ended, as before */ }
+  }
 
   // Agents that never sent a SubagentStop still count (MACLEOD-882): their
   // transcripts are read into their own states at the session's Stop.
