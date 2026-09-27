@@ -263,7 +263,7 @@ export function cardPayload(key, card, { workflow, config = {}, info = {}, at } 
     .map((name) => [name, source[name]]));
   if (Array.isArray(judged?.verdicts) && judged.verdicts.length) {
     payload.verdicts = judged.verdicts.slice(-20).map((one) => fields(one,
-      ['round', 'gate', 'verdict', 'at', 'by', 'summary', 'raised', 'fixed', 'open', 'notAdded']));
+      ['round', 'gate', 'verdict', 'at', 'by', 'summary', 'raised', 'fixed', 'open', 'notAdded', 'blocking', 'should']));
   }
   // The failure points those rounds raised: the checklist the next team works from.
   if (Array.isArray(judged?.points) && judged.points.length) {

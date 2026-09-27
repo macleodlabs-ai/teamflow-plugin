@@ -118,7 +118,7 @@ the board draws on the arrow.
 reviews, in a pull request if they want: the run's name, the keys in priority
 order, every edge with its reason, and the checks the run expects. It holds
 keys and reasons only. Never put a command in it; TeamFlow refuses any field
-but these four.
+but `name`, `keys`, `edges`, `waits` and `gates`.
 
 ```yaml
 # .teamflow/plans/backlog-sweep.yaml
@@ -137,7 +137,33 @@ edges:
 gates: [lint]
 ```
 
-JSON with the same four fields works too. The YAML is a small plain subset:
+An edge may carry a `rule` when "every ticket it waits on is done" is wrong:
+
+- `rule: one` — any one of the edges with this rule is enough. Use it when
+  two approaches are tried and either one unblocks the next ticket.
+- `rule: all_done` — the ticket starts when the other one ends, even if it
+  failed (it is `blocked`). Use it for clean-up that must run anyway.
+
+A ticket with a rule can start before its phase does, once its edges are met;
+`ready` offers it. Without a rule nothing changes. The command is the same:
+`teamflow workflow depends <KEY> --on <KEY> --rule one|all_done`.
+
+A ticket may also wait for something outside the run, with a deadline:
+
+```yaml
+waits:
+  - key: MACLEOD-541
+    for: pr_approved        # a person approves the pull request
+    deadline: 2026-10-01T17:00:00Z
+```
+
+or `teamflow workflow wait <KEY> --for pr_approved|deploy_window --deadline <iso>`.
+An approval shows in that person's Needs you on the board. A deploy window
+does not, because it is a time and needs nobody. The wait holds a kind and a
+time, never a command, and it ends when the ticket moves to another step, is
+done or is skipped (`--clear` ends it now).
+
+JSON with the same fields works too. The YAML is a small plain subset:
 lists with `- `, `key: value`, `[a, b]`, quotes and `#` comments. Anything
 fancier is refused with its line number.
 
@@ -202,6 +228,12 @@ on those. Nothing from a later phase starts early — that is what phases are
 for.
 
 For each ticket, in the order `ready` gives them:
+
+**Pick the model for the step.** Pass `model` on the `Agent` call: a small,
+fast model (`haiku`) for triage and scoping — reading tickets, sorting,
+finding edges — and a strong one (`opus`) for the audit, where a missed
+problem costs a rework round. The build takes the session's default. TeamFlow
+reports which model each agent ran, so the lead can see the choice.
 
 **Build.** Dispatch a team in its own git worktree. Its first command, before
 any edit, is `teamflow bind <KEY> --local`: a worktree is its own repository
@@ -365,8 +397,13 @@ Send the ticket back with the gate that failed, and say why:
 
 ```bash
 teamflow workflow ticket MACLEOD-538 --state rework --cycle audit \
+  --findings blocking=2,should=2 \
   --reason "Audit rejected: 2 blocking findings, 2 should fix"
 ```
+
+`--findings blocking=2,should=2` puts the counts on the card, so the board
+can sort the cards sent back by how much must be fixed. Counts only: give
+each problem with `--finding` as well if the next team needs the points.
 
 `ready` offers it again, and **this command is what puts the rejection on the
 board**. A test command that exits non-zero is reported by the hooks on their

@@ -36,7 +36,7 @@ import {
 } from './card.mjs';
 import { readChecks } from './checks.mjs';
 import {
-  changesNothing, dryRunLines, planChanges, readPlan, unlistedLine,
+  EDGE_RULES, RULE_WORDS, WAIT_KINDS, changesNothing, dryRunLines, planChanges, readPlan, unlistedLine,
 } from './planfile.mjs';
 
 // The plan's session block lives beside the card it is stamped on.
@@ -62,6 +62,14 @@ export const TICKET_STATES = ['waiting', 'running', 'done', 'blocked', 'skipped'
 // report, on purpose: the board draws the stage from what it observed,
 // and this is the run's own account of which gate the ticket is at.
 export const CYCLES = ['build', 'test', 'audit', 'status', 'deploy', 'verified', 'rework'];
+
+// How a link lets its ticket start, and what a ticket may wait for
+// (MACLEOD-885): planfile.mjs holds the lists, so a plan file and the
+// command agree.
+export { EDGE_RULES, RULE_WORDS, WAIT_KINDS };
+// The weights an audit counts its findings in (MACLEOD-885). Counts only.
+export const FINDING_WEIGHTS = ['blocking', 'should'];
+const FINDING_COUNT_MAX = 9999;
 
 const NAME_MAX = 80;
 
@@ -130,10 +138,15 @@ export const USAGE = `teamflow workflow — the pool of tickets a run works thro
       and reasons only, never a command. --dry-run is the plan dry run
       above, with the file applied; it writes nothing.
 
-  teamflow workflow depends <KEY> --on <KEY> [--reason <why>]
+  teamflow workflow depends <KEY> --on <KEY> [--reason <why>] [--rule one|all_done]
                             [--found planning|build] [--to <name>]
       One ticket waits on another. Re-levels the phases, because an edge
       a team found mid-build moves tickets between them.
+      --rule one: any one of the tickets it waits on with this rule is
+      enough ("either approach unblocks it"). --rule all_done: it starts
+      when the other ticket ends, even if that ticket failed ("clean-up
+      runs even after a failure"). Without --rule, every ticket it waits
+      on must be done. A ticket with a rule can start before its phase.
       With --branch <name>, the waiting ticket starts from that branch's
       commits: TeamFlow tells its agent to start once the branch is pushed.
 
@@ -152,6 +165,14 @@ export const USAGE = `teamflow workflow — the pool of tickets a run works thro
       that edge. A malformed entry, or a removal of an edge that is not
       there, refuses the batch.
 
+  teamflow workflow wait <KEY> --for pr_approved|deploy_window [--deadline <iso>] [--to <name>]
+  teamflow workflow wait <KEY> --clear [--to <name>]
+      The ticket waits for something outside the run: a person to approve
+      its pull request, or a deploy window. An approval shows in Needs you
+      on the board. A deploy window does not: it is a time, not a person.
+      The wait ends when the ticket moves to another step, is done or is
+      skipped. A wait holds a kind and a time only, never a command.
+
   teamflow workflow ready [--to <name>]
       What the current phase has open. This is what a run starts next.
 
@@ -167,6 +188,9 @@ export const USAGE = `teamflow workflow — the pool of tickets a run works thro
       never replace earlier ones.
       --findings is a short summary. With --state rework, it is a failed
       round. With another state and --cycle audit, it is a pass.
+      --findings blocking=2,should=1 gives counts instead: the problems
+      that must be fixed and the ones that should be. The card shows the
+      counts, so the board can sort by them. Counts only, never words.
       --finding is one problem the audit found. Give it once for each
       problem, with --state rework. Each one becomes a failure point on
       the card (F1, F2, ...). The next build, test and audit work from
@@ -348,10 +372,10 @@ const pointsWord = (n) => `${n} ${n === 1 ? 'point' : 'points'}`;
  * one for a new round. The same words said twice are one verdict.
  */
 function recordVerdict(ticket, {
-  entering, state, summaryText, findings = [], gate, by, at, rechecked = false,
+  entering, state, summaryText, findings = [], gate, by, at, rechecked = false, counts,
 }) {
   const failed = state === 'rework';
-  if (!failed && summaryText === undefined && !rechecked) return undefined;
+  if (!failed && summaryText === undefined && !rechecked && !counts) return undefined;
   if (!gate) return undefined;
   const verdict = failed ? 'fail' : 'pass';
   const summary = pointLine(summaryText, VERDICT_SUMMARY_MAX);
@@ -380,9 +404,10 @@ function recordVerdict(ticket, {
   // The same round, a second batch: appended, never a new round.
   if (failed && !entering && last && last.gate === gate && last.verdict === 'fail') {
     const ran = run(last.round);
-    if (!ran.raised.length && unchanged(ran) && (!summary || summary === (last.summary || ''))) return undefined;
+    if (!ran.raised.length && unchanged(ran) && (!summary || summary === (last.summary || ''))
+      && sameCounts(counts, last)) return undefined;
     ticket.points = ran.points;
-    const into = { ...last };
+    const into = { ...last, ...(counts || {}) };
     if (summary) into.summary = summary;
     if (ran.raised.length) into.raised = [...(last.raised || []), ...ran.raised];
     const fixed = [...new Set([...(last.fixed || []), ...fixedBy(ran)])];
@@ -392,7 +417,8 @@ function recordVerdict(ticket, {
     if (ran.notAdded) into.notAdded = (last.notAdded || 0) + ran.notAdded;
     ticket.verdicts = [...list.slice(0, -1), into];
     verdictNotes.set(ticket, `Added ${pointsWord(ran.raised.length)} to round ${last.round}.`
-      + (ran.fixed.length ? ` Marked ${pointsWord(ran.fixed.length)} fixed.` : ''));
+      + (ran.fixed.length ? ` Marked ${pointsWord(ran.fixed.length)} fixed.` : '')
+      + (counts ? ` Found ${countWordsOf(counts)}.` : ''));
     return into;
   }
 
@@ -400,7 +426,8 @@ function recordVerdict(ticket, {
     .reduce((most, one) => Math.max(most, Number(one.round) || 0), 0);
   const round = fails + 1;
   // A pass said twice is one pass.
-  if (!failed && last && last.gate === gate && last.verdict === 'pass' && (last.summary || '') === summary) {
+  if (!failed && last && last.gate === gate && last.verdict === 'pass' && (last.summary || '') === summary
+    && sameCounts(counts, last)) {
     const replay = run(last.round);
     if (!replay.raised.length && unchanged(replay)) return undefined;
   }
@@ -410,6 +437,7 @@ function recordVerdict(ticket, {
   const out = { gate, verdict, round, at };
   if (who(by)) out.by = who(by);
   if (summary) out.summary = summary;
+  if (counts) Object.assign(out, counts);
   if (ran.raised.length) out.raised = ran.raised;
   if (fixed.length) out.fixed = fixed;
   if (ran.open.length) out.open = ran.open;
@@ -421,8 +449,40 @@ function recordVerdict(ticket, {
     ? `${name} sent ${ticket.key} back for rework (round ${round}). Added ${pointsWord(ran.raised.length)}.`
       + (ran.fixed.length ? ` Marked ${pointsWord(ran.fixed.length)} fixed.` : '')
     : `${name} passed.${still ? ` ${still === 1 ? '1 point is' : `${still} points are`} still open.` : ''}`
-      + (ran.fixed.length ? ` Marked ${pointsWord(ran.fixed.length)} fixed.` : ''));
+      + (ran.fixed.length ? ` Marked ${pointsWord(ran.fixed.length)} fixed.` : '')
+      + (counts ? ` Found ${countWordsOf(counts)}.` : ''));
   return out;
+}
+
+/*
+ * An audit's findings as counts (MACLEOD-885): `--findings blocking=2,should=2`.
+ * Numbers only, so the board can sort cards sent back without reading any
+ * words, and so nothing from the findings leaves the machine but a count.
+ * Any other text is the summary it always was: undefined here.
+ */
+const COUNTS = new RegExp(`^\\s*(?:${FINDING_WEIGHTS.join('|')})\\s*=\\s*\\d{1,4}\\s*(?:,\\s*(?:${FINDING_WEIGHTS.join('|')})\\s*=\\s*\\d{1,4}\\s*)*$`);
+
+export function findingCounts(text) {
+  if (typeof text !== 'string' || !COUNTS.test(text)) return undefined;
+  const out = {};
+  for (const part of text.split(',')) {
+    const [weight, n] = part.split('=').map((one) => one.trim());
+    if (weight in out) throw new Error(`Give "${weight}" once in --findings.`);
+    out[weight] = Math.min(Number(n), FINDING_COUNT_MAX);
+  }
+  return out;
+}
+
+const WEIGHT_WORDS = { blocking: 'must fix', should: 'should fix' };
+
+/** "2 must fix, 1 should fix". */
+export function countWordsOf(counts = {}) {
+  return FINDING_WEIGHTS.filter((w) => counts[w] !== undefined)
+    .map((w) => `${counts[w]} ${WEIGHT_WORDS[w]}`).join(', ');
+}
+
+function sameCounts(counts, verdict) {
+  return !counts || FINDING_WEIGHTS.every((w) => counts[w] === undefined || counts[w] === verdict[w]);
 }
 
 /**
@@ -517,9 +577,14 @@ export function published(workflow) {
     name: workflow.name,
     status: workflow.status,
     tickets: (workflow.tickets || []).slice(0, CAPS.tickets).map(
-      (t) => pick(t, ['key', 'rank', 'phase', 'state', 'cycle', 'addedBy', 'updatedAt', 'note'])),
+      (t) => {
+        const out = pick(t, ['key', 'rank', 'phase', 'state', 'cycle', 'addedBy', 'updatedAt', 'note']);
+        // A typed wait (MACLEOD-885): a kind and two clocks, never a command.
+        if (t.wait?.for) out.wait = pick(t.wait, ['for', 'since', 'deadline']);
+        return out;
+      }),
     dependencies: (workflow.dependencies || []).slice(0, CAPS.dependencies).map(
-      (d) => pick(d, ['from', 'on', 'reason', 'found'])),
+      (d) => pick(d, ['from', 'on', 'reason', 'found', 'rule'])),
     phases: (workflow.phases || []).slice(0, CAPS.phases).map((phase) => ({
       ...pick(phase, ['n', 'state']),
       tickets: (phase.tickets || []).slice(0, CAPS.tickets).map(String),
@@ -712,7 +777,7 @@ export function add(workflow, key) {
  * something on the way past.
  */
 export function move(workflow, key, {
-  state, cycle, note, findings, finding = [], done = [], reopen = [], by, rechecked = false,
+  state, cycle, note, findings, finding = [], done = [], reopen = [], by, rechecked = false, counts,
 } = {}) {
   const ticket = (workflow.tickets || []).find((t) => t.key === String(key || '').trim());
   if (!ticket) throw new Error(`${key} is not in "${workflow.name}"`);
@@ -739,8 +804,12 @@ export function move(workflow, key, {
     if (!CYCLES.includes(cycle)) {
       throw new Error(`A cycle step is one of ${CYCLES.join(', ')}`);
     }
+    // A plan wait belongs to the step it was set at (MACLEOD-885): moving
+    // on means it is over, so it never stays in somebody's Needs you.
+    if (ticket.cycle !== cycle) delete ticket.wait;
     ticket.cycle = cycle;
   }
+  if (state === 'done' || state === 'skipped') delete ticket.wait;
   // Only what `--note` passed. An empty note clears the old one.
   if (note !== undefined) {
     const line = noteLine(note);
@@ -764,6 +833,7 @@ export function move(workflow, key, {
     by,
     at,
     rechecked,
+    counts,
   });
   /*
    * Naming a gate again restarts it (MACLEOD-639). A gate that was closed
@@ -1246,11 +1316,12 @@ export function closeActors(key, config = {}, at = now()) {
 function line(ticket, workflow) {
   const waits = (workflow.dependencies || [])
     .filter((d) => d.from === ticket.key)
-    .map((d) => d.on);
+    .map((d) => (RULE_WORDS[d.rule] ? `${d.on} (${RULE_WORDS[d.rule]})` : d.on));
   const where = ticket.cycle ? `${ticket.state}/${ticket.cycle}` : ticket.state;
   const on = waits.length ? `  waits on ${waits.join(', ')}` : '';
   const how = ticket.addedBy === 'dispatch' ? '  (dispatched)' : '';
-  return `    ${String(ticket.rank).padStart(3)}. ${ticket.key}  ${where}${on}${how}`;
+  const held = ticket.wait?.for ? `  waits for ${ticket.wait.for === 'pr_approved' ? 'an approval' : 'the deploy window'}` : '';
+  return `    ${String(ticket.rank).padStart(3)}. ${ticket.key}  ${where}${on}${held}${how}`;
 }
 
 export function render(workflow, state) {
@@ -1665,12 +1736,26 @@ export async function main(args, {
       branch: flag(rest, 'branch'),
       reason: flag(rest, 'reason'),
       found: flag(rest, 'found') || 'planning',
+      rule: flag(rest, 'rule'),
     });
     save(state, config);
     await publish(target, config);
-    print(`${edge.from} waits on ${edge.on}${edge.reason ? ` — ${edge.reason}` : ''}.`);
+    const how = RULE_WORDS[edge.rule] ? ` (${RULE_WORDS[edge.rule]})` : '';
+    print(`${edge.from} waits on ${edge.on}${how}${edge.reason ? ` — ${edge.reason}` : ''}.`);
     print(`"${target.name}" is now ${target.phases.length} phase`
       + `${target.phases.length === 1 ? '' : 's'}.`);
+    return 0;
+  }
+
+  if (sub === 'wait') {
+    const key = rest.filter((a) => !a.startsWith('--'))[0];
+    const wait = setWait(target, key, {
+      kind: flag(rest, 'for'), deadline: flag(rest, 'deadline'), clear: rest.includes('--clear'),
+    });
+    save(state, config);
+    await publish(target, config);
+    if (!wait) print(`${key} no longer waits.`);
+    else print(`${waitLine({ key, wait })}${waitNeedsPerson(wait) ? ' It shows in Needs you on the board.' : ''}`);
     return 0;
   }
 
@@ -1700,9 +1785,12 @@ export async function main(args, {
 
   if (sub === 'ticket') {
     const key = rest.filter((a) => !a.startsWith('--'))[0];
+    // `--findings blocking=2,should=2` is counts (MACLEOD-885); other text is the summary.
+    const counts = findingCounts(flag(rest, 'findings'));
     const ticket = move(target, key, {
       state: flag(rest, 'state'), cycle: flag(rest, 'cycle'), note: flag(rest, 'note'),
-      findings: flag(rest, 'findings'),
+      findings: counts ? undefined : flag(rest, 'findings'),
+      counts,
       finding: [...flags(rest, 'finding'), ...findingsFile(flag(rest, 'findings-file'))],
       done: flags(rest, 'done'),
       reopen: flags(rest, 'reopen'),
@@ -1738,7 +1826,11 @@ export async function main(args, {
     const { healRun, settle } = await import('./selfheal.mjs');
     const healed = healRun(target, { now: at, deadlines, policy: policyFor(config) });
     for (const line of healed.lines) print(`TeamFlow: ${line}`);
-    const said = gateReports(target, ticket, { reason: flag(rest, 'reason'), at, deadlines });
+    const said = gateReports(target, ticket, {
+      reason: flag(rest, 'reason') || (counts && ticket.state === 'rework' ? `Found ${countWordsOf(counts)}.` : undefined),
+      at,
+      deadlines,
+    });
     /*
      * And every OTHER ticket in the pool (MACLEOD-593). This is the
      * revisiting: a gate chip is only ever as true as the last write,
@@ -1940,17 +2032,22 @@ export default main;
  */
 export function levelPhases(tickets = [], dependencies = []) {
   const pool = new Set(tickets.map((t) => t.key));
-  const waits = new Map(tickets.map((t) => [t.key, new Set()]));
+  const waits = new Map(tickets.map((t) => [t.key, { all: new Set(), one: new Set() }]));
   for (const edge of dependencies) {
     if (pool.has(edge.from) && pool.has(edge.on) && edge.from !== edge.on) {
-      waits.get(edge.from).add(edge.on);
+      // A `one` link needs any one of its tickets placed first (MACLEOD-885).
+      waits.get(edge.from)[edge.rule === 'one' ? 'one' : 'all'].add(edge.on);
     }
   }
   const placed = new Set();
   const phases = [];
   let left = tickets.map((t) => t.key);
+  const isPlaced = (on) => placed.has(on);
   while (left.length) {
-    const now = left.filter((key) => [...waits.get(key)].every((on) => placed.has(on)));
+    const now = left.filter((key) => {
+      const { all, one } = waits.get(key);
+      return [...all].every(isPlaced) && (!one.size || [...one].some(isPlaced));
+    });
     if (!now.length) {
       phases.push({ n: phases.length + 1, state: 'blocked', tickets: left.slice() });
       break;
@@ -2008,10 +2105,84 @@ export function ready(workflow) {
   const byKey = new Map(tickets.map((t) => [t.key, t]));
   const phase = (workflow.phases || []).find((p) => phaseState(p, tickets) !== 'done');
   if (!phase) return { phase: null, tickets: [] };
-  const open = phase.tickets
-    .map((k) => byKey.get(k))
-    .filter((t) => t && (t.state === 'waiting' || t.state === 'rework'));
-  return { phase, tickets: open };
+  const waiting = (t) => t && (t.state === 'waiting' || t.state === 'rework');
+  const open = phase.tickets.map((k) => byKey.get(k)).filter(waiting);
+  /*
+   * A ticket whose links carry a rule may start before its phase does
+   * (MACLEOD-885): "either approach unblocks C" starts C when one approach
+   * lands, and a clean-up starts when the ticket it follows has ended, even
+   * if that ticket failed and holds its own phase open. Without a rule,
+   * nothing later starts early.
+   */
+  const early = tickets.filter((t) => waiting(t) && !phase.tickets.includes(t.key)
+    && linksMet(workflow, t.key, { ruledOnly: true }));
+  return { phase, tickets: [...open, ...early] };
+}
+
+// A link is met when the ticket it waits on is done or skipped; an
+// `all_done` link also when that ticket is blocked, which is how a run
+// says a ticket failed and was given up on.
+const FINISHED = new Set(['done', 'skipped']);
+const ENDED = new Set(['done', 'skipped', 'blocked']);
+
+/**
+ * Whether a ticket's links in the pool let it start, by their rules
+ * (MACLEOD-885). Every plain and `all_done` link is met, and at least one
+ * `one` link when it has any. With `ruledOnly`, a ticket with no rule on
+ * any link answers false: its phase decides when it starts.
+ */
+export function linksMet(workflow, key, { ruledOnly = false } = {}) {
+  const byKey = new Map((workflow.tickets || []).map((t) => [t.key, t]));
+  const links = (workflow.dependencies || []).filter((d) => d.from === key && byKey.has(d.on) && d.on !== key);
+  if (ruledOnly && !links.some((d) => d.rule === 'one' || d.rule === 'all_done')) return false;
+  const met = (d) => (d.rule === 'all_done' ? ENDED : FINISHED).has(byKey.get(d.on)?.state);
+  const either = links.filter((d) => d.rule === 'one');
+  return links.filter((d) => d.rule !== 'one').every(met) && (!either.length || either.some(met));
+}
+
+/**
+ * A typed wait on one ticket (MACLEOD-885, after Archon's durable wait):
+ * `pr_approved` waits for a person to approve the pull request, and
+ * `deploy_window` waits for a time. A kind and a deadline, never a
+ * command: nothing here runs anything when the wait ends. Moving the
+ * ticket to another step, done or skipped ends it; `clear` ends it now.
+ */
+export function setWait(workflow, key, { kind, deadline, clear = false, at = new Date().toISOString() } = {}) {
+  const ticket = (workflow.tickets || []).find((t) => t.key === String(key || '').trim());
+  if (!ticket) throw new Error(`${key} is not in "${workflow.name}"`);
+  if (clear) {
+    delete ticket.wait;
+    ticket.updatedAt = at;
+    return undefined;
+  }
+  if (!WAIT_KINDS.includes(kind)) throw new Error(`--for must be ${WAIT_KINDS.join(' or ')}`);
+  const wait = { for: kind, since: at };
+  if (deadline !== undefined) {
+    const when = Date.parse(deadline);
+    if (!/^\d{4}-\d{2}-\d{2}/.test(String(deadline)) || Number.isNaN(when)) {
+      throw new Error('--deadline must be a date and time, such as 2026-10-01T17:00:00Z');
+    }
+    wait.deadline = new Date(when).toISOString();
+  }
+  ticket.wait = wait;
+  ticket.updatedAt = at;
+  return wait;
+}
+
+/** Whether a wait needs a person (MACLEOD-885). Only an approval does. */
+export function waitNeedsPerson(wait) {
+  return wait?.for === 'pr_approved';
+}
+
+/** The wait in plain words, with its deadline. Never a command. */
+export function waitLine({ key, wait }, now = Date.now()) {
+  if (!wait?.for) return '';
+  const when = wait.deadline ? wait.deadline.slice(0, 16).replace('T', ' ') : '';
+  const late = wait.deadline && Date.parse(wait.deadline) < now ? ' The deadline has passed.' : '';
+  if (wait.for === 'pr_approved') {
+    return `${key} waits for a person to approve its pull request${when ? `, by ${when} UTC` : ''}.${late}`;
+  }
+  return `${key} waits for the deploy window${when ? `, by ${when} UTC` : ''}.${late}`;
 }
 
 /** Put the selected tickets in the pool, in the order they were given. */
@@ -2044,13 +2215,16 @@ export const BRANCH = /^(?![-.\/])(?!.*\.\.)(?!.*\/\/)(?!.*\.lock$)[A-Za-z0-9._\
  * left as it is: widening the service's allowlist before the ad hoc subject
  * exists would accept ids nothing can draw.
  */
-function recordEdge(workflow, from, on, { reason, found = 'planning', branch } = {}) {
+function recordEdge(workflow, from, on, { reason, found = 'planning', branch, rule } = {}) {
   const a = String(from || '').trim();
   const b = String(on || '').trim();
   if (!a || !b) throw new Error('Usage: teamflow workflow depends <KEY> --on <KEY>');
   if (a === b) throw new Error(`${a} cannot wait on itself`);
   if (!['planning', 'build'].includes(found)) {
     throw new Error('--found must be planning or build');
+  }
+  if (rule !== undefined && !EDGE_RULES.includes(rule)) {
+    throw new Error(`--rule must be ${EDGE_RULES.join(', ')}`);
   }
   const edges = workflow.dependencies || [];
   const existing = edges.find((d) => d.from === a && d.on === b);
@@ -2063,6 +2237,9 @@ function recordEdge(workflow, from, on, { reason, found = 'planning', branch } =
     if (!BRANCH.test(String(branch))) throw new Error('--branch must be a plain branch name, such as lane-theme');
     edge.branch = String(branch);
   }
+  // `all` is the default and is never written, so an old reader sees no change.
+  if (rule === 'all') delete edge.rule;
+  else if (rule !== undefined) edge.rule = rule;
   edge.found = found;
   if (!existing) edges.push(edge);
   workflow.dependencies = edges;
@@ -2159,7 +2336,10 @@ export function dependsBatch(workflow, entries, { found } = {}) {
     if (!['planning', 'build'].includes(where)) {
       throw new Error(`Edge ${index + 1}: found must be planning or build.`);
     }
-    return { from, on, reason: entry.reason, found: where, remove: entry.remove === true };
+    if (entry.rule !== undefined && !EDGE_RULES.includes(entry.rule)) {
+      throw new Error(`Edge ${index + 1}: rule must be ${EDGE_RULES.join(', ')}.`);
+    }
+    return { from, on, reason: entry.reason, found: where, rule: entry.rule, remove: entry.remove === true };
   });
   // A removal must name an edge that is there when its turn comes, in
   // the order given. Checked before anything is written.
@@ -2198,6 +2378,7 @@ export function applyPlan(workflow, plan, changes) {
   workflow.dependencies = workflow.dependencies || [];
   if (changes.keys.length) seed(workflow, changes.keys);
   if (changes.edges.length) dependsBatch(workflow, changes.edges);
+  for (const wait of changes.waits || []) setWait(workflow, wait.key, { kind: wait.for, deadline: wait.deadline });
   if (changes.gates.length) workflow.gates = [...(workflow.gates || []), ...changes.gates];
   if (!changes.keys.length && !changes.edges.length) workflow.updatedAt = now();
   return workflow;
@@ -2206,7 +2387,8 @@ export function applyPlan(workflow, plan, changes) {
 /** "2 tickets, 1 link and 1 check", or "nothing new". */
 function countWords(changes) {
   const parts = [
-    [changes.keys.length, 'ticket'], [changes.edges.length, 'link'], [changes.gates.length, 'check'],
+    [changes.keys.length, 'ticket'], [changes.edges.length, 'link'], [(changes.waits || []).length, 'wait'],
+    [changes.gates.length, 'check'],
   ].filter(([n]) => n).map(([n, word]) => `${n} ${word}${n === 1 ? '' : 's'}`);
   if (!parts.length) return 'nothing new';
   return parts.length === 1 ? parts[0] : `${parts.slice(0, -1).join(', ')} and ${parts[parts.length - 1]}`;

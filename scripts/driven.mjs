@@ -47,14 +47,17 @@ function branchOf(cwd) {
 /**
  * Which tool drives this session, or undefined for a person's own.
  *
- * - `sdk`: CLAUDE_CODE_ENTRYPOINT starts with "sdk" (Agent SDK, `claude -p`).
+ * - `sdk`: CLAUDE_CODE_ENTRYPOINT starts with "sdk" (Agent SDK, `claude -p`),
+ *   or CLAUDE_AGENT_SDK_VERSION is set. The SDK keeps an inherited
+ *   entry point, so a program started from a person's own session reads
+ *   "cli"; the version is the SDK's own mark on every run (MACLEOD-910).
  * - `github-action`: the Claude Code GitHub Action.
  * - `archon`: a cwd under ~/.archon/, or a current branch `archon/*`.
  */
 export function drivenBy(payload = {}, env = process.env, cwd = undefined) {
   try {
     const entry = String(env?.CLAUDE_CODE_ENTRYPOINT || '');
-    if (entry.startsWith('sdk')) return 'sdk';
+    if (entry.startsWith('sdk') || env?.CLAUDE_AGENT_SDK_VERSION) return 'sdk';
     if (entry === ACTION_ENTRYPOINT) return 'github-action';
     const where = cwd || payload?.cwd;
     if (!where) return undefined;

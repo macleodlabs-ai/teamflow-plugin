@@ -3,6 +3,23 @@
 What changed in each published version of the TeamFlow plugin, newest first.
 Only what a person using it would notice.
 
+## 0.3.53
+
+- **Quiet in automated runs.** In a session a script or the Agent SDK
+  drives, TeamFlow prints nothing into it. It also stops at once when the
+  run ends.
+- **Reading is not testing.** A command that only reads, such as `grep` or
+  `ls`, no longer counts as a test run.
+- **Every agent's cost is counted.** An agent that ends without its stop
+  signal is still counted, once. Each agent names its model.
+- **Counted findings.** `teamflow workflow ticket KEY --state rework
+  --findings blocking=2,should=1` puts the counts on the card.
+- **New link rules.** `teamflow workflow depends A --on B --rule one` lets
+  any one link unblock a card. `--rule all_done` starts it even after a
+  failure.
+- **Plan waits.** `teamflow workflow wait KEY --for pr_approved` shows who
+  must approve. A wait for a deploy time never asks anybody.
+
 ## 0.3.52
 
 - **TeamFlow does the reminding.** When work is sent back or stops, TeamFlow

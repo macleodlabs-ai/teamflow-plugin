@@ -223,8 +223,15 @@ export function waitOf(actor, runs = [], { main, subagent = false, now = Date.no
   const pending = [];
   const until = [];
   let branchSha;
-  for (const edge of (run?.dependencies || []).filter((d) => d.from === key && keyOf(d.on))) {
-    const done = ['done', 'skipped'].includes(byKey.get(edge.on)?.state);
+  const links = (run?.dependencies || []).filter((d) => d.from === key && keyOf(d.on));
+  // A link's rule (MACLEOD-885): `all_done` is met once the other ticket
+  // ended, even blocked; one met `one` link is enough for all of them.
+  const met = (d) => (d.rule === 'all_done' ? ['done', 'skipped', 'blocked'] : ['done', 'skipped'])
+    .includes(byKey.get(d.on)?.state);
+  const oneMet = links.some((d) => d.rule === 'one' && met(d));
+  for (const edge of links) {
+    const done = met(edge);
+    if (!done && edge.rule === 'one' && oneMet) continue;
     if (edge.branch && BRANCH.test(edge.branch)) {
       const sha = remoteHead(actor.cwd || main?.cwd, edge.branch);
       if (sha) {

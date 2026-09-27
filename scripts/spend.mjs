@@ -134,8 +134,44 @@ export function actorFile(event, input = {}, sessionId = undefined) {
  * Kept on the actor's own state file, never sent whole.
  */
 export function tally(state, event, input = {}) {
+  return tallyFile(state, actorFile(event, input, state?.sessionId || input.session_id));
+}
+
+/**
+ * Agents whose `SubagentStop` never came (MACLEOD-882): a killed agent, or
+ * one still running when its session ends. Called on the session's own
+ * `Stop` and at `SessionEnd`. Each agent's transcript is read into the
+ * agent's own state, with the agent's own offsets, so its `SubagentStop`
+ * later reads only what is new: nothing is counted twice. An agent that
+ * has ended was counted by its own stop and is left alone. Local files
+ * only; the count goes out with the agent's next report, or with its end.
+ * Returns the agents whose state now holds more.
+ */
+export function sweepAgents(sessionId, transcriptPath, {
+  actors = core.sessionActors(sessionId), save = core.saveSession, fresh = (a) => core.readJson(core.sessionPath(a.sessionId, a.agentKey)),
+} = {}) {
+  const files = transcriptFiles(sessionId, transcriptPath);
+  const counted = [];
+  for (const actor of actors) {
+    if (!actor?.agentKey || actor.ended || !actor.binding?.key) continue;
+    const id = String(actor.agent?.id || actor.agentKey).slice(0, 80);
+    const file = files.find((f) => f.agent === id && f.agent !== 'main')?.file;
+    if (!file) continue;
+    const before = JSON.stringify(actor.spend || {});
+    tallyFile(actor, file);
+    if (JSON.stringify(actor.spend || {}) === before) continue;
+    // The agent's own hook may have written since: keep what it wrote,
+    // add only the count, and leave an agent that has just ended to it.
+    const now = fresh(actor) || actor;
+    if (now.ended) continue;
+    save({ ...now, spend: actor.spend });
+    counted.push(actor);
+  }
+  return counted;
+}
+
+function tallyFile(state, file) {
   const key = state?.binding?.key;
-  const file = actorFile(event, input, state?.sessionId || input.session_id);
   if (!key || !file) return state?.spend;
   const spend = (state.spend ||= { read: {}, seen: [], keys: {} });
   const mark = core.digest(file);

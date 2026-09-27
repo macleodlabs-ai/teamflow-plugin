@@ -529,6 +529,8 @@ export function agentRow(actor) {
   if (STATUSES.has(actor.status)) row.status = actor.status;
   const at = isoOf(actor.updatedAt);
   if (at) row.lastEventAt = at;
+  // The agent's own model (MACLEOD-882), once its transcript was read.
+  if (MODEL_ID.test(String(actor.spend?.model || ''))) row.model = actor.spend.model;
   return row;
 }
 
@@ -581,6 +583,19 @@ async function sendLedger(options) {
 
 const pause = (ms) => new Promise((resolve) => { setTimeout(resolve, ms); });
 
+// A poll's wait that ends early once the session has gone (MACLEOD-910).
+// An Agent SDK program runs one short session per query, and a heartbeat
+// that slept out its full poll stayed up to five seconds after each one.
+// One kill(pid, 0) and one stat every quarter second.
+const WAKE_MS = 250;
+async function watchfulPause(ms, over) {
+  const end = Date.now() + ms;
+  while (Date.now() < end) {
+    await pause(Math.min(WAKE_MS, end - Date.now()));
+    if (over()) return;
+  }
+}
+
 /**
  * The loop. Beats at once, then every `beatMs`; looks at the session and
  * the stop mark every `pollMs`. Returns why it stopped:
@@ -591,7 +606,7 @@ const pause = (ms) => new Promise((resolve) => { setTimeout(resolve, ms); });
  */
 export async function runHeartbeat({
   sessionId, watchPid, cwd = process.cwd(), beatMs = BEAT_MS, pollMs = POLL_MS,
-  maxLifeMs = MAX_LIFE_MS, now = Date.now, sleep = pause, alive = isAlive,
+  maxLifeMs = MAX_LIFE_MS, now = Date.now, sleep = undefined, alive = isAlive,
   send = core.sendHeartbeat, self = process.pid, continues, env = process.env,
   deliver = deliverRound, notify = notifyDesktop, inventory = sendLedger,
 }) {
@@ -639,7 +654,8 @@ export async function runHeartbeat({
       next = now() + beatMs;
     }
     try { await checkBack(sessionId, { now: now(), deliver, notify, cwd }); } catch { /* fails open */ }
-    await sleep(pollMs);
+    if (sleep) await sleep(pollMs);
+    else await watchfulPause(pollMs, () => !alive(watchPid) || fs.existsSync(endMarkPath(sessionId)));
   }
 }
 

@@ -924,7 +924,8 @@ var SEVERITY_OF = {
   work_after_done: "note",
   teamflow_stopped: "rework",
   asks_you: "blocked",
-  for_you: "blocked"
+  for_you: "blocked",
+  plan_wait: "blocked"
 };
 function severityRank(rule) {
   return SEVERITY.indexOf(SEVERITY_OF[rule]);
@@ -1023,6 +1024,11 @@ function rowsFor(card, ctx) {
     const from = first.source === "plan" && first.reason ? ` \xB7 from the plan: ${first.reason}` : "";
     out.push(row("blocked", age, `${card.key} waits on ${first.on}${more}${from} \xB7 ${owner}`, "open_tracker"));
   }
+  const wait = card.run?.tickets.find((t) => t.key === card.key)?.wait;
+  if (wait?.for === "pr_approved") {
+    const due = wait.deadline ? ` by ${clockLabel(wait.deadline, now, ctx.timeZone)}` : "";
+    out.push(row("plan_wait", Math.max(0, now - time3(wait.since)), `${card.key} waits for a person to approve its pull request${due} \xB7 ${owner}${plan}`, "open_card"));
+  }
   const silentFor = Math.max(0, now - time3(card.ticket.updatedAt));
   const column = card.gate?.label ?? STAGE_LABELS[card.ticket.stage];
   const asks = card.ticket.status === "waiting" && card.ticket.waitingOn === "human" ? card.ticket.asks : void 0;
@@ -1062,13 +1068,13 @@ function rowsFor(card, ctx) {
     out.push(row("audit_no_review", silentFor, `${card.key} passed its audit and the code is pushed. Nobody has reviewed it for ${ageLabel(silentFor)} \xB7 ${owner}`, "open_card"));
   }
   const frozen = (card.ticket.attention ?? []).some((mark) => mark.kind === "autonomy_off");
-  return autonomyRows(card, out, row, now).map((held) => followUpOf(frozen ? { ...held, frozen } : held, card, now));
+  return autonomyRows(card, out, row, now).map((held) => followUpOf(frozen ? { ...held, frozen } : held, card, now, ctx.carryOn));
 }
 var NEED_WORDS = { check: "a check", decision: "a decision", approval: "an approval" };
 function needRows(cards, ctx) {
   return (ctx.needs ?? []).filter((need) => need.status === "open").map((need) => {
     const card = cards.get(need.key);
-    const asker = need.by.split("@")[0] || "Someone";
+    const asker = need.by === "teamflow" ? "TeamFlow" : need.by.split("@")[0] || "Someone";
     return {
       key: need.key,
       rule: "for_you",
@@ -1095,30 +1101,63 @@ var OLDER_AFTER_MS = 48 * 60 * 6e4;
 var PASSIVE = /* @__PURE__ */ new Set(["idle", "unfinished", "agent_offline", "audit_no_review", "blocked", "mutual"]);
 var AUTOMATIC = /* @__PURE__ */ new Set(["rework", "delayed", "silent", "unfinished", "agent_crashed", "agent_hung", "agent_offline"]);
 var STOPPED_WORK = /* @__PURE__ */ new Set(["silent", "unfinished", "agent_crashed", "agent_hung", "agent_offline"]);
-var HUMAN_INPUT = /* @__PURE__ */ new Set(["asks_you", "for_you", "audit_no_review", "teamflow_stopped"]);
+var HUMAN_INPUT = /* @__PURE__ */ new Set(["asks_you", "for_you", "audit_no_review", "teamflow_stopped", "plan_wait"]);
 var CARRY_ON_TRIES = 2;
 var PARK_AFTER_MS = 48 * 60 * 6e4;
+var CARRY_ON_DEFAULTS = { enabled: true, tries: CARRY_ON_TRIES, parkHours: PARK_AFTER_MS / 36e5 };
+var CARRY_ON_CAUSES = /* @__PURE__ */ new Set(["rework", "silent", "unfinished"]);
+var RULE_OFF_WORDS = "TeamFlow leaves this alone: the rule is off.";
+function asksAgent(auto, carryOn = CARRY_ON_DEFAULTS) {
+  return auto?.state === "stopped" && !auto.asked && Boolean(auto.agentAsks || auto.limited) && carryOn.enabled && auto.criticality !== "critical";
+}
+function agentAskWords(auto) {
+  const asks = auto?.agentAsks;
+  return asks ? `TeamFlow is handling: asked the agent to try again (${asks.count} of ${asks.of}).` : "TeamFlow is handling: it will ask the agent to try again later.";
+}
 var FOLLOW_KINDS = /* @__PURE__ */ new Set(["fix", "bump", "rerun_gate", "resume_plan", "skip_gate"]);
 var followable = (entry) => FOLLOW_KINDS.has(entry.kind);
 var parkedWords = (tries) => `No session took up this work after ${tries} asks from TeamFlow. TeamFlow put it aside.`;
-function needsInput(row, card) {
-  if (row.frozen || HUMAN_INPUT.has(row.cause)) return true;
+function needsInput(row, card, carryOn = CARRY_ON_DEFAULTS) {
+  const auto = card?.ticket.autonomy;
+  const agent = asksAgent(auto, carryOn);
+  if (row.frozen) return true;
+  if (HUMAN_INPUT.has(row.cause)) return !(row.cause === "teamflow_stopped" && agent);
   if (row.cause === "idle" && card?.waitingOn === "review") return true;
-  return card?.ticket.autonomy?.state === "stopped" || card?.ticket.policy?.criticality === "critical";
+  return auto?.state === "stopped" && !auto.asked && !agent || card?.ticket.policy?.criticality === "critical";
 }
-function followUpOf(row, card, now) {
+function followUpOf(row, card, now, carryOn = CARRY_ON_DEFAULTS) {
   const began = now - row.ageMs;
   const queued = (card.ticket.actionQueue ?? []).filter((entry) => followable(entry) && entry.status !== "not_needed" && time3(entry.at) >= began - 6e4);
   const last = queued[queued.length - 1];
-  const person = needsInput(row, card);
+  const person = needsInput(row, card, carryOn);
+  const asking = !person && asksAgent(card.ticket.autonomy, carryOn) ? agentAskWords(card.ticket.autonomy) : void 0;
   const quiet = row.tier === "need" && !card.run && (PASSIVE.has(row.cause) || !person && STOPPED_WORK.has(row.cause)) && row.ageMs > OLDER_AFTER_MS;
   const base = last ? withFollowUp(row, last, card, now) : row;
-  if (base.handled) return base;
+  if (base.handled) return asking ? { ...base, handling: asking } : base;
   if (quiet) return { ...base, quiet };
   if (person || row.tier !== "need") return base;
+  if (!carryOn.enabled && CARRY_ON_CAUSES.has(row.cause)) return { ...base, tier: "note", decide: RULE_OFF_WORDS };
+  if (asking) return { ...base, handled: true, handling: asking };
   const tries = queued.filter((entry) => entry.by === "teamflow").length;
-  const aside = AUTOMATIC.has(row.cause) && tries >= CARRY_ON_TRIES && row.ageMs > PARK_AFTER_MS && !card.flags.live;
-  return aside ? { ...base, quiet: true, decide: parkedWords(tries) } : { ...base, handled: true };
+  const aside = AUTOMATIC.has(row.cause) && tries >= carryOn.tries && row.ageMs > carryOn.parkHours * 36e5 && !card.flags.live;
+  if (aside) return { ...base, quiet: true, decide: parkedWords(tries) };
+  const waiting = waitingOf(row, card);
+  return waiting ? { ...base, handled: true, waiting } : { ...base, handled: true };
+}
+function waitingOf(row, card) {
+  const asked = card.ticket.autonomy?.state === "stopped" ? card.ticket.autonomy.asked : void 0;
+  if (asked) return `Waiting on ${asked.name ?? "a person"} to decide.`;
+  if (row.cause === "mutual") {
+    const other = card.openEdges.find((edge) => edge.kind === "mutual")?.on ?? "another card";
+    return `Waiting on ${other}, which waits on this card.`;
+  }
+  if (row.cause === "blocked") {
+    const open = card.openEdges.filter((edge) => edge.kind !== "mutual");
+    return `Waiting on ${open[0]?.on ?? "another card"}${open.length > 1 ? ` and ${open.length - 1} more` : ""}.`;
+  }
+  if (row.cause === "idle") return `Waiting on ${waitingWords(card.waitingOn)}.`;
+  if (card.ticket.status === "blocked") return "Waiting: the agent said it is blocked.";
+  return void 0;
 }
 function withFollowUp(row, last, card, now) {
   const served = last.status !== "pending" && last.status !== "expired";
@@ -1141,7 +1180,7 @@ function autonomyRows(card, out, row, now) {
   const auto = card.ticket.autonomy;
   if (!auto) return out;
   const off = (card.ticket.attention ?? []).some((mark) => mark.kind === "autonomy_off");
-  if (auto.state === "stopped" && !out.length) {
+  if (auto.state === "stopped" && !out.length && !auto.asked) {
     return [row("teamflow_stopped", Math.max(0, now - time3(auto.at)), `${card.key} \xB7 TeamFlow stopped \xB7 ${auto.reason ? plainer(auto.reason) : "a person decides next"} \xB7 ${card.laneLabel}`, "send_fix")];
   }
   const onItsWay = (card.ticket.actionQueue ?? []).some((row2) => row2.id === auto.action?.id && (row2.status === "pending" || row2.status === "served"));
@@ -1451,8 +1490,26 @@ function edgesOf(ticket, all, workflows, planDone) {
     if (blocks) out.push({ from: ticket.jiraKey, on: other.jiraKey, kind: "blocks", source: "tracker", ...resolve(other.jiraKey) });
   }
   for (const run of workflows) {
-    for (const dep of run.dependencies ?? []) {
-      if (dep.from === ticket.jiraKey) out.push({ from: ticket.jiraKey, on: dep.on, kind: "plan", source: "plan", reason: dep.reason, ...resolve(dep.on) });
+    const mine = (run.dependencies ?? []).filter((dep) => dep.from === ticket.jiraKey);
+    if (!mine.length) continue;
+    const states = new Map((run.tickets ?? []).map((t) => [t.key, t.state]));
+    const planned = (dep) => {
+      const got = resolve(dep.on);
+      return dep.rule === "all_done" && states.get(dep.on) === "blocked" ? { ...got, resolution: "satisfied" } : got;
+    };
+    const oneMet = mine.some((dep) => dep.rule === "one" && planned(dep).resolution === "satisfied");
+    for (const dep of mine) {
+      const got = planned(dep);
+      out.push({
+        from: ticket.jiraKey,
+        on: dep.on,
+        kind: "plan",
+        source: "plan",
+        reason: dep.reason,
+        ...dep.rule ? { rule: dep.rule } : {},
+        ...got,
+        ...dep.rule === "one" && oneMet ? { resolution: "satisfied" } : {}
+      });
     }
   }
   const seen = /* @__PURE__ */ new Set();
@@ -1574,7 +1631,7 @@ function accountingOf(input) {
     }
   }
   const marks = [...input.marks ?? [], ...tickets.flatMap((ticket) => ticket.attention ?? [])];
-  const rows = attentionRows(cards, { now, marks, members, timeZone: input.timeZone, needs: input.needs });
+  const rows = attentionRows(cards, { now, marks, members, timeZone: input.timeZone, needs: input.needs, carryOn: input.carryOn });
   for (const row of rows) cards.get(row.key)?.attention.push(row);
   const keySet = (flag) => new Set([...cards.values()].filter((c) => c.flags[flag]).map((c) => c.key));
   const keys = {

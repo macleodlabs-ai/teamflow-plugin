@@ -346,6 +346,7 @@ export function withAgentIdentity(event, input, state, sessionId, agentKey, laun
         name,
         task: launch?.task || state.agent?.task,
         type: type || launch?.type || state.agent?.type,
+        ...((launch?.model || state.agent?.model) ? { model: launch?.model || state.agent.model } : {}),
         parent: sessionId,
         ...((launch?.launchedBy || state.agent?.parentAgent)
           ? { parentAgent: launch?.launchedBy || state.agent?.parentAgent } : {}),
@@ -850,6 +851,14 @@ export async function handleEvent(input = {}) {
     // `running` is an agent the board counts forever. Still local and
     // still a handful of small writes, so the budget holds.
     const at = new Date().toISOString();
+    // Agents with no SubagentStop, counted before they are ended here, so
+    // their pending end carries what they used (MACLEOD-882). Local reads.
+    if (!input.reporter_tool) {
+      try {
+        const { sweepAgents } = await import('./spend.mjs');
+        sweepAgents(sessionId, input.transcript_path);
+      } catch { /* the agents' ends go out without their spend */ }
+    }
     const ending = sessionActors(sessionId).filter((one) => one.agentKey);
     for (const other of ending) {
       saveSession({
@@ -1137,6 +1146,15 @@ export async function handleEvent(input = {}) {
     } catch { /* the trailer still names the bound ticket */ }
   }
   saveSession(state);
+
+  // Agents that never sent a SubagentStop still count (MACLEOD-882): their
+  // transcripts are read into their own states at the session's Stop.
+  if (event === 'Stop' && !agentKey && !input.reporter_tool) {
+    try {
+      const { sweepAgents } = await import('./spend.mjs');
+      sweepAgents(sessionId, input.transcript_path);
+    } catch { /* counted at the next stop or at the session's end */ }
+  }
 
   // Synchronous SessionStart/UserPromptSubmit must stay fast so they never hold up the tool.
   // Async tool/task/stop hooks publish to the service (or legacy S3).

@@ -2078,6 +2078,10 @@ export function recordLaunch(sessionId, toolInput = {}, launchedBy = undefined, 
     if (held) return held;
   }
   const launch = { id, name, task, type, at: new Date().toISOString() };
+  // The model the launch asked for (MACLEOD-885), such as "haiku" or a
+  // full model id. A name only; the agent's own transcript corrects it.
+  const model = agentModel(toolInput.model);
+  if (model) launch.model = model;
   // A node still to be minted, on the async path (MACLEOD-639 audit):
   // PreToolUse is synchronous and spends nothing on the network.
   if (represented.pending) launch.pending = true;
@@ -3603,23 +3607,60 @@ export function nothingMerged(input = {}) {
   }
 }
 
+/*
+ * A command that only reads (MACLEOD-641, K9's second event). The test
+ * pattern matches a word anywhere, so `test -f x`, `grep -n jest` or
+ * `ls e2e | grep playwright` read as a test run, and a ticket nobody
+ * tested showed "Local tests passed". A command is read-only when every
+ * part of it, split at `&&`, `||`, `;`, `|` and new lines, starts with a
+ * program that only reads. Anything unsure (a quote split in two, an
+ * unknown program) is not read-only, so real test runs keep counting.
+ */
+const READ_ONLY_PROGRAMS = new Set([
+  'ls', 'cat', 'head', 'tail', 'grep', 'egrep', 'fgrep', 'rg', 'ag', 'find', 'fd', 'wc', 'echo',
+  'printf', 'pwd', 'cd', 'which', 'type', 'file', 'stat', 'tree', 'less', 'more', 'sort', 'uniq',
+  'cut', 'tr', 'jq', 'diff', 'test', '[', 'true', 'basename', 'dirname', 'realpath', 'date',
+]);
+const READ_ONLY_GIT = new Set([
+  'log', 'show', 'diff', 'status', 'grep', 'blame', 'ls-files', 'ls-tree', 'rev-parse', 'describe',
+  'shortlog', 'reflog', 'cat-file', 'merge-base',
+]);
+export function readOnlyCommand(command) {
+  const parts = String(command || '').split(/&&|\|\||[;|\n]/).map((p) => p.trim()).filter(Boolean);
+  if (!parts.length) return false;
+  return parts.every((part) => {
+    const words = part.split(/\s+/);
+    while (words.length && /^[A-Za-z_][A-Za-z0-9_]*=/.test(words[0])) words.shift();
+    const [program, ...rest] = words;
+    if (READ_ONLY_PROGRAMS.has(program)) return true;
+    if (program === 'sed') return !rest.some((w) => /^-[a-zA-Z]*i/.test(w) || w.startsWith('--in-place'));
+    if (program === 'git') {
+      const sub = rest.find((w) => !w.startsWith('-'));
+      return READ_ONLY_GIT.has(sub);
+    }
+    return false;
+  });
+}
+
 export function classifyTool(input, state, config) {
   const event = input.hook_event_name;
   const tool = input.tool_name || '';
   const command = commandOf(input);
   const failed = event === 'PostToolUseFailure';
+  // Reading never runs a test or a build.
+  const readOnly = readOnlyCommand(command);
   const customDevTest = config.devTestPattern ? new RegExp(config.devTestPattern, 'i') : undefined;
   const customLocalAudit = config.localAuditPattern ? new RegExp(config.localAuditPattern, 'i') : undefined;
   const customDevAudit = config.devAuditPattern ? new RegExp(config.devAuditPattern, 'i') : undefined;
   const isDevAudit = DEV_AUDIT_RE.test(command) || Boolean(customDevAudit?.test(command));
   const isLocalAudit = !isDevAudit && (LOCAL_AUDIT_RE.test(command) || Boolean(customLocalAudit?.test(command)));
-  const isDevTest = DEV_TEST_RE.test(command) || Boolean(customDevTest?.test(command));
+  const isDevTest = !readOnly && (DEV_TEST_RE.test(command) || Boolean(customDevTest?.test(command)));
   // A repository whose suite is not `npm test` or `pytest` names it in
   // `.teamflow.json` as `testCommand`. The git pre-push fallback runs
   // exactly that command, so matching it literally is what lets a
   // `make check` project report LOCAL_TEST at all.
-  const isLocalTest = TEST_RE.test(command)
-    || Boolean(config.testCommand && command.includes(String(config.testCommand).trim()));
+  const isLocalTest = !readOnly && (TEST_RE.test(command)
+    || Boolean(config.testCommand && command.includes(String(config.testCommand).trim())));
 
   if (event === 'SubagentStart') return { summary: 'Agent started', heartbeat: true };
   if (event === 'SubagentStop') return { summary: 'Agent finished', heartbeat: true };
@@ -3754,7 +3795,7 @@ export function classifyTool(input, state, config) {
       : { stage: 'LOCAL_TEST', status: 'success', summary: 'Local tests passed; awaiting audit', evidence: extractTestEvidence(input.tool_response), sticky: true, clearRework: true, ...testRun(input, command, false, config) };
   }
 
-  if (BUILD_RE.test(command)) {
+  if (!readOnly && BUILD_RE.test(command)) {
     return failed
       ? { stage: 'LOCAL_REWORK', status: 'failed', summary: 'Local build failed', incrementLoop: true, reworkFrom: 'LOCAL_TEST', sticky: true }
       : { stage: 'LOCAL_TEST', status: 'success', summary: 'Local build passed', sticky: true, clearRework: true };
@@ -4194,6 +4235,13 @@ export function agentTaskWords(sources = []) {
   return undefined;
 }
 
+// A model name as the service takes it (the same shape as `spend.model`).
+const MODEL_NAME = /^[A-Za-z0-9][A-Za-z0-9._:\[\]-]{0,63}$/;
+export function agentModel(value) {
+  const text = String(value || '').trim();
+  return MODEL_NAME.test(text) && text !== '<synthetic>' ? text : undefined;
+}
+
 export function agentBlock(state = {}) {
   const agent = state.agent || {};
   const block = {
@@ -4204,6 +4252,13 @@ export function agentBlock(state = {}) {
   const type = agentLabel(agent.type, 40);
   if (task) block.task = task;
   if (type) block.type = type;
+  /*
+   * Which model the agent runs (MACLEOD-885): the id its own transcript
+   * names once read (`spend.model`), else what its launch asked for. So a
+   * lead can see a small model on triage and a strong one on the audit.
+   */
+  const model = agentModel(state.spend?.model) || agentModel(agent.model);
+  if (model) block.model = model;
   // The row's header (MACLEOD-773): its task first, as nodeTitle reads it.
   const said = agentTaskWords([task, agent.name, agent.name && task ? `${agent.name}: ${task}` : '']);
   if (said) block.agentTask = said;
@@ -4535,7 +4590,7 @@ export function sanitizePayload(value, { kind = 'issue' } = {}) {
    * the payload they are dropped, `prompt` and `last_assistant_message`
    * among them, because neither is in either set.
    */
-  const agentOnly = new Set(['id', 'name', 'task', 'agentTask', 'type', 'parent', 'parentAgent', 'startedAt', 'endedAt', 'role']);
+  const agentOnly = new Set(['id', 'name', 'task', 'agentTask', 'type', 'parent', 'parentAgent', 'startedAt', 'endedAt', 'role', 'model']);
   // What the agent was launched for (MACLEOD-722): the answer, how it was
   // reached and the classifier's fixed features. Enums, flags, one count
   // and one number; the prompt it was scored on has no field here.
@@ -4563,7 +4618,9 @@ export function sanitizePayload(value, { kind = 'issue' } = {}) {
   const actionOnly = new Set(['id', 'kind', 'by', 'at', 'outcome', 'reason']);
   // A gate's verdict (ADHOC-19): which gate, pass or fail, the round, a
   // clock, who, and the words the orchestrator deliberately wrote.
-  const verdictOnly = new Set(['round', 'gate', 'verdict', 'at', 'by', 'summary', 'raised', 'fixed', 'open', 'notAdded']);
+  const verdictOnly = new Set(['round', 'gate', 'verdict', 'at', 'by', 'summary', 'raised', 'fixed', 'open', 'notAdded',
+    // MACLEOD-885: an audit's findings as counts only.
+    'blocking', 'should']);
   // A failure point (points.mjs): its id, the gate, the one line, the rounds
   // it failed in, and when it was fixed. Never output, a message or a log.
   const pointOnly = new Set(['id', 'gate', 'key', 'text', 'from', 'rounds', 'lastRound', 'state', 'at', 'by',

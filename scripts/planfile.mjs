@@ -15,9 +15,14 @@
 //     - from: MACLEOD-540
 //       on: MACLEOD-538
 //       reason: needs the reporter field that release adds
+//       rule: one                  # optional: one or all_done (MACLEOD-885)
+//   waits:
+//     - key: MACLEOD-540
+//       for: pr_approved           # or deploy_window
+//       deadline: 2026-10-01T17:00:00Z
 //   gates: [lint, playwright]
 //
-// JSON with the same four fields works too. The YAML is a small strict
+// JSON with the same fields works too. The YAML is a small strict
 // subset, read here without a dependency (the plugin has none and runs on
 // Node 18.17): a top-level mapping of scalars, block lists of scalars,
 // block lists of one-level mappings, `[a, b]` lists of scalars, quoted or
@@ -28,8 +33,24 @@
 import fs from 'node:fs';
 import { CHECKS_FILE, PRESET_GATES, checkLabel, checkNameFor } from './checks.mjs';
 
-const FIELDS = ['name', 'keys', 'edges', 'gates'];
-const EDGE_FIELDS = ['from', 'on', 'reason'];
+const FIELDS = ['name', 'keys', 'edges', 'waits', 'gates'];
+const EDGE_FIELDS = ['from', 'on', 'reason', 'rule'];
+/*
+ * How a link lets its ticket start (MACLEOD-885, after Archon's trigger
+ * rules). `all` is the default and is never written: every ticket it waits
+ * on is done. `one`: any one of the tickets it waits on with this rule is
+ * done ("either approach unblocks C"). `all_done`: the ticket it waits on
+ * has ended, even if it failed ("clean-up runs even after a failure").
+ * workflow.mjs re-exports these, so the file and the command agree.
+ */
+export const EDGE_RULES = ['all', 'one', 'all_done'];
+export const RULE_WORDS = { one: 'any one is enough', all_done: 'even if it fails' };
+// A wait the plan holds on a ticket. Only a pull request approval needs a
+// person; a deploy window is a time.
+export const WAIT_KINDS = ['pr_approved', 'deploy_window'];
+const RULES = EDGE_RULES;
+const WAIT_FIELDS = ['key', 'for', 'deadline'];
+const WAITS = WAIT_KINDS;
 // A tracker key, an ad hoc key or a GitHub `owner/repo#12`. No spaces:
 // a key with a space in it is a sentence, or a command.
 const KEY = /^[A-Za-z0-9][A-Za-z0-9._/#-]{0,119}$/;
@@ -196,10 +217,10 @@ export function parseYaml(text) {
  * because a plan file holds keys and reasons and never a command.
  */
 export function planFrom(raw) {
-  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) fail('A plan file holds one set of fields: `name`, `keys`, `edges` and `gates`.');
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) fail('A plan file holds one set of fields: `name`, `keys`, `edges`, `waits` and `gates`.');
   const extra = Object.keys(raw).filter((field) => !FIELDS.includes(field));
   if (extra.length) {
-    fail(`A plan file holds \`name\`, \`keys\`, \`edges\` and \`gates\` only. Remove "${extra[0]}". A plan never holds a command.`);
+    fail(`A plan file holds \`name\`, \`keys\`, \`edges\`, \`waits\` and \`gates\` only. Remove "${extra[0]}". A plan never holds a command.`);
   }
   const name = typeof raw.name === 'string' ? raw.name.trim() : '';
   if (!name) fail('The plan file needs a name.');
@@ -223,7 +244,7 @@ export function planFrom(raw) {
     const label = `Link ${n + 1}`;
     if (!edge || typeof edge !== 'object' || Array.isArray(edge)) fail(`${label} needs "from", "on" and "reason".`);
     const odd = Object.keys(edge).filter((field) => !EDGE_FIELDS.includes(field));
-    if (odd.length) fail(`${label} holds "${odd[0]}". A link holds from, on and reason only.`);
+    if (odd.length) fail(`${label} holds "${odd[0]}". A link holds from, on, reason and rule only.`);
     const from = String(edge.from ?? '').trim();
     const on = String(edge.on ?? '').trim();
     const reason = String(edge.reason ?? '').replace(/\s+/g, ' ').trim();
@@ -233,7 +254,33 @@ export function planFrom(raw) {
     if (reason.length > REASON_MAX) fail(`${label}: a reason has at most ${REASON_MAX} characters.`);
     const same = edges.find((e) => e.from === from && e.on === on);
     if (same) fail(`${label}: ${from} waits on ${on} twice in this file.`);
-    edges.push({ from, on, reason });
+    const rule = edge.rule === undefined ? undefined : String(edge.rule).trim();
+    if (rule !== undefined && !RULES.includes(rule)) fail(`${label}: the rule must be one or all_done.`);
+    edges.push(rule && rule !== 'all' ? { from, on, reason, rule } : { from, on, reason });
+  });
+
+  const waitsIn = raw.waits ?? [];
+  if (!Array.isArray(waitsIn)) fail('"waits" must be a list of waits.');
+  const waits = [];
+  waitsIn.forEach((wait, n) => {
+    const label = `Wait ${n + 1}`;
+    if (!wait || typeof wait !== 'object' || Array.isArray(wait)) fail(`${label} needs "key" and "for".`);
+    const odd = Object.keys(wait).filter((field) => !WAIT_FIELDS.includes(field));
+    if (odd.length) fail(`${label} holds "${odd[0]}". A wait holds key, for and deadline only.`);
+    const key = String(wait.key ?? '').trim();
+    const kind = String(wait.for ?? '').trim();
+    if (!KEY.test(key)) fail(`${label} needs a ticket key in "key".`);
+    if (!WAITS.includes(kind)) fail(`${label}: "for" must be pr_approved or deploy_window.`);
+    if (waits.some((w) => w.key === key)) fail(`${label}: ${key} has two waits in this file.`);
+    const out = { key, for: kind };
+    if (wait.deadline !== undefined) {
+      const when = Date.parse(String(wait.deadline));
+      if (!/^\d{4}-\d{2}-\d{2}/.test(String(wait.deadline)) || Number.isNaN(when)) {
+        fail(`${label}: the deadline must be a date and time, such as 2026-10-01T17:00:00Z.`);
+      }
+      out.deadline = new Date(when).toISOString();
+    }
+    waits.push(out);
   });
 
   const gatesIn = raw.gates ?? [];
@@ -244,7 +291,7 @@ export function planFrom(raw) {
     if (!GATE.test(clean)) fail(`"${clean.slice(0, 40)}" is not a check name. Use small letters, digits and hyphens.`);
     if (!gates.includes(clean)) gates.push(clean);
   }
-  return { name, keys, edges, gates };
+  return { name, keys, edges, waits, gates };
 }
 
 /** A plan from text: JSON when it looks like JSON, else the YAML subset. */
@@ -291,13 +338,22 @@ export function planChanges(workflow = {}, plan) {
   for (const edge of plan.edges) {
     const now = have.find((d) => d.from === edge.from && d.on === edge.on);
     if (!now) edges.push({ ...edge, found: 'planning' });
-    else if ((now.reason || '') !== edge.reason) edges.push({ ...edge, found: now.found || 'planning' });
+    else if ((now.reason || '') !== edge.reason || (now.rule || 'all') !== (edge.rule || 'all')) {
+      edges.push({ ...edge, rule: edge.rule || 'all', found: now.found || 'planning' });
+    }
   }
+  // A wait the run lacks, or holds with another kind or deadline.
+  const byKey = new Map((workflow.tickets || []).map((t) => [t.key, t]));
+  const waits = (plan.waits || []).filter((w) => {
+    const held = byKey.get(w.key)?.wait;
+    return !held || held.for !== w.for || (held.deadline || '') !== (w.deadline || '');
+  });
   const listed = new Set(plan.keys);
   const linked = new Set(plan.edges.map((e) => `${e.from}\u0000${e.on}`));
   return {
     keys: plan.keys.filter((key) => !tickets.has(key)),
     edges,
+    waits,
     gates: plan.gates.filter((gate) => !(workflow.gates || []).includes(gate)),
     unlistedKeys: [...tickets].filter((key) => !listed.has(key)),
     unlistedEdges: have.filter((d) => !linked.has(`${d.from}\u0000${d.on}`)).length,
@@ -305,7 +361,7 @@ export function planChanges(workflow = {}, plan) {
 }
 
 export function changesNothing(changes) {
-  return !changes.keys.length && !changes.edges.length && !changes.gates.length;
+  return !changes.keys.length && !changes.edges.length && !(changes.waits || []).length && !changes.gates.length;
 }
 
 /** What the run holds beyond the file, in one line, or nothing. */
@@ -340,7 +396,14 @@ export function dryRunLines(workflow, { checks = {}, gates = [], policy = { atte
     lines.push(`  Phase ${phase.n}: ${phase.tickets.join(', ')}`);
     for (const key of phase.tickets) {
       for (const edge of edges.filter((e) => e.from === key)) {
-        lines.push(`    ${key} waits on ${edge.on}${edge.reason ? `: ${edge.reason}` : '.'}`);
+        const how = RULE_WORDS[edge.rule] ? ` (${RULE_WORDS[edge.rule]})` : '';
+        lines.push(`    ${key} waits on ${edge.on}${how}${edge.reason ? `: ${edge.reason}` : '.'}`);
+      }
+      const held = (workflow.tickets || []).find((t) => t.key === key)?.wait;
+      if (held?.for) {
+        const what = held.for === 'pr_approved' ? 'a person to approve its pull request' : 'the deploy window';
+        const by = held.deadline ? `, by ${held.deadline.slice(0, 16).replace('T', ' ')} UTC` : '';
+        lines.push(`    ${key} waits for ${what}${by}.`);
       }
     }
   }
