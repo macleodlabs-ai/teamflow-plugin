@@ -3,6 +3,13 @@
 What changed in each published version of the TeamFlow plugin, newest first.
 Only what a person using it would notice.
 
+## 0.3.55
+
+- **Each agent on its own ticket.** Agents sent together no longer show
+  under each other's tickets. An agent's own `work-on` always wins.
+- **No tickets made from names.** A builder's name such as
+  "team-history-943" never becomes a ticket key.
+
 ## 0.3.54
 
 - **Limits say when they end.** When a model hits its limit, TeamFlow notes

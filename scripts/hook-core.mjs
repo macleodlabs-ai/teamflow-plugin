@@ -42,6 +42,7 @@ import {
   launchId,
   launchOf,
   matchLaunch,
+  rematchLaunch,
   organisationScope,
   parseAgentId,
   publishState,
@@ -363,7 +364,12 @@ export function withAgentIdentity(event, input, state, sessionId, agentKey, laun
       // only; the launch file is where it came from.
       // `launchId` is how a node still owed is settled from here, and
       // `under` is the parent's node for a nested agent.
-      ...(launch?.key || launch?.id ? {
+      // A launch guessed from start order gives no key (MACLEOD-944):
+      // agents sent together start in any order, and a guess bound them to
+      // each other's tickets. The key waits for proof or the agent's own
+      // `work-on`.
+      ...(launch?.guessed && launch.id ? { dispatch: { launchId: launch.id, guessed: true } } : {}),
+      ...(!launch?.guessed && (launch?.key || launch?.id) ? {
         dispatch: {
           ...(launch.id ? { launchId: launch.id } : {}),
           ...(launch.key ? { key: launch.key, title: launch.title } : {}),
@@ -409,12 +415,21 @@ export function withOwnLaunch(state, sessionId) {
     formerName: state.agent.name,
     renamedAt: new Date().toISOString(),
   };
-  const moved = launch.key && launch.key !== state.dispatch?.key;
-  return {
+  // A launch handed over by a swap is still a guess until proven
+  // (MACLEOD-944): its name shows, its key waits.
+  const proven = launch.proven === true;
+  const moved = proven && launch.key && launch.key !== state.dispatch?.key;
+  const guess = !proven && launch.id && state.dispatch?.launchId && !state.dispatch.overruled && launch.id !== state.dispatch.launchId;
+  // The key the wrong launch gave is not this agent's: it lets go of it.
+  const borrowed = guess && state.binding?.source === 'dispatch' && state.binding.key === state.dispatch?.key;
+  const out = {
     ...state,
     agent,
     ...(moved ? { dispatch: { ...(launch.id ? { launchId: launch.id } : {}), key: launch.key, title: launch.title } } : {}),
+    ...(guess ? { dispatch: { launchId: launch.id, guessed: true } } : {}),
   };
+  if (borrowed) delete out.binding;
+  return out;
 }
 
 function teamTasksPath(sessionId) {
@@ -1022,7 +1037,33 @@ export async function handleEvent(input = {}) {
      * finished -- so whichever async event is first mints, and the mint
      * record makes sure only one of them does. Never on PreToolUse.
      */
-    if (state.dispatch?.launchId && !state.dispatch.key && !state.dispatch.bound && !LOCAL_ONLY.includes(event)) {
+    // The agent's own `work-on` names its ticket, so the launch whose
+    // brief named that ticket is its launch (MACLEOD-944): its name, task
+    // and node follow, whatever order the agents started in. Once per key.
+    if (state.binding?.source === 'manual' && state.binding.key && state.rematched !== state.binding.key) {
+      state.rematched = state.binding.key;
+      if (launchOf(sessionId, state.agent.id)?.key !== state.binding.key) {
+        const own = rematchLaunch(sessionId, state.agent.id, state.binding.key);
+        if (own) {
+          state.agent = {
+            ...state.agent,
+            ...(own.name ? { name: own.name } : {}),
+            ...(own.task ? { task: own.task } : {}),
+            ...(own.name && own.name !== state.agent.name ? { formerName: state.agent.name, renamedAt: at } : {}),
+          };
+          state.dispatch = { launchId: own.id, key: own.key, title: own.title, bound: true };
+        }
+      }
+    }
+    // A guessed launch gives its key once something proves it this
+    // agent's: its own tool call's id, or its own `work-on`.
+    if (state.dispatch?.guessed) {
+      const held = launchOf(sessionId, state.agent.id);
+      if (held?.proven) {
+        state.dispatch = { launchId: held.id, ...(held.key ? { key: held.key, title: held.title } : {}) };
+      }
+    }
+    if (state.dispatch?.launchId && !state.dispatch.key && !state.dispatch.bound && !state.dispatch.guessed && !LOCAL_ONLY.includes(event)) {
       const launch = findLaunch(sessionId, state.dispatch.launchId);
       const got = launch?.pending ? await settle(config, { sessionId, launch, state, cwd, info }) : undefined;
       const known = withMint(sessionId, launch);

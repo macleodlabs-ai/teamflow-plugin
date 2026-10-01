@@ -125,6 +125,7 @@ const USAGE = `teamflow \u2014 delivery reporting for TeamFlow
   teamflow admin code [create|list|revoke]  invite codes, for superadmins
   teamflow admin comp <account> [--days N]  complimentary time for an existing account
   teamflow admin launch [--confirm]         end demo mode; run once, on the day
+  teamflow admin history <account> <path>   saved copies of a document; --restore <version> --reason "..."
   teamflow report --issue ... --stage ...   report one stage transition
   teamflow skills install --for <tool>      install these skills into another tool
   teamflow continue on|off|status   whether TeamFlow tells a stopped session what

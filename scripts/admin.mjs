@@ -1,7 +1,8 @@
 // `teamflow admin ...`: the superadmin commands.
 //
-// Three of them. `code` issues invite codes; `comp` gives an existing
-// account complimentary time; `launch` ends demo mode.
+// Four of them. `code` issues invite codes; `comp` gives an existing
+// account complimentary time; `launch` ends demo mode; `history` lists
+// and restores the saved copies of one document (MACLEOD-943).
 //
 // An invite code lets an organisation sign up without paying: the
 // holder opens /signup/?code=TF-XXXX-XXXX, names the org, and the
@@ -25,6 +26,8 @@ const USAGE = `teamflow admin \u2014 operator commands, for superadmins
   teamflow admin code revoke TF-XXXX-XXXX
   teamflow admin comp <account-id> [--days N] [--plan growth_monthly]
   teamflow admin launch [--confirm]
+  teamflow admin history <account> <path>
+  teamflow admin history <account> <path> --restore <version> --reason "..."
 
 --email is the organisation's admin. The service emails them the code and its
 redeem link, and locks the code to that address: anyone else redeeming it is
@@ -42,7 +45,14 @@ launch ends demo mode: every demo account loses its free credits, moves onto
 the team plan and must subscribe to carry on. Nothing else is touched -- the
 organisations, their members, keys, connections and boards all stay. Without
 --confirm it only prints what it would do. Run it once, on the day Stripe goes
-live, and never before.`;
+live, and never before.
+
+history lists the saved copies of one document, such as issues/ABC-1.json:
+when each was saved and its size, never what it says. TeamFlow keeps a copy
+for 365 days after it is changed or deleted. --restore puts one copy back as
+the newest. The copy it replaces is kept, so you can undo it the same way.
+--reason is required, 10 to 300 characters. The organisation sees who did it
+and why in its Events list.`;
 
 // Exit codes, so a script can tell the two failures apart: 2 means "you
 // are not allowed to do this, or you asked for something impossible",
@@ -308,6 +318,49 @@ export async function launch(config, { confirm = false } = {}) {
   return EXIT_OK;
 }
 
+// `teamflow admin history <account> <path> [--restore V --reason R]`
+// (MACLEOD-943). The listing is dates and sizes only; the service never
+// sends a body, so there is nothing here that could print one.
+async function history(config, account, docPath, flags) {
+  if (!account || !docPath) { fail(`Give the account id and the document path.\n\n${USAGE}`); return EXIT_REFUSED; }
+  const unknown = Object.keys(flags).filter((name) => name !== 'restore' && name !== 'reason');
+  if (unknown.length) { fail(`history takes --restore and --reason and nothing else\n\n${USAGE}`); return EXIT_REFUSED; }
+  const base = `/v1/admin/history/${encodeURIComponent(account)}`;
+  if (flags.restore === undefined) {
+    if (flags.reason !== undefined) { fail('--reason goes with --restore.'); return EXIT_REFUSED; }
+    const result = await adminCall(config, 'GET', `${base}?path=${encodeURIComponent(docPath)}`);
+    if (!result.ok) return report(result);
+    const rows = Array.isArray(result.body.versions) ? result.body.versions : [];
+    if (!rows.length) {
+      out(`TeamFlow has no saved copies of ${docPath}.`);
+      return EXIT_OK;
+    }
+    const cells = rows.map((row) => [
+      cell(row.version),
+      cell(row.at),
+      row.deleted ? 'deleted' : `${cell(row.size)} B`,
+      row.current ? 'now' : '',
+    ]);
+    const head = ['VERSION', 'SAVED', 'SIZE', ''];
+    const widths = head.map((h, i) => Math.max(h.length, ...cells.map((c) => c[i].length)));
+    for (const c of [head, ...cells]) {
+      out(c.map((v, i) => (i === c.length - 1 ? v : v.padEnd(widths[i]))).join('  ').trimEnd());
+    }
+    return EXIT_OK;
+  }
+  const reason = String(flags.reason || '').trim();
+  if (reason.length < 10 || reason.length > 300) {
+    fail('--reason is required with --restore: say why, in 10 to 300 characters.');
+    return EXIT_REFUSED;
+  }
+  const result = await adminCall(config, 'POST', `${base}/restore`,
+    { path: docPath, version: flags.restore, reason });
+  if (!result.ok) return report(result);
+  out(`Put back the copy ${flags.restore} of ${docPath} as the newest.`);
+  out(`The copy it replaced is kept. The organisation can see this in its Events list.`);
+  return EXIT_OK;
+}
+
 // --- entry point ----------------------------------------------------
 
 const HELP = new Set(['help', '--help', '-h']);
@@ -317,6 +370,12 @@ export async function main(args, config = {}) {
   if (HELP.has(group) || HELP.has(action)) {
     out(USAGE);
     return EXIT_OK;
+  }
+  if (group === 'history') {
+    const parsed = parseFlags([action, ...rest].filter((word) => word !== undefined));
+    if (parsed.error) { fail(`${parsed.error}\n\n${USAGE}`); return EXIT_REFUSED; }
+    if (parsed.positional.length > 2) { fail(`history takes one account id and one path\n\n${USAGE}`); return EXIT_REFUSED; }
+    return history(config, parsed.positional[0], parsed.positional[1], parsed.flags);
   }
   if (group !== 'code' && group !== 'launch' && group !== 'comp') {
     fail(`Unknown admin command: ${[group, action].filter(Boolean).join(' ') || '(none)'}\n\n${USAGE}`);

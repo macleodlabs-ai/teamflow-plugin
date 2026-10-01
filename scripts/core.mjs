@@ -2162,11 +2162,17 @@ export function claimLaunch(sessionId, agentId, type = undefined, toolUseId = un
   // (MACLEOD-640): three agents dispatched at once are three PostToolUse
   // events in any order, and "the newest" would swap their names.
   const own = toolUseId ? unclaimed.find((entry) => entry.name === `${launchId(toolUseId)}.json`) : undefined;
-  if (own) return claimFile(own, agentId);
+  if (own) return claimFile(own, agentId) && proveClaim(sessionId, agentId);
   // Claimed already, by a guess at start that this call's id now proves
   // wrong (MACLEOD-641, audit K8): put each launch with its own agent.
   const fixed = toolUseId ? reclaimLaunch(sessionId, agentId, toolUseId) : undefined;
   if (fixed) return fixed;
+  // The guess at start was right: the call's id proves it, and no second
+  // launch is claimed for the same agent (MACLEOD-944).
+  const mark = `${CLAIMED}${digest(agentId, 16)}.json`;
+  if (toolUseId && launchFiles(sessionId).some((entry) => entry.name === `${launchId(toolUseId)}${mark}`)) {
+    return proveClaim(sessionId, agentId);
+  }
   const candidates = unclaimed
     .filter((entry) => !type || !entry.launch.type || entry.launch.type === type)
     .reverse();                              // newest first: this is the one just started
@@ -2214,7 +2220,7 @@ export function reclaimLaunch(sessionId, agentId, toolUseId) {
   const launch = moveClaim(own, agentId);
   if (!launch) return undefined;
   if (other) moveClaim(other, guessed && guessed !== agentId ? guessed : undefined);
-  return { ...launch, swappedWith: guessed };
+  return { ...(proveClaim(sessionId, agentId) || launch), swappedWith: guessed };
 }
 
 /** The launch claimed for `agentId`, or `undefined`. One listing and one read. */
@@ -2250,9 +2256,60 @@ export function matchLaunch(sessionId, agentId, agentType) {
     .filter((entry) => !agentType || !entry.launch.type || entry.launch.type === agentType);
   for (const entry of candidates) {           // oldest first: FIFO
     const won = claimFile(entry, agentId || entry.name);
-    if (won) return won;
+    // A guess when the launch went out with others of its type: agents
+    // sent together start in any order, so its key is not this agent's
+    // to take until something proves it (MACLEOD-944).
+    if (won) return batchOf(files, entry, agentType).length > 1 ? { ...won, guessed: true } : won;
   }
   return undefined;
+}
+
+// Launches this far apart, with no prompt id to compare, are one batch.
+const BATCH_MS = 120_000;
+
+/** The launches sent with this one, claimed or not, itself included. */
+function batchOf(files, entry, agentType) {
+  const at = Date.parse(entry.launch.at) || 0;
+  return files.filter((one) => (!agentType || !one.launch.type || one.launch.type === agentType)
+    && (entry.launch.promptId && one.launch.promptId
+      ? one.launch.promptId === entry.launch.promptId
+      : Math.abs((Date.parse(one.launch.at) || 0) - at) <= BATCH_MS));
+}
+
+/**
+ * The agent takes the launch that names `key` (MACLEOD-944). Its own
+ * `work-on` says which ticket it is on, so the launch whose brief named
+ * that ticket is its launch, whatever order the agents started in. The
+ * launch it held goes to the agent that held this one, or back to
+ * unclaimed. Returns the launch, marked `proven`, or `undefined` when no
+ * launch names the key or it is already this agent's. Local files only.
+ */
+export function rematchLaunch(sessionId, agentId, key) {
+  if (!sessionId || !agentId || !key) return undefined;
+  const files = launchFiles(sessionId);
+  const mark = `${CLAIMED}${digest(agentId, 16)}.json`;
+  const wanted = String(key).toUpperCase();
+  const target = files.find((entry) => String(entry.launch.key || '').toUpperCase() === wanted);
+  if (!target || target.name.endsWith(mark) || target.launch.proven) return undefined;
+  const held = files.find((entry) => entry !== target && entry.name.endsWith(mark));
+  // A launch proven this agent's stays its own: an agent that moved to
+  // another ticket does not take that ticket's agent's launch.
+  if (held?.launch.proven) return undefined;
+  const other = isClaimed(target.name) ? target.launch.agentId : undefined;
+  const launch = isClaimed(target.name) ? moveClaim(target, agentId) : claimFile(target, agentId);
+  if (!launch) return undefined;
+  if (held) moveClaim(held, other && other !== agentId ? other : undefined);
+  return proveClaim(sessionId, agentId) || { ...launch, proven: true };
+}
+
+/** Mark the launch claimed for `agentId` as proven, and return it. */
+function proveClaim(sessionId, agentId) {
+  const mark = `${CLAIMED}${digest(agentId, 16)}.json`;
+  const entry = launchFiles(sessionId).find((one) => one.name.endsWith(mark));
+  if (!entry) return undefined;
+  const launch = { ...entry.launch, proven: true };
+  try { writeJson(entry.file, launch); } catch { /* the claim stands without the mark */ }
+  return launch;
 }
 
 /**
@@ -2995,13 +3052,16 @@ export function candidate(key, confidence, source, ref = {}) {
   return out;
 }
 
-const CODE_NAME_RE = /(?<![A-Za-z0-9-])([a-z][a-z0-9]{1,19})-(\d{1,9})(?![A-Za-z0-9-])/g;
+// A whole lower-case code name, with any words before its last one:
+// `team-baseline-938` is one name, and its last two words alone made a
+// BASELINE-938 card from a task subject (MACLEOD-944).
+const CODE_NAME_RE = /(?<![A-Za-z0-9-])((?:[a-z][a-z0-9]*-)*)([a-z][a-z0-9]{1,19})-(\d{1,9})(?![A-Za-z0-9-])/g;
 
 /** The text with each lower-case key-shaped word of an unknown prefix removed. */
 export function codeNamesOut(text, known) {
   if (text === undefined || text === null) return text;
-  return String(text).replace(CODE_NAME_RE, (word, prefix) => (
-    known?.has(prefix.toUpperCase()) || isAdHocKey(word) ? word : ' '));
+  return String(text).replace(CODE_NAME_RE, (word, lead, prefix, number) => (
+    known?.has(prefix.toUpperCase()) || isAdHocKey(`${prefix}-${number}`) ? word : ' '));
 }
 
 // Pure half of detectCandidates: git and disk stay in the caller so detection is testable.

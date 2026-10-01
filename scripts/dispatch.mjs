@@ -416,7 +416,14 @@ export function planLaunch(config, { state = {}, dispatch = {}, cwd, info = {}, 
     // joins the run and nothing is minted for it.
     const named = dispatch.kind === 'agent' && dispatch.type !== 'workflow'
       ? namedKey(launch, { config, state, keys: runKeys(config) }) : undefined;
-    const made = ensureRun(config, state, info, { cwd, keys: named ? [named] : [] });
+    // A run that cannot be made does not cost the agent its ticket
+    // (MACLEOD-944): the brief's key still binds it.
+    let made;
+    try {
+      made = ensureRun(config, state, info, { cwd, keys: named ? [named] : [] });
+    } catch (error) {
+      out.reason = `TeamFlow could not represent the dispatch: ${error instanceof Error ? error.message : String(error)}`;
+    }
     if (made?.created) out.notice = createdNotice(made.run);
     if (made) out.run = { id: made.run.id, name: made.run.name };
     if (dispatch.kind !== 'agent') return out;
