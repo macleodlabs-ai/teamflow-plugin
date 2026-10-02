@@ -1,19 +1,29 @@
-// Answering an agent from TeamFlow (MACLEOD-848).
+// Answering an agent from TeamFlow (MACLEOD-848, MACLEOD-946).
 //
-// The owner's ruling: "Treat this as a remote control session. Only the
-// dev can make those choices." So this is as narrow as Claude's Remote
-// Control. The session's own developer, signed in to TeamFlow, answers
-// what the agent waits on, and nothing else:
+// The owner's rulings: "Treat this as a remote control session." and,
+// 2026-10-01, "Always allow answers and inputs from team flow." So it is
+// on by default and as narrow as Claude's Remote Control. A signed-in
+// person who may answer (the session's developer, an owner or admin, or
+// the person who made its plan; the service checks) answers what the
+// agent waits on, and nothing else:
 //
 // - `choice`: one of the options the agent offered (AskUserQuestion), or
 //   free words where Claude Code allows them ("Other"), at most 500.
 // - `permission`: allow or deny.
 // - `question`: the turn ended with a question. Free words, or continue.
 //
-// Four switches, all off by default: the organisation's agent view, its
-// two-way option (owners and admins), this person's `teamflow agent-view
-// on` and this machine's `teamflow two-way on`. Without the last one no
-// question carries an `askId`, so nothing here can be answered.
+// Two switches, both on by default: the organisation's two-way option
+// (owners and admins may turn it off) and this machine's own (`teamflow
+// two-way off` turns it off). Agent view is not needed. With the
+// machine's switch off no question carries an `askId`, nothing is sent,
+// and nothing here can be answered.
+//
+// While it is on, the machine sends the question it waits on: its words,
+// its offered labels or a permission's plain words, its kind and its id
+// (`POST /v1/members/asks`). Never the tool's input, a command or a path.
+// The service seals it with the organisation's key and drops it when the
+// question ends: answered, no longer waited on, or the session went on
+// (`{ended: true}`, from the hook that saw the person type).
 //
 // How an answer reaches Claude. Claude Code takes a hook's decision only
 // from that hook's own output (hooks reference, "PermissionRequest
@@ -44,12 +54,12 @@ const ASK_ID = /^ask_[0-9a-f]{16,40}$/;
 
 // --- the machine's switch -------------------------------------------------
 
-/** `{ on, waitSeconds }` from the user's own config. Off by default. */
+/** `{ on, waitSeconds }` from the user's own config. On unless set off. */
 export function twoWaySwitch() {
   const held = core.readJson(core.globalConfigPath(), {})?.twoWay;
   const wait = Number(held?.waitSeconds);
   return {
-    on: held?.on === true,
+    on: held?.on !== false,
     waitSeconds: Number.isFinite(wait) ? Math.max(0, Math.min(WAIT_MAX_S, Math.round(wait))) : WAIT_DEFAULT_S,
   };
 }
@@ -67,8 +77,8 @@ export function setTwoWay(value, { waitSeconds } = {}) {
 
 /** The `teamflow two-way status` line. */
 export function twoWayLine(held = twoWaySwitch()) {
-  if (!held.on) return 'off (the default). Your agents take answers only in Claude Code.';
-  return `on. You can answer your agents from TeamFlow. Claude Code waits up to ${held.waitSeconds} seconds for an answer from TeamFlow, then asks here.`;
+  if (!held.on) return 'off. Your agents take answers only in Claude Code. `teamflow two-way on` turns answers from TeamFlow back on.';
+  return `on (the default). You can answer your agents from TeamFlow. Claude Code waits up to ${held.waitSeconds} seconds for an answer from TeamFlow, then asks here.`;
 }
 
 // --- the question's id -----------------------------------------------------
@@ -199,6 +209,47 @@ export async function answerOutcome(config = {}, session, id, outcome, { timeout
 
 export const streamSessionOf = (sessionId) => core.sessionBlock({ sessionId })?.id;
 
+const ASK_KINDS = new Set(['choice', 'permission', 'question']);
+
+/**
+ * `POST /v1/members/asks`: the question this machine waits on, so the
+ * people who may answer it can read it in TeamFlow. One line from
+ * `askLines`, never the tool's input. Every failure is false.
+ */
+export async function sendAsk(config = {}, sessionId, line, { agent = 'main', timeoutMs = 2000, fetchImpl = fetch } = {}) {
+  const session = streamSessionOf(sessionId);
+  if (!session || !line || !ASK_KINDS.has(line.asks) || !validAskId(line.askId)) return false;
+  const key = core.readJson(core.sessionPath(sessionId))?.binding?.key;
+  const machine = core.machineId();
+  return postAsks(config, {
+    session, agent: String(agent || 'main').slice(0, 80), ...(key ? { key } : {}), ...(machine ? { machine } : {}), ask: line,
+  }, { timeoutMs, fetchImpl });
+}
+
+/** `POST /v1/members/asks {session, ended: true}`: the session went on without TeamFlow. */
+export async function endAsks(config = {}, sessionId, { timeoutMs = 1500, fetchImpl = fetch } = {}) {
+  const session = streamSessionOf(sessionId);
+  if (!session) return false;
+  return postAsks(config, { session, ended: true }, { timeoutMs, fetchImpl });
+}
+
+async function postAsks(config, body, { timeoutMs, fetchImpl }) {
+  const cred = await core.credential(config);
+  if (!cred) return false;
+  try {
+    const response = await fetchImpl(`${core.serviceUrl(config)}/v1/members/asks`, {
+      method: 'POST',
+      headers: { [cred.header]: cred.value, 'content-type': 'application/json' },
+      body: JSON.stringify(body),
+      redirect: 'error',
+      signal: AbortSignal.timeout(Math.max(1, timeoutMs)),
+    });
+    return response.ok;
+  } catch {
+    return false;
+  }
+}
+
 // --- the waiting hook -------------------------------------------------------------
 
 /**
@@ -209,16 +260,19 @@ export const streamSessionOf = (sessionId) => core.sessionBlock({ sessionId })?.
  */
 export async function waitForAnswer(input = {}, {
   config, now = () => Date.now(), sleep = (ms) => new Promise((r) => setTimeout(r, ms)),
-  fetchImpl = fetch, held = twoWaySwitch(), personOn,
+  fetchImpl = fetch, held = twoWaySwitch(),
 } = {}) {
   if (!held.on || held.waitSeconds <= 0) return undefined;
   if (input.reporter_tool) return undefined;              // Claude Code only
-  const agentViewOn = personOn ?? (await import('./agent-view.mjs')).personSwitch().on;
-  if (!agentViewOn) return undefined;
   const askId = askIdOf(input);
   const session = streamSessionOf(input.session_id);
   if (!askId || !session) return undefined;
   const cfg = config || core.loadConfig(input.cwd || process.cwd());
+  // Not signed in: nobody can answer, so Claude Code asks at once.
+  if (!(await core.credential(cfg))) return undefined;
+  // The question first, so the people who may answer it can read it.
+  const [line] = (await import('./asking.mjs')).askLines(input, now(), { twoWay: true }).lines;
+  if (line) await sendAsk(cfg, input.session_id, line, { agent: input.agent_id || 'main', fetchImpl });
   const end = now() + held.waitSeconds * 1000;
   for (;;) {
     const last = now() + POLL_MS >= end;
@@ -245,6 +299,12 @@ export async function questionAnswer(sessionId, { config, fetchImpl = fetch, hel
   if (mark?.kind !== 'question' || !validAskId(mark.askId)) return undefined;
   const session = streamSessionOf(sessionId);
   const cfg = config || core.loadConfig(core.readJson(core.sessionPath(sessionId))?.cwd || process.cwd());
+  if (!mark.sent) {
+    // Once per question: what the session asks, so it can be answered in
+    // TeamFlow while it waits.
+    const asking = await import('./asking.mjs');
+    if (await sendAsk(cfg, sessionId, asking.questionLine(mark), { fetchImpl })) asking.markSent(sessionId, mark.askId);
+  }
   for (const answer of await fetchAnswers(cfg, session, mark.askId, { fetchImpl })) {
     const words = answer.kind === 'question' ? answerSentence(answer) : undefined;
     await answerOutcome(cfg, session, answer.id, words ? 'done' : 'expired', { fetchImpl });

@@ -22,6 +22,8 @@ import {
   resolveActorKey,
   applyTransition,
   bindingRefusal,
+  staleBindingFor,
+  touchBinding,
   candidate,
   chooseBinding,
   claimLaunch,
@@ -97,6 +99,9 @@ const DELIBERATE_END = new Set(['clear', 'logout', 'prompt_input_exit']);
 const LOCAL_ONLY = [...FAST, 'PreToolUse'];
 // Events that are work: a tool ran, or is about to.
 const TOOL_EVENTS = ['PreToolUse', 'PostToolUse', 'PostToolUseFailure'];
+
+// The tools whose use is an edit under the session's binding.
+const EDIT_TOOLS = new Set(['Edit', 'Write', 'MultiEdit', 'NotebookEdit']);
 
 export function newSession(sessionId, cwd, agentKey = undefined) {
   return {
@@ -927,6 +932,9 @@ export async function handleEvent(input = {}) {
    */
   const staleOrg = state.binding?.source === 'manual' ? bindingRefusal(state.binding, config) : undefined;
   if (staleOrg) delete state.binding;
+  // A binding whose ticket shipped, or with no edit for a day, names
+  // nothing any more (MACLEOD-949). The session forgets it the same way.
+  if (state.binding?.source === 'manual' && staleBindingFor(cwd, config, state.binding.key)) delete state.binding;
   // A converted ad hoc key (MACLEOD-639, ADHOC-15): the session and the
   // binding files follow it to the ticket before anything is detected,
   // so the manual candidate and the session's own agree on the new key.
@@ -934,6 +942,10 @@ export async function handleEvent(input = {}) {
   const { candidates, info, refused } = detectCandidates(resolved, cwd, state, config);
   state.binding = chooseBinding(state, candidates);
   const justBound = Boolean(state.binding?.key && state.binding.key !== beforeKey);
+  // An edit keeps the binding it was made under fresh (MACLEOD-949).
+  if (state.binding?.source === 'manual' && EDIT_TOOLS.has(resolved.tool_name)) {
+    touchBinding(cwd, config, state.binding.key);
+  }
   state = enrichBinding(state, resolved);
 
   /*
@@ -1187,6 +1199,14 @@ export async function handleEvent(input = {}) {
       if (move && recordMove(move)) noteDirection(sessionId, agentKey, { kind: 'note', text: moveLine(move) });
     } catch { /* the trailer still names the bound ticket */ }
   }
+  // What this thread changed, for tracks (MACLEOD-936): hashed file
+  // names and a Claude Code Project id, kept on this machine only.
+  if (event === 'PostToolUse' || input.project_id) {
+    try {
+      const { noteTrackSignals } = await import('./tracks.mjs');
+      noteTrackSignals(state, input);
+    } catch { /* a track misses one signal; the others still join it */ }
+  }
   saveSession(state);
 
   /*
@@ -1217,7 +1237,13 @@ export async function handleEvent(input = {}) {
 
   // Synchronous SessionStart/UserPromptSubmit must stay fast so they never hold up the tool.
   // Async tool/task/stop hooks publish to the service (or legacy S3).
-  if ((!LOCAL_ONLY.includes(event) || asked.ask) && state.binding?.key) {
+  /*
+   * MACLEOD-939: a notice that asks nothing of the person says nothing.
+   * Claude Code's idle notice comes a minute after every turn; only a
+   * permission, a choice, a form or a confirmed question reaches the board.
+   */
+  const quietNotice = event === 'Notification' && !asked.ask;
+  if (((!LOCAL_ONLY.includes(event) && !quietNotice) || asked.ask) && state.binding?.key) {
     // What TeamFlow told this agent (MACLEOD-726/733), for the card's Progress line.
     /*
      * What the model used on this card (MACLEOD-882), read from Claude
@@ -1313,6 +1339,12 @@ export async function handleEvent(input = {}) {
    * the tool is waiting — it does no network at all: it closes runs
    * that have gone silent with file writes and posts nothing.
    */
+  // Tracks (MACLEOD-936): the main session groups this machine's threads
+  // and sends the tracks that changed, at most every two minutes.
+  if (event === 'Stop' && !agentKey) {
+    const { tracksOnStop } = await import('./tracks.mjs');
+    await tracksOnStop(config, { cwd });
+  }
   if (event === 'Stop' || event === 'SessionStart') {
     const { reconcileOnHook } = await import('./reconcile.mjs');
     /*
@@ -1411,6 +1443,12 @@ export async function handleEvent(input = {}) {
     const local = await sessionStartLines(config, state);
     if (local.performed.length) state.actions = [...(state.actions || []), ...local.performed].slice(-16);
     notices = local.notices;
+    // The team set-up changed (MACLEOD-938): one line, local files only.
+    try {
+      const { setupNotice } = await import('./setup.mjs');
+      const line = setupNotice({ data: dataDir() });
+      if (line) notices = [...notices, line];
+    } catch { /* nothing to say */ }
     if (local.performed.length) saveSession(state);
     // The organisation's check columns (MACLEOD-639): the command that
     // counts and its note, in its own words, read from the cache the last
@@ -1537,6 +1575,15 @@ export async function handleEvent(input = {}) {
    * hook reads nothing and waits for nothing. Claude Code only: the
    * transcript is Claude Code's.
    */
+  // MACLEOD-946: the person answered in Claude Code, or the session went
+  // on. The open question TeamFlow holds ends now, words and all.
+  if (asked.endedAsk) {
+    try {
+      const { endAsks } = await import('./two-way.mjs');
+      await endAsks(config, sessionId);
+    } catch { /* it ends by itself within a week */ }
+  }
+
   if (!input.reporter_tool) {
     try {
       const { kick, noteAsk } = await import('./agent-view.mjs');

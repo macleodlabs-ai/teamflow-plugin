@@ -569,6 +569,91 @@ export function preferBinding(local, user) {
   return (user.boundAt || '') > (local.boundAt || '') ? user : local;
 }
 
+// --- a binding goes stale (MACLEOD-949) ------------------------------
+//
+// This repository's binding to MACLEOD-839 was made by hand on
+// 2026-09-25. Its work merged the same day, and for a week every edit in
+// the main session still reported under it and every dispatch stamped it
+// into a plan: seven plans held it as "running/build (dispatched)", and
+// each report put its finished card back to Local Dev. A binding says
+// "this ticket now"; it stops saying so when the ticket ships or when a
+// day passes with no edit on it. A stale binding is never stamped into
+// a plan or a report. Nothing is deleted: the file stays, `work-on` or
+// `bind` makes it fresh again, and a commit or branch naming a key still
+// attributes the work.
+
+/** A day with no edit under a binding makes it stale. */
+export const BINDING_IDLE_MS = 24 * 60 * 60 * 1000;
+/** A binding's `usedAt` is written at most this often. */
+const BINDING_TOUCH_MS = 60 * 60 * 1000;
+
+/** When this machine proved `key` merged (merged.mjs's sent file), or undefined. */
+export function shippedAt(key) {
+  if (!key) return undefined;
+  const held = readJson(path.join(dataDir(), 'merged-sent.json')) || {};
+  const at = held[String(key).toUpperCase()];
+  return typeof at === 'string' ? at : undefined;
+}
+
+/**
+ * Whether a binding no longer speaks for this repository. Pure: the
+ * caller passes when its ticket shipped. Shipped after it was bound, or
+ * a day since it was bound or last had an edit, is stale. A binding with
+ * no time at all (written before `boundAt`) is left alone.
+ */
+export function bindingStale(binding, { now = Date.now(), shipped } = {}) {
+  if (!binding?.jiraKey && !binding?.key) return false;
+  const bound = binding.boundAt ? Date.parse(binding.boundAt) : Number.NaN;
+  if (shipped && Number.isFinite(bound) && Date.parse(shipped) > bound) return true;
+  const used = Math.max(
+    Number.isFinite(bound) ? bound : 0,
+    binding.usedAt ? Date.parse(binding.usedAt) || 0 : 0,
+  );
+  if (!used) return false;
+  return now - used > BINDING_IDLE_MS;
+}
+
+/** The binding record, or undefined when it is stale. */
+export function freshBinding(record, { now = Date.now() } = {}) {
+  if (!record) return record;
+  const key = record.jiraKey || record.key;
+  return bindingStale(record, { now, shipped: shippedAt(key) }) ? undefined : record;
+}
+
+/** Whether the binding file that names `key` here is stale. False when none does. */
+export function staleBindingFor(cwd, config = {}, key, { now = Date.now() } = {}) {
+  if (!key) return false;
+  try {
+    for (const file of [localBindingPath(cwd), ...userBindingPaths(cwd, config)]) {
+      const held = readJson(file);
+      if (held?.jiraKey === key) return !freshBinding(held, { now });
+    }
+  } catch { /* unreadable: not known to be stale */ }
+  return false;
+}
+
+/**
+ * An edit under `key`: the binding file that names it says when it was
+ * last used, so a binding in daily use never goes stale. At most once an
+ * hour per file. Never throws.
+ */
+export function touchBinding(cwd, config = {}, key, at = new Date()) {
+  try {
+    if (!key) return false;
+    const stamp = at instanceof Date ? at : new Date(at);
+    const files = [localBindingPath(cwd), ...userBindingPaths(cwd, config)];
+    for (const file of files) {
+      const held = readJson(file);
+      if (held?.jiraKey !== key) continue;
+      const last = Date.parse(held.usedAt || held.boundAt || '') || 0;
+      if (stamp.getTime() - last < BINDING_TOUCH_MS) return false;
+      writeJson(file, { ...held, usedAt: stamp.toISOString() });
+      return true;
+    }
+  } catch { /* an unwritten stamp only shortens the binding's life */ }
+  return false;
+}
+
 /**
  * Write the local binding, and keep it out of the repository's history.
  *
@@ -3162,7 +3247,10 @@ export function detectCandidates(input, cwd, state = {}, config = {}) {
       for (const ticket of workflow.tickets || []) seen.push(ticket.key);
     }
   } catch { /* a workflows file that cannot be read teaches nothing, and breaks nothing */ }
-  const candidates = issueCandidates(input, info, manual, config, knownPrefixes(config, seen));
+  // A stale binding names nothing (MACLEOD-949): its ticket shipped, or
+  // a day passed with no edit on it.
+  const fresh = manual.map((one) => freshBinding(one));
+  const candidates = issueCandidates(input, info, fresh, config, knownPrefixes(config, seen));
   if (state.binding?.key) {
     const session = candidate(state.binding.key, state.binding.confidence || 1, state.binding.source || 'session', state.binding);
     if (session) candidates.push(session);

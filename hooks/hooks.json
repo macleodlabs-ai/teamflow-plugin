@@ -1,5 +1,6 @@
 {
   "description": "Zero-touch TeamFlow delivery reporting",
+  "modules": ["./teamflow-mod.mjs"],
   "hooks": {
     "SessionStart": [
       {

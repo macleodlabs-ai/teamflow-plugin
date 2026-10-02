@@ -15,11 +15,15 @@
 //   Claude Code's own `idle_prompt` confirms the person has not answered
 //   for a minute. Only then does the board hear of it.
 //
-// Never the question, the tool's input, the command, the URL or a path.
-// The one exception is agent view (MACLEOD-852): when the person and the
-// organisation both turned it on, `askLines` gives the question and its
-// option labels, or a permission's plain words, as stream lines. Those go
-// only into the agent view stream, never onto the report.
+// Never the question, the tool's input, the command, the URL or a path
+// on the report. Two exceptions, both apart from the report:
+// - agent view (MACLEOD-852): when the person and the organisation both
+//   turned it on, `askLines` gives the question and its option labels, or
+//   a permission's plain words, as stream lines;
+// - answers from TeamFlow (MACLEOD-946, on by default): the same one line,
+//   with its id, goes to `POST /v1/members/asks` (two-way.mjs), so the
+//   people who may answer it can read it. For an open question that is
+//   its last sentence, secrets redacted (`questionLine`).
 //
 // A local mark (`asking/<digest>.json`) lets the one-minute check-in
 // leave a session alone while it asks. A typed prompt or a tool that ran
@@ -60,9 +64,46 @@ function mark(sessionId, ask, now) {
   const entry = {
     kind: ask.kind, ...(ask.tool ? { tool: ask.tool } : {}), sure: Boolean(ask.sure), at: new Date(now).toISOString(),
     ...(ask.askId ? { askId: ask.askId } : {}),
+    ...(ask.question ? { question: ask.question } : {}),
+    ...(ask.sent ? { sent: true } : {}),
   };
   core.writeJson(askingPath(sessionId), entry);
   return entry;
+}
+
+const QUESTION_WORDS_MAX = 300;
+
+/** The last sentence of a turn that ends on a question, secrets redacted. */
+export function lastQuestion(message) {
+  const text = String(message || '').replace(/```[\s\S]*?```/g, ' ').trim();
+  const last = text.split(/\n\s*\n/).map((p) => p.trim()).filter(Boolean).at(-1) || '';
+  const sentences = last.split(/(?<=[.!?])\s+/).map((s) => s.trim()).filter(Boolean);
+  const pick = [...sentences].reverse().find((s) => s.includes('?')) || sentences.at(-1) || '';
+  const one = cleanLine(redactSecrets(pick)).replace(/\s+/g, ' ').trim();
+  return one.length > QUESTION_WORDS_MAX ? `${one.slice(0, QUESTION_WORDS_MAX - 1)}…` : one;
+}
+
+/** The one line an open question sends to TeamFlow (MACLEOD-946). */
+export function questionLine(held = {}) {
+  return {
+    t: held.at, role: 'assistant', asks: 'question', askId: held.askId,
+    text: held.question || 'Your agent asked you a question at the end of its turn.',
+  };
+}
+
+/** The open question reached TeamFlow; it is not sent again. */
+export function markSent(sessionId, askId) {
+  const held = askingOf(sessionId);
+  if (!held || held.askId !== askId) return false;
+  core.writeJson(askingPath(sessionId), { ...held, sent: true });
+  return true;
+}
+
+/** Clear the mark; `{ clear, endedAsk? }` — the id TeamFlow holds, if it holds one. */
+function clearStep(sessionId) {
+  const held = askingOf(sessionId);
+  if (!clearAsking(sessionId)) return {};
+  return { clear: true, ...(held?.sent && held.askId ? { endedAsk: held.askId } : {}) };
 }
 
 /** True for the events this module reads without classifying a stage. */
@@ -81,7 +122,7 @@ export function askStep(input = {}, { now = Date.now() } = {}) {
   const sessionId = input.session_id;
   const event = input.hook_event_name;
   if (!sessionId || sessionId === 'unknown-session') return {};
-  if (CLEARS.has(event)) return clearAsking(sessionId) ? { clear: true } : {};
+  if (CLEARS.has(event)) return clearStep(sessionId);
   if (event === 'PermissionRequest') {
     const tool = BUILTIN_TOOL.test(String(input.tool_name || '')) ? input.tool_name : undefined;
     return { ask: pick(mark(sessionId, { kind: 'permission', tool, sure: true }, now)) };
@@ -111,10 +152,10 @@ export function askStep(input = {}, { now = Date.now() } = {}) {
   }
   if (event === 'Stop') {
     if (endsWithQuestion(input.last_assistant_message)) {
-      mark(sessionId, { kind: 'question', sure: false }, now);
+      mark(sessionId, { kind: 'question', sure: false, question: lastQuestion(input.last_assistant_message) }, now);
       return {};
     }
-    return clearAsking(sessionId) ? { clear: true } : {};
+    return clearStep(sessionId);
   }
   return {};
 }

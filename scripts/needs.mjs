@@ -160,7 +160,9 @@ export function forYouLines(items = [], asked = []) {
   return items.map((item) => {
     const opts = item.options?.length ? ` Options: ${item.options.join(', ')}.` : '';
     const from = mine.has(item.id) ? 'you' : String(item.by || 'someone').split('@')[0];
-    return `${item.key} · ${KIND_WORDS[item.kind] || 'a request'} from ${from}: ${item.text}${opts} (${item.id})`;
+    /* MACLEOD-931: TeamFlow's own decision states what happens with no answer. */
+    const fallback = item.defaultWords ? ` ${item.defaultWords}` : '';
+    return `${item.key} · ${KIND_WORDS[item.kind] || 'a request'} from ${from}: ${item.text}${opts}${fallback} (${item.id})`;
   });
 }
 
@@ -200,9 +202,23 @@ export async function askMain(args = [], ctx = {}) {
     print(`TeamFlow took back the item on ${parsed.key}.`);
     return 0;
   }
-  const out = await send('POST', '', parsed.body, config);
+  /* MACLEOD-931, R3: an agent's question ends with its session, so the
+     service is told which session asked. Never throws: no session, no field. */
+  let session = ctx.session;
+  if (session === undefined) {
+    try { session = core.latestSessionForCwd(process.cwd(), config)?.sessionId; } catch { session = undefined; }
+  }
+  const body = session ? { ...parsed.body, session: String(session) } : parsed.body;
+  const out = await send('POST', '', body, config);
   if (!out.ok) { fail(`TeamFlow did not send it: ${out.reason}`); return out.status === 400 ? 2 : 1; }
   const need = out.body?.need || {};
+  /* MACLEOD-931, R3: a person has at most five open questions. The sixth
+     waits, and the asker is told why in plain words. */
+  if (need.status === 'held') {
+    print(need.heldWords || `${whoWords(need)} already has 5 open questions. TeamFlow holds this one and shows it when one of them ends.`);
+    print(`Id: ${need.id}.`);
+    return 0;
+  }
   // parseAsk returns `{ body }`: the key is `body.key`, and the service
   // echoes it on `need.key` (MACLEOD-914: this read `parsed.key`, undefined).
   print(`TeamFlow put ${KIND_WORDS[need.kind] || 'the item'} for ${whoWords(need)} on ${need.key || parsed.body.key}. It shows in their Needs you. Id: ${need.id}.`);

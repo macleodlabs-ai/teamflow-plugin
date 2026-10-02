@@ -25,6 +25,7 @@ import { execFile, execFileSync, spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
 import * as core from './core.mjs';
+import { fingerprint as setupFingerprint, noteWanted } from './setup.mjs';
 import { sentence } from './words.mjs';
 
 export const BEAT_MS = 120_000;
@@ -784,6 +785,13 @@ export function buildBeat(sessionId, { at = new Date().toISOString(), alive = tr
   // named them at its last stop (spend.mjs, MACLEOD-882).
   if (MODEL_ID.test(String(main?.spend?.model || ''))) beat.model = main.spend.model;
   if (VERSION_ID.test(String(main?.spend?.claudeVersion || ''))) beat.claudeVersion = main.spend.claudeVersion;
+  // The team set-up on this machine (MACLEOD-938): versions and digests
+  // only, on a live beat; the last beat of a session has nothing to add.
+  try {
+    const machine = alive && core.machineId();
+    const setup = machine ? setupFingerprint({ machine: core.digest(machine), data: core.dataDir() }) : undefined;
+    if (setup) beat.setup = setup;
+  } catch { /* no fingerprint this beat */ }
   beat.agents = actors
     .filter((one) => one.agentKey && one.agent?.startedAt && !one.agent.endedAt && !one.ended && !one.absorbedInto)
     .sort((a, b) => (Date.parse(b.updatedAt) || 0) - (Date.parse(a.updatedAt) || 0))
@@ -843,6 +851,8 @@ export async function runHeartbeat({
       const result = await send(buildBeat(sessionId, { at, alive: sessionAlive, endedReason, continues, repo }), core.loadConfig(cwd));
       sent = Boolean(result?.ok);
       if (sent && (Array.isArray(result.others) || Array.isArray(result.holds))) reply = othersOf(result);
+      // Which team set-up this machine should have (MACLEOD-938).
+      if (sent && result.teamSetup?.version) noteWanted(result.teamSetup.version, { data: core.dataDir() });
     } catch { /* this beat is skipped; the next one is two minutes away */ }
     try {
       const held = core.readJson(file);

@@ -142,7 +142,7 @@ The rule has three halves and all three are load-bearing:
 
 The value discloses nothing new to whoever can read it. It is only ever the address of a member of the account the document belongs to, and an organisation's own members' addresses are already listed on its members page to its own members. What it adds is the fact that this report and that member are the same human, which is what lets the dashboard draw one person instead of one per name they report under.
 
-A workflow document is not stamped: it already names its `actor`, and a second answer to who is running a run is a second thing to go stale.
+A workflow document is not stamped with `member`: it already names its `actor`, and a second answer to who is running a run is a second thing to go stale. It carries `createdBy` instead (MACLEOD-946): the address of the member whose credential wrote the run first, stamped by the service the same way and kept from that first write only, so it never goes stale. A payload's `createdBy` is dropped. A run written before the field existed has none. It says who may answer the questions its tickets ask (see "Questions and answers from TeamFlow").
 
 ### One event
 
@@ -385,6 +385,8 @@ It may carry:
 - `phases[]`: `n`, `state`, `tickets[]`
 - `origin` — `auto` when the plugin created the run itself because a session dispatched agents with no run to hold them (MACLEOD-639). Absent on every run a person created. The board draws an `auto` run as unplanned: its nodes are real, its edges are unknown until `teamflow workflow depends` draws them. `tickets[].addedBy` gains `dispatch` for the same reason: a node the hooks put in the pool because an agent was sent to work on it. Its title is the agent's label and one-line task as the launch registry already carries them, capped like any summary: the label at 64 characters and the task (the `Agent` tool's `description`) at 80, each collapsed to one line; the prompt the agent was given is not an input to it
 - `directions[]` — what auto-continue told a session to do next (MACLEOD-726): `at`, `kind` (`fix`, `points`, `finish`, `next`, `waiting`; and for an agent told to wait, MACLEOD-733, `start` and `wait`), `key` (absent on `waiting`) and `said` (≤ 240), capped at 20. `said` is the plugin's own fixed words with keys, step names, counts and the run's name reduced to plain characters; never a title, a point's text, a note or anything else the service sent. `continued` is how many times the plugin kept a session going on this run. The Progress view reads both
+- `origin` may also be `track` (MACLEOD-936): a run the plugin found rather than one anybody made. An `auto` run becomes a track too; it keeps its id and its `auto`.
+- `track` — one person's threads grouped into an impromptu project (MACLEOD-936). `members[]` (`id` and `kind`: `session` or `agent`; the same ids every execution already carries; at most 50), `state` (`active`, `quiet` or `ended`), `by[]` (the names of the signals that joined it: `person`, `project`, `parent`, `run`, `ticket`, `branch`, `files`, `waits`), `startedAt`, `lastAt`, `endedAt`, and `named` and `mergedInto` once a person renamed or merged it. The grouping runs on the machine. File names are hashed there and never sent; branch names, prompts and agent descriptions are inputs to it and never outputs. The name is the tickets' titles or the first agent's description, both already reported. The same repository in the same hour joins nothing on its own. `WORKFLOW_CARRIED` keeps `track` when a run republishes without it, and a person's rename, merge, split or move (`/v1/members/tracks/{id}/…`, kept in `tracks/corrections.json`) is re-applied to every later report until the machine has pulled it.
 
 **The user's order does not travel.** The order is a prompt, and the rule
 above admits no exception for this one: it selects tickets on the machine and
@@ -431,8 +433,29 @@ stall, a crash or an orphaned agent from quiet work.
     "paused": { "reason": "rate_limit" | "billing", "until": "<ISO>", "estimated": true | false, "model": "<model name>" },
     "limits": [ { "reason", "until", "estimated", "model", "agentId", "name", "key" } ],   (≤ 8, MACLEOD-920)
     "model": "<model name>", "claudeVersion": "<version>", "pluginVersion": "<version>",
-    "agents": [ { "agentId", "name", "key", "stage", "status", "lastEventAt", "model" } ] } }
+    "agents": [ { "agentId", "name", "key", "stage", "status", "lastEventAt", "model" } ],
+    "setup": { "machine": "<12-hex digest>", "version": "3" | "3.1", "project": "<project id>",
+               "claudeMd": "<16-hex digest>", "settings": "<16-hex digest>", "mcp": "<16-hex digest>",
+               "drift": true | false, "missing": 0..100,
+               "tools": [ { "name": "node", "version": "22.3.0" } ] } } }   (live beats only, MACLEOD-938)
 ```
+
+- **The team set-up** (MACLEOD-938). `setup` says how this machine stands
+  against the organisation's Claude Code set-up, which `teamflow setup`
+  offered and the person applied. `machine` is a digest of the plugin's
+  machine id; `version` is the set-up version applied (`"3"`, or `"3.1"`
+  for a project's copy); `claudeMd`, `settings` and `mcp` are SHA-256
+  digests (16 hex) of the parts TeamFlow wrote, as they are now: the
+  shared CLAUDE.md file it owns, the settings keys and the MCP entries it
+  added. `drift` is true when one of them changed since it was applied;
+  `missing` counts tools and variables still to do; `tools` is each
+  checked tool's name and version number. Never a file's contents, a
+  path, a setting's value or a variable's value. A machine that never
+  applied the set-up sends `{ "machine" }` alone, so its owner can see it
+  is not set up. The service keeps the newest one per person and machine
+  at `team-setup/machines/<member>--<machine>.json` (the member id is the
+  service's own stamp, from the credential), and its reply says
+  `teamSetup: { "version" }`, the version this machine should have.
 
 - **Which model and which builds** (MACLEOD-846). `model` is a model name
   (letters, digits, `.`, `-`, `:`, `[`, `]`, at most 64), `claudeVersion` and
@@ -993,6 +1016,23 @@ commit subject and no link. The cap is tighter than the report's own
 this contract, so the ceiling is the sentence and not the field it came
 from.
 
+**TeamFlow updates your tracker (MACLEOD-949).** An organisation setting,
+on unless an owner or admin turns it off (`GET/PUT
+/v1/members/tracker-updates`; each change is a version and an Events line).
+When a plan step is proved shipped -- merged to the default branch, and
+deployed where the plan deploys -- TeamFlow moves the issue to Done through
+the existing connection and adds one fixed comment, nothing composed:
+
+```
+TeamFlow moved this issue to Done. Its work is merged into main. Reopen the issue to bring the card back.
+TeamFlow moved this issue to Done. Its work is merged and deployed. Reopen the issue to bring the card back.
+```
+
+An issue the tracker holds done, cancelled or deleted is never written, and
+a reopen after the proof is never undone by the same proof. Off, TeamFlow
+writes nothing to the tracker on its own: no Done, no comment, no checklist,
+no new ticket.
+
 **A gate's verdict (ADHOC-19)** is the one other comment. For the newest
 entry of an issue document's `verdicts[]`:
 
@@ -1078,9 +1118,27 @@ TeamFlow has ever verified.
 
 ## Questions in the agent view stream (MACLEOD-852)
 
-Agent view (opt-in, organisation and machine) may carry a pending question's words and its option labels, in a line marked `asks`, cleaned like every other line. Outside agent view nothing new leaves the machine: a report carries only `asks.kind` and, for a permission, a built-in tool name (MACLEOD-845).
+Agent view (opt-in, organisation and machine) may carry a pending question's words and its option labels, in a line marked `asks`, cleaned like every other line. A report still carries only `asks.kind` and, for a permission, a built-in tool name (MACLEOD-845).
 
-With two-way on (MACLEOD-848, organisation and machine, off by default), a question's stream line adds `askId` (a hash, `ask_<hex>`) and `questions` (a count), and each safe chunk adds `machine` (this machine's random id). No new field reaches a report.
+With answers from TeamFlow on (the default since MACLEOD-946), a question's stream line adds `askId` (a hash, `ask_<hex>`) and `questions` (a count), and each safe chunk adds `machine` (this machine's random id). No new field reaches a report.
+
+## Questions and answers from TeamFlow (MACLEOD-848, MACLEOD-946)
+
+An owner-approved exception to "derived facts only", like agent view, and the second one about what an agent asks. The owner, 2026-10-01: "Always allow answers and inputs from team flow." It is on by default. An owner or admin can turn it off for the organisation (`twoWay: false` on `PUT /v1/members/settings/agent-view`, any plan), and a person can turn it off for their computer (`teamflow two-way off`). Off, nothing below is sent or kept.
+
+**What is sent.** While a session waits on a person, the plugin sends one line to `POST /v1/members/asks`, apart from the report:
+
+- `session` (the stream's session id), `agent` (`main` or the agent's id), `key` (the bound ticket, when there is one), `machine` (this machine's random id)
+- `ask`: `asks` (`choice`, `permission` or `question`), `askId`, `t`, and
+  - for a choice: the question (at most 300 characters) and its option labels (at most 8, each at most 80), and `questions` (a count);
+  - for a permission: the plain words "wants to run a Bash command" and a built-in tool's name. Never the command, a path, a URL or the tool's input;
+  - for an open question at the end of a turn: its last sentence, at most 300 characters, with secrets taken out.
+
+Every text is one cleaned line. `{session, ended: true}` says the session went on (its person typed, a tool ran, or it ended), so its open questions end.
+
+**How long it is kept.** Sealed with the organisation's own key, at `asks/<session>/<askId>.json` in the organisation's store, only while the question is open. It is erased, with every old version, when the question is answered, when the machine stops waiting for it, when its session goes on, or after 7 days (MACLEOD-931: every question ends). The state route never serves it.
+
+**Who reads it and who answers.** `GET /v1/members/asks?ticket=<KEY>` gives the words only to a signed-in person who may answer: the session's own developer, an owner or admin of the organisation, or the member who created a plan the ticket is in (the run's `createdBy`). Never a viewer, a device credential, CI or support access. The same rule answers through `POST /v1/members/sessions/{session}/answers`. An answer goes only to the machine that asked; typed words (at most 500) are kept sealed until that machine takes them, once, and then dropped. A permission is allowed only when a person presses Allow. Nothing received reaches a shell. The Events feed records `session.answered` with who, the session, the kind of answer and in which role (developer, lead, plan owner), never the words.
 
 ## Tracker comments, read on demand (MACLEOD-840)
 

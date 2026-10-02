@@ -1256,26 +1256,90 @@ export function openTickets(workflow) {
   return (workflow.tickets || []).filter((t) => t.state !== 'done' && t.state !== 'skipped');
 }
 
+/** The statuses a run is still open in: the service's OPEN_RUNS too. */
+export const OPEN_RUN_STATUSES = ['planning', 'running', 'stalled', 'blocked'];
+
+/**
+ * Whether a run is over because all its work is: it holds tickets, and
+ * every one is done or skipped. The same rule as the service's
+ * (`recover.Pass._all_settled`, MACLEOD-949), so the plugin and the
+ * board never disagree about whether a plan is finished.
+ */
+export function allFinished(workflow) {
+  return Boolean(workflow) && OPEN_RUN_STATUSES.includes(workflow.status)
+    && (workflow.tickets || []).length > 0 && !openTickets(workflow).length;
+}
+
 /**
  * A run with nothing open finishes itself.
  *
- * "The last ticket verified finishes the run." A run left `running`
- * with nothing to do sits on the board and in every picker for ever,
- * and nothing was ever going to move it: the orchestrator's last act is
+ * "The last ticket verified finishes the run." A run left open with
+ * nothing to do sits on the board and in every picker for ever, and
+ * nothing was ever going to move it: the orchestrator's last act is
  * closing the last ticket, and the step after that is the one it is
  * most likely to be interrupted before reaching.
  *
- * Only from `running`. A `planning` run with no tickets has not
- * finished, it has not started; `blocked` and `cancelled` are
- * somebody's decision and not this function's to overturn.
+ * From any open status (MACLEOD-949): "website-refactor" read
+ * "planning" at 27 of 27 finished because this once finished only a
+ * `running` run. A run with no tickets has not finished, it has not
+ * started; `cancelled` and `archived` are over already.
  */
 export function finishRun(workflow) {
-  if (!workflow || workflow.status !== 'running') return false;
-  if (!(workflow.tickets || []).length) return false;
-  if (openTickets(workflow).length) return false;
+  if (!allFinished(workflow)) return false;
   workflow.status = 'done';
   workflow.updatedAt = now();
   return true;
+}
+
+/**
+ * Take what the service settled on this run (MACLEOD-949). The service
+ * proves a step shipped from its card and closes a finished plan, and
+ * the plugin's own copy never heard of either, so every later post of
+ * that copy put the step back to running: MACLEOD-811's step was set
+ * done twelve times on 2026-09-25 and undone eleven. The rule is the
+ * service's; this only copies its answer.
+ *
+ * Per step, the newer word wins: a step the service settled after the
+ * plugin last moved it takes the service's state, and a step the
+ * service opened again (Undo) does too. The run takes the service's
+ * end (`ended`, kept until Undo) or its reopen (`endUndone`). Local
+ * fields stay; nothing is deleted. Returns what changed. Pure.
+ */
+export function adoptServed(workflow, served) {
+  const out = { steps: [], status: undefined };
+  if (!workflow || !served || typeof served !== 'object') return out;
+  const theirs = new Map((served.tickets || []).filter((t) => t?.key).map((t) => [t.key, t]));
+  for (const ticket of workflow.tickets || []) {
+    const there = theirs.get(ticket.key);
+    if (!there || !TICKET_STATES.includes(there.state) || there.state === ticket.state) continue;
+    if (String(there.updatedAt || '') <= String(ticket.updatedAt || '')) continue;
+    ticket.state = there.state;
+    ticket.updatedAt = there.updatedAt;
+    if (there.state === 'done' || there.state === 'skipped') delete ticket.wait;
+    if (there.movedTo) ticket.movedTo = there.movedTo;
+    out.steps.push({ key: ticket.key, state: there.state });
+  }
+  if (out.steps.length) relevel(workflow);
+  const ended = served.ended && typeof served.ended === 'object' ? served.ended : undefined;
+  const undone = served.endUndone && typeof served.endUndone === 'object' ? served.endUndone : undefined;
+  const open = OPEN_RUN_STATUSES.includes(workflow.status);
+  if (ended && ['done', 'cancelled'].includes(served.status) && open) {
+    workflow.status = served.status;
+    workflow.ended = ended;
+    out.status = served.status;
+  } else if (served.status === 'archived' && open && !(workflow.tickets || []).length) {
+    // An empty plan the service archived after a day (MACLEOD-844).
+    workflow.status = 'archived';
+    out.status = 'archived';
+  } else if (!ended && undone && OPEN_RUN_STATUSES.includes(served.status) && !open
+      && String(undone.at || '') > String(workflow.updatedAt || '')) {
+    workflow.status = served.status;
+    delete workflow.ended;
+    out.status = served.status;
+  }
+  if (out.steps.length || out.status) workflow.updatedAt = served.updatedAt && String(served.updatedAt) > String(workflow.updatedAt || '')
+    ? served.updatedAt : workflow.updatedAt;
+  return out;
 }
 
 /**

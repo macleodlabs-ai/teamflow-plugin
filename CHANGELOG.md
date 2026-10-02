@@ -3,6 +3,32 @@
 What changed in each published version of the TeamFlow plugin, newest first.
 Only what a person using it would notice.
 
+## 0.3.56
+
+- **TeamFlow inside Claude Code.** A line above the prompt shows your
+  track and what needs you. Type `/teamflow-turn` to see your tracks
+  and Your turn. It is on by default; `teamflow mod off` turns it off.
+  It needs Claude Code 2.1.287 or later.
+  Older versions still load the plugin as before.
+- **Answers from TeamFlow are on by default.** The person, an owner or
+  admin, or the plan's owner can answer what an agent waits on.
+  Run `teamflow two-way off` to stop it on this computer.
+- **Your threads become tracks.** Work that belongs together is grouped
+  on this computer. Run `teamflow track` to rename, merge, split or move.
+  The signals stay on this computer.
+- **One team set-up.** `teamflow setup` shows the team's Claude Code
+  set-up first, then applies it. Your own lines and keys stay.
+- **One count everywhere.** `teamflow statusline` shows the same
+  number as Your turn.
+- **Quiet when idle.** An idle notice that asks you nothing stays on
+  this computer.
+- **Finished plans close by themselves.** A plan ends once every step is
+  done or skipped, and a step closes once its work is merged. Undo brings
+  a plan back for 7 days.
+- **An old binding stops counting.** A binding is ignored once its ticket
+  ships, or after a day with no edits. Run `teamflow work-on <KEY>` to
+  bind again. It never joins a plan by itself.
+
 ## 0.3.55
 
 - **Each agent on its own ticket.** Agents sent together no longer show

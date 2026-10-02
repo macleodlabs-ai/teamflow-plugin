@@ -77,6 +77,9 @@ const USAGE = `teamflow \u2014 delivery reporting for TeamFlow
   teamflow bind <issue> [--local] | unbind
                                    name the ticket by hand, or stop; --local writes
                                    the binding inside the repository, for a worktree
+  teamflow setup [--dry-run] [--yes]
+                                   offer your team's Claude Code set-up: shows what
+                                   it will change, asks once, keeps your own lines
   teamflow work-on <issue>         bind, with --local implied inside a git worktree;
                                    identical to bind everywhere else
   teamflow next [--dry-run]        take the top-priority open ticket and bind it
@@ -84,6 +87,8 @@ const USAGE = `teamflow \u2014 delivery reporting for TeamFlow
                                    as the table the dashboard shows
   teamflow update                  the Status update: what is live, merged,
                                    still being built and what needs you
+  teamflow statusline              one line for a status bar: what needs you
+                                   and how many agents work, as the dashboard counts
   teamflow card say <KEY> "<line>" [--by model|person]
                                    one plain line on the card about what a
                                    person gets from it; checked before it is sent
@@ -92,6 +97,7 @@ const USAGE = `teamflow \u2014 delivery reporting for TeamFlow
                                    put it in that person's Needs you; they answer
                                    in the app, and the answer comes back here
   teamflow needs                   what waits for you, and answers to what you asked
+  teamflow track list|rename|merge|split|move   your tracks, and fix how TeamFlow grouped them
   teamflow adhoc start "<what the work is>" | title "<...>" | done
                                    work that arrived without a ticket: TeamFlow
                                    mints the key; \`teamflow adhoc --help\` has the rest
@@ -134,7 +140,9 @@ const USAGE = `teamflow \u2014 delivery reporting for TeamFlow
                                    say to their tickets (off by default)
   teamflow two-way on|off|status [--wait <seconds>]
                                    whether you can answer your agents from
-                                   TeamFlow on this computer (off by default)
+                                   TeamFlow on this computer (on by default)
+  teamflow mod on|off|status        whether Claude Code shows your track and
+                                   Your turn inside it (on by default)
   teamflow hooks status | install           report automatically from that tool
   teamflow hooks uninstall --all            take all of it back out again
   teamflow hook --for <tool>                the hook entry itself; tools call this
@@ -329,6 +337,13 @@ async function status() {
   // waits for them (MACLEOD-894).
   const { statusLines: needLines } = await import('./needs.mjs');
   for (const line of await needLines(config)) print(line);
+  // The team set-up (MACLEOD-938): one line when it changed. Local files only.
+  try {
+    const { setupNotice } = await import('./setup.mjs');
+    const { dataDir } = await import('./core.mjs');
+    const line = setupNotice({ data: dataDir() });
+    if (line) print(`TeamFlow: ${line}`);
+  } catch { /* nothing to say */ }
   // The open failure points on the bound card (ADHOC-19): the checklist a
   // team picking the card up works from, so nobody has to ask what is left.
   const { openPointLines } = await import('./workflow.mjs');
@@ -899,6 +914,22 @@ async function deviceLogin(because, before, { noBrowser = false, canOpen = false
       ? ' Each report carries a one-hour access token; the long-lived part is sent '
         + 'only to TeamFlow\'s token endpoint.'
       : ''));
+  // The team's set-up (MACLEOD-938), offered right after sign-in: a
+  // preview and one question. Never in the way of the sign-in itself.
+  try {
+    const { runSetup } = await import('./setup.mjs');
+    const { dataDir } = await import('./core.mjs');
+    const project = await resolveProject(info.repository, config).catch(() => undefined);
+    if (process.stdin.isTTY) {
+      await runSetup({ args: [], config, print, project: project?.id, data: dataDir(), offer: true });
+    } else {
+      const { fetchBaseline } = await import('./setup.mjs');
+      const got = await fetchBaseline(config, project?.id);
+      if (got.ok && Object.keys(got.baseline?.setup || {}).length) {
+        print('Your team shares a Claude Code set-up. Run `teamflow setup` to see what it changes.');
+      }
+    }
+  } catch { /* the sign-in worked; the offer waits for `teamflow setup` */ }
 }
 
 // `teamflow org`, and `teamflow org switch <id>`.
@@ -1058,6 +1089,11 @@ try {
     const { main } = await import('./progress.mjs');
     process.exit(await main(args, { config }));
   }
+  else if (command === 'statusline') {
+    // Read-only, one line for a status bar (MACLEOD-932): the dashboard's one count.
+    const { main } = await import('./statusline.mjs');
+    process.exit(await main(args, { config }));
+  }
   else if (command === 'update') {
     // Read-only: the Status update from the board (MACLEOD-770).
     const { main } = await import('./update.mjs');
@@ -1078,6 +1114,11 @@ try {
     // What waits for this person, and answers to what they asked (MACLEOD-894).
     const { needsMain } = await import('./needs.mjs');
     process.exit(await needsMain(args, { config }));
+  }
+  else if (command === 'track') {
+    // Tracks (MACLEOD-936): list them, or rename, merge, split or move by hand.
+    const { trackMain } = await import('./tracks.mjs');
+    process.exit(await trackMain(args, { config }));
   }
   else if (command === 'workflow') {
     const { main } = await import('./workflow.mjs');
@@ -1183,18 +1224,25 @@ try {
   }
   else if (command === 'two-way') {
     // `teamflow two-way on|off|status [--wait <seconds>]` (MACLEOD-848):
-    // this machine's switch for answers from TeamFlow. The organisation's
-    // agent view and two-way option are the other halves; all must be on.
+    // this machine's switch for answers from TeamFlow. On by default
+    // (MACLEOD-946); `on` when it is already on changes nothing. The
+    // organisation's two-way option is the other half.
     const { setTwoWay, twoWayLine } = await import('./two-way.mjs');
     const [verb = 'status'] = args;
     const at = args.indexOf('--wait');
     if (verb !== 'status') {
       const held = setTwoWay(verb, at >= 0 ? { waitSeconds: Number(args[at + 1]) } : {});
       print(held.on
-        ? 'You can answer your agents from TeamFlow, when your organisation has it on. Your agents act on your answers.'
+        ? 'You can answer your agents from TeamFlow. Your agents act on your answers.'
         : 'Your agents take answers only in Claude Code. `teamflow two-way on` turns answers from TeamFlow back on.');
     }
     print(`Two-way: ${twoWayLine()}`);
+  }
+  else if (command === 'mod') {
+    // `teamflow mod on|off|status` (MACLEOD-941): the Claude Code mod's
+    // switch, on by default. `mod snapshot` is what the mod reads.
+    const { modMain } = await import('./mod.mjs');
+    process.exit(await modMain(args, { config, print }));
   }
   else if (command === 'statusline-tap') {
     // Chained from a statusline command: reads its JSON, prints nothing (MACLEOD-641).
@@ -1203,6 +1251,14 @@ try {
       const { usageTap } = await import('./resume.mjs');
       await usageTap(await readStdin(), { config: loadConfig(process.cwd()) });
     } catch { /* never in the way of the statusline */ }
+  }
+  else if (command === 'setup') {
+    // `teamflow setup [--dry-run] [--yes]` (MACLEOD-938): the team's
+    // Claude Code set-up, offered with a preview and never forced.
+    const { runSetup } = await import('./setup.mjs');
+    const { dataDir } = await import('./core.mjs');
+    const project = await resolveProject(info.repository, config).catch(() => undefined);
+    process.exit(await runSetup({ args, config, print, project: project?.id, data: dataDir() }));
   }
   else if (command === 'doctor') await doctor();
   else if (command === 'login') await login();

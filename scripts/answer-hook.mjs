@@ -1,13 +1,16 @@
 #!/usr/bin/env node
-// The waiting hook (MACLEOD-848), registered by plugin/hooks/hooks.json as
-// a synchronous PreToolUse hook for AskUserQuestion and a synchronous
-// PermissionRequest hook. two-way.mjs says why it must be synchronous.
+// The waiting hook (MACLEOD-848, MACLEOD-946), registered by
+// plugin/hooks/hooks.json as a synchronous PreToolUse hook for
+// AskUserQuestion and a synchronous PermissionRequest hook. two-way.mjs
+// says why it must be synchronous.
 //
-// With this machine's `teamflow two-way` off (the default) it reads one
-// config file and exits 0 with no output: Claude Code asks as always. On,
-// it waits up to `waitSeconds` for the developer's answer from TeamFlow
-// and prints Claude Code's own decision for it. Nothing else is printed,
-// and nothing received is run. Any error prints nothing and exits 0.
+// On by default. It sends the question to TeamFlow, waits up to
+// `waitSeconds` for an answer from someone who may give one, and prints
+// Claude Code's own decision for it. Nothing else is printed, and nothing
+// received is run. With `teamflow two-way off` it reads one config file
+// and exits 0 with no output: Claude Code asks as always. Any error
+// prints nothing and exits 0. A permission is never allowed unless a
+// person pressed Allow.
 import { failOpen, readStdin } from './hook-core.mjs';
 import { twoWaySwitch, waitForAnswer } from './two-way.mjs';
 import { drivenBy } from './driven.mjs';

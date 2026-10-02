@@ -65,12 +65,13 @@ import {
   TRIGGER_STAGES, cardFor, publishCard, readTracker, readWriteBack, trackerAskLines,
 } from './card.mjs';
 import {
-  dataDir, fitsRun, isOver, organisationScope, readJson, readWorkflows, saveSession, sessionPath,
+  dataDir, fetchState, fitsRun, isOver, organisationScope, readJson, readWorkflows, saveSession, sessionPath,
   writeJson, writeWorkflows,
 } from './core.mjs';
 import { projectFor, projectsCachePath } from './project.mjs';
 import {
-  autoCreate, cardOwed, cardSaid, homeRun, moveNode, openTickets, publish,
+  adoptServed, allFinished, autoCreate, cardOwed, cardSaid, homeRun, hygieneRow, moveNode,
+  OPEN_RUN_STATUSES, openTickets, publish,
 } from './workflow.mjs';
 
 /**
@@ -353,8 +354,9 @@ export function planRepairs({
 
   // 3. A run that is over, and a run that never started.
   for (const workflow of Object.values(workflows)) {
-    if (workflow.status === 'running' && (workflow.tickets || []).length
-        && !openTickets(workflow).length) {
+    // Any open status (MACLEOD-949): a `planning` run with every step
+    // finished never ended, because this asked only about `running`.
+    if (allFinished(workflow)) {
       repairs.push({
         kind: 'run-done',
         workflowId: workflow.id,
@@ -574,10 +576,57 @@ export function trackerAgrees(tracker, ticket) {
  * `dryRun` pays nothing and changes nothing, including the record of
  * the pass — printing a plan is not doing it.
  */
+/**
+ * Read back what the service settled on this machine's open runs
+ * (MACLEOD-949), a few a pass, the run checked longest ago first.
+ *
+ * The service is where a step is proved shipped (a merged report, a
+ * commit naming the key, the tracker's Done) and where a finished plan
+ * closes. The plugin only ever wrote, so its copy kept saying
+ * "running" and every later post undid the service: thirteen of our
+ * plans stayed open with their work shipped. This copies the service's
+ * answer (`adoptServed`); the `run-done` repair then ends a run whose
+ * steps are all finished. Our own organisation's documents only, through the
+ * dashboard's own route; nothing received is run. Never throws.
+ */
+export async function adoptServicePlans(config = {}, {
+  limit = 2, read = fetchState, at = new Date().toISOString(),
+} = {}) {
+  const changed = [];
+  try {
+    const state = readWorkflows(config);
+    const open = Object.values(state.workflows || {})
+      .filter((w) => w?.id && OPEN_RUN_STATUSES.includes(w.status))
+      .sort((a, b) => String(a.servedAt || '').localeCompare(String(b.servedAt || '')))
+      .slice(0, limit);
+    if (!open.length) return changed;
+    for (const workflow of open) {
+      const got = await read(`workflows/${encodeURIComponent(workflow.id)}.json`, config)
+        .catch(() => ({ ok: false }));
+      if (!got?.ok) break;
+      // Local only, never published: when this run was last compared.
+      workflow.servedAt = at;
+      const took = got.missing ? { steps: [] } : adoptServed(workflow, got.document);
+      // A run this leaves with every step finished is ended by the
+      // `run-done` repair below, which publishes it and rolls back if
+      // the service refuses.
+      if (took.steps.length || took.status) {
+        changed.push({ id: workflow.id, name: workflow.name, steps: took.steps.length, status: workflow.status });
+      }
+    }
+    writeWorkflows(state, config);
+  } catch { /* the next pass tries again */ }
+  return changed;
+}
+
 export async function reconcile(config = {}, {
   limit = LIMIT, now = Date.now(), dryRun = false, deep = false, exceptSession,
   at = new Date().toISOString(), announce, served, idleMs = idleClock({ served, config }),
+  adopt = adoptServicePlans,
 } = {}) {
+  // The service's word on each plan first (MACLEOD-949), so the repairs
+  // below are worked out from the plan as it really stands.
+  if (!dryRun && adopt) await adopt(config, { limit: deep ? 50 : 2, at });
   const state = readWorkflows(config);
   /*
    * Before anything is planned, and never on a dry run: a run written
@@ -800,13 +849,22 @@ async function pay(repair, state, config, { at, deep }) {
   if (repair.kind === 'run-done' || repair.kind === 'run-archived') {
     if (!workflow) return { landed: false };
     const was = workflow.status;
+    const rows = workflow.hygiene;
     workflow.status = repair.kind === 'run-done' ? 'done' : 'archived';
     workflow.updatedAt = at;
+    // History says what TeamFlow closed and how to bring it back (the
+    // owner, 2026-10-02: "Just close. Don't ask human. But allow human
+    // to reopen.").
+    hygieneRow(workflow, repair.kind === 'run-done' ? 'closed the plan' : 'archived the plan', 'teamflow',
+      repair.kind === 'run-done'
+        ? 'Every step is finished. TeamFlow closed the plan. Undo on the Plans page brings it back.'
+        : `Nobody added work for a week. TeamFlow archived the plan. "teamflow workflow status ${was}" brings it back.`, at);
     const sent = await publish(workflow, config, { flush: false });
     if (sent.ok || sent.queued) return { landed: true };
     // Rolled back, so the next pass owes it again rather than believing
     // it has already been done.
     workflow.status = was;
+    workflow.hygiene = rows;
     return { landed: false, ...notLanded(sent) };
   }
 

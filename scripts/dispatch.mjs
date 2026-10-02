@@ -49,9 +49,9 @@
 import { currentBinding, mint, TITLE_MAX, TRACKER } from './adhoc.mjs';
 import { title } from './words.mjs';
 import {
-  agentLabel, believable, dataDir, followKeyAliases, isAdHocKey, knownPrefixes, isAgentTool, isWorkflowTool, issuePayload, launchesPath, launchFields,
+  agentLabel, believable, bindingStale, dataDir, followKeyAliases, isAdHocKey, knownPrefixes, isAgentTool, isWorkflowTool, issuePayload, launchesPath, launchFields,
   organisationScope, readJson, readWorkflows, reportScope, saveSession, sendReport, sessionActors, workflowsPath, writeJson,
-  writeWorkflows,
+  shippedAt, writeWorkflows,
 } from './core.mjs';
 import { projectFor, projectsCachePath } from './project.mjs';
 import { launchRole, roleBlock } from './launch-role.mjs';
@@ -341,10 +341,16 @@ export function dispatchPlace(config, state = {}, info = {}, cwd = undefined) {
 
 /**
  * The run this organisation's dispatches go into, created when there is
- * none, with the session's ticket in it. Local, under the lock, and
- * re-read after the lock is had, so thirty dispatches at once make one
- * run. Undefined when the lock was not had in time; the async half
- * tries again.
+ * none. Local, under the lock, and re-read after the lock is had, so
+ * thirty dispatches at once make one run. Undefined when the lock was
+ * not had in time; the async half tries again.
+ *
+ * The dispatched work joins: the key the brief names, or the node minted
+ * for the agent. When TeamFlow creates the run here, the session's own
+ * ticket joins too while its binding is fresh: that is the work the agents
+ * serve. Never into a plan a person made, and never a stale binding
+ * (MACLEOD-949): one made by hand on 2026-09-25 joined seven plans as
+ * "running/build (dispatched)" over a week after its ticket had shipped.
  */
 export function ensureRun(config, state = {}, info = {}, { waitMs, keys = [], cwd } = {}) {
   const held = withRunsLock(() => {
@@ -361,7 +367,10 @@ export function ensureRun(config, state = {}, info = {}, { waitMs, keys = [], cw
     let changed = created;
     // Joined, so it is this session's now: pointed at, never only inherited.
     if (runs.current !== run.id || runs.via === 'legacy') { runs.current = run.id; runs.via = 'dispatch'; changed = true; }
-    for (const key of [state.binding?.key, ...keys].filter(Boolean)) {
+    const own = state.binding?.key;
+    // Only into a run TeamFlow made here and now, never a plan a person made.
+    const ownFresh = created && own && !bindingStale(state.binding, { shipped: shippedAt(own) });
+    for (const key of [ownFresh ? own : undefined, ...keys].filter(Boolean)) {
       if (!(run.tickets || []).some((t) => t.key === key)) {
         addDispatched(run, key, runs.place);
         changed = true;
