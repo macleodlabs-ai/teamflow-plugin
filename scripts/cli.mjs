@@ -319,6 +319,9 @@ async function status() {
     ? linesFor(sessionWork(state.sessionId, { launches: launchesOf(state.sessionId) }),
       (await loadPipeline(config, { project: project?.id })).pipeline)
     : [];
+  // What to pick up next, and why (MACLEOD-958): the board's own answer.
+  const { boardNext } = await import('./next.mjs');
+  const next = credentialKind(config) ? await boardNext(config) : undefined;
   // Whether this session's live heartbeat is running (MACLEOD-641).
   const { heartbeatLine } = await import('./heartbeat.mjs');
   const heartbeat = heartbeatLine(state?.sessionId);
@@ -393,6 +396,7 @@ async function status() {
     ...(toPass?.length ? { checksToPass: toPass } : {}),
     dispatched,
     ...(work.length ? { work } : {}),
+    ...(next ? { next } : {}),
     heartbeat,
     autoContinue,
     // Which of the two switches is off (MACLEOD-793), from local files only.

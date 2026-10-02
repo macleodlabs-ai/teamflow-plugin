@@ -104,11 +104,20 @@ export function localWork({ sessionId, actors = allActors(), ended = false } = {
  * Every piece this session has: its own and its agents' tickets, ended ones
  * too, then each agent it dispatched that has not reported yet (in Backlog).
  */
-export function sessionWork(sessionId, { actors, launches = [] } = {}) {
+export function sessionWork(sessionId, { actors = allActors(), launches = [] } = {}) {
   const items = localWork({ sessionId, actors, ended: true });
   const held = new Set(items.map((item) => item.key));
+  // A launch whose agent reported is that agent's item already, under
+  // whatever key it moved to (MACLEOD-958): ADHOC-178's agent moved to
+  // MACLEOD-919 and ended, and its launch still read "Backlog" for days.
+  const ran = new Set();
+  for (const actor of actors) {
+    if (sessionId && actor.sessionId !== sessionId) continue;
+    for (const id of [actor.dispatch?.launchId, actor.agent?.id, actor.agentKey]) if (id) ran.add(id);
+  }
   for (const launch of launches) {
-    if (launch?.key && !held.has(launch.key)) items.push({ key: launch.key, task: launch.title, stage: 'BACKLOG' });
+    if (!launch?.key || held.has(launch.key) || ran.has(launch.id) || ran.has(launch.agentId)) continue;
+    items.push({ key: launch.key, task: launch.title, stage: 'BACKLOG' });
   }
   return items;
 }

@@ -35,6 +35,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 
 import * as core from './core.mjs';
+import { projectFor, projectsCachePath } from './project.mjs';
 
 export const FACTS_MAX = 200;
 const COMMITS_MAX = 20000;
@@ -414,16 +415,21 @@ function sentPath() {
   return path.join(core.dataDir(), 'merged-sent.json');
 }
 
-/** The facts not sent before with the same `mergedAt`. */
+// What a sent fact is remembered by: its time, and whether the proof was
+// shared (MACLEOD-958). A merge sent once as local-only by 0.3.59 or older
+// is sent again once origin has it, or the service never hears it shipped.
+const sentMark = (fact) => (fact.shared ? `${fact.mergedAt}|shared` : fact.mergedAt);
+
+/** The facts not sent before with the same `mergedAt` and the same proof. */
 export function unsent(facts) {
   const held = core.readJson(sentPath()) || {};
-  return facts.filter((fact) => held[fact.key] !== fact.mergedAt);
+  return facts.filter((fact) => held[fact.key] !== sentMark(fact));
 }
 
 /** Remember facts the service took. The file keeps the newest 2000 keys. */
 export function markSent(facts) {
   const held = core.readJson(sentPath()) || {};
-  for (const fact of facts) held[fact.key] = fact.mergedAt;
+  for (const fact of facts) held[fact.key] = sentMark(fact);
   const keys = Object.keys(held);
   const kept = Object.fromEntries(keys.slice(Math.max(0, keys.length - 2000)).map((k) => [k, held[k]]));
   core.writeJson(sentPath(), kept);
@@ -500,11 +506,85 @@ export async function main(args = [], ctx = {}) {
   return 0;
 }
 
+// --- the organisation's other repositories (MACLEOD-958) -----------------
+//
+// A ticket can ship in another repository of the same project: MACLEOD-818
+// shipped in mcp-server-kit, a clone beside this one, and no session ever
+// ran there, so TeamFlow never saw it shipped. The pass also asks the
+// clones beside this checkout whose origin is another repository of this
+// repository's TeamFlow project (the kept projects list, a local file).
+// Only folder names this machine listed reach git, as a `-C` argument,
+// never a shell; nothing from the service does.
+
+export const SIBLINGS_MAX = 8;
+const REPO_OF = /[:/]([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+?)(?:\.git)?\/?$/;
+
+/** `owner/name` of a remote URL, lower-cased, or undefined. */
+export function repoOf(url) {
+  return REPO_OF.exec(String(url ?? '').trim())?.[1]?.toLowerCase();
+}
+
+/** The other repositories of this repository's project, from the kept list. */
+export function projectRepos(repository, config = {}) {
+  const held = core.readJson(projectsCachePath(config));
+  const project = projectFor(repository, held?.projects);
+  return (project?.repos || []).map((r) => String(r).toLowerCase()).filter((r) => r !== String(repository).toLowerCase());
+}
+
+/**
+ * Clones beside this repository's main checkout (a worktree's too) whose
+ * origin is one of `repos`, at most SIBLINGS_MAX.
+ */
+export function siblingRoots(root, { run = git, list, repos, config = {} } = {}) {
+  if (!root) return [];
+  const url = run(root, ['remote', 'get-url', 'origin']);
+  const own = url.ok ? repoOf(url.stdout) : undefined;
+  const wanted = new Set(repos ?? (own ? projectRepos(own, config) : []));
+  if (!own || !wanted.size) return [];
+  // A worktree lives inside the checkout; the clones sit beside the checkout.
+  const common = run(root, ['rev-parse', '--path-format=absolute', '--git-common-dir']);
+  const home = common.ok && path.basename(common.stdout.trim()) === '.git' ? path.dirname(common.stdout.trim()) : root;
+  const parent = path.dirname(home);
+  let names = [];
+  try { names = (list ? list(parent) : fs.readdirSync(parent)).sort(); } catch { return []; }
+  // One clone per repository: the folder named like it first, so a
+  // second clone made for one branch is not read as well.
+  const leaves = new Set([...wanted].map((repo) => repo.split('/').pop()));
+  const ordered = [...names.filter((n) => leaves.has(n.toLowerCase())),
+    ...names.filter((n) => !leaves.has(n.toLowerCase()))];
+  const out = new Map();
+  for (const name of ordered) {
+    const dir = path.join(parent, name);
+    if (dir === home || !fs.existsSync(path.join(dir, '.git'))) continue;
+    const got = run(dir, ['remote', 'get-url', 'origin']);
+    const theirs = got.ok ? repoOf(got.stdout) : undefined;
+    if (theirs && theirs !== own && wanted.has(theirs) && !out.has(theirs)) out.set(theirs, dir);
+    if (out.size >= Math.min(SIBLINGS_MAX, wanted.size)) break;
+  }
+  return [...out.values()];
+}
+
+/** One fact per key from several repositories: shared proof first, then the newest. */
+export function mergeFacts(...lists) {
+  const best = new Map();
+  for (const fact of lists.flat()) {
+    const held = best.get(fact.key);
+    const better = !held || (Boolean(fact.shared) !== Boolean(held.shared)
+      ? Boolean(fact.shared) : fact.mergedAt > held.mergedAt);
+    if (better) best.set(fact.key, fact);
+  }
+  return [...best.values()].sort((a, b) => a.key.localeCompare(b.key));
+}
+
 /** Check `keys` against git and send what is merged. Returns how many facts went. */
 export async function reportMerged(keys, {
   root, config = {}, run, aliases = core.readKeyAliases(config), repo, now = Date.now(), send = core.sendMerged,
+  siblings = siblingRoots(root, { config, ...(run ? { run } : {}) }),
 } = {}) {
-  const facts = unsent(mergedFacts(keys, { root, run, aliases, config }));
+  const facts = unsent(mergeFacts(
+    mergedFacts(keys, { root, run, aliases, config }),
+    ...siblings.map((other) => mergedFacts(keys, { root: other, run, aliases, config })),
+  ));
   if (!facts.length) return { ok: true, sent: 0 };
   const out = await sendInBatches(facts, { repo, now, send, config });
   markSent(facts.slice(0, out.sent));

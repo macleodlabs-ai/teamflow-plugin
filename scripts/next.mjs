@@ -14,7 +14,18 @@
 // The pick is stated with its reason, always, because a command that
 // assigns somebody a ticket has to be arguable with.
 
-import { resolveGithubRepo, safeExec, trackerOf } from './core.mjs';
+import { fetchState, resolveGithubRepo, safeExec, trackerOf } from './core.mjs';
+
+/**
+ * The board's next item and why (MACLEOD-958), as the service's
+ * five-minute pass kept it: one plain line, or undefined. It is words to
+ * read; nothing in it is ever run.
+ */
+export async function boardNext(config = {}, read = fetchState) {
+  const got = await read('hygiene/next.json', config);
+  const line = got?.ok ? got.document?.next?.line : undefined;
+  return typeof line === 'string' && line ? line.slice(0, 300) : undefined;
+}
 
 // p0/p1/p2 and high/medium/low are the two spellings teams label with.
 // Ranked together so a repository using both still has one order.

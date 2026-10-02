@@ -3,6 +3,19 @@
 What changed in each published version of the TeamFlow plugin, newest first.
 Only what a person using it would notice.
 
+## 0.3.61
+
+- **Work shipped in another repository counts.** When a ticket ships in
+  another repository of the same TeamFlow project, such as a kit beside
+  your service, TeamFlow sees it. It looks in the clones next to yours.
+- **A push after a local merge is sent.** A merge that went once as "on
+  this computer only" is sent again when origin has it. Then the card
+  and the tracker issue close.
+- **`teamflow status` says what to do next.** One line names the next
+  ticket and why: its priority, what waits on it, and its age.
+- **Finished agents leave the list.** `teamflow status` no longer shows
+  an agent at Backlog after it moved to a ticket or stopped.
+
 ## 0.3.60
 
 - **A merge on your computer is not shipped.** A local `git merge` says

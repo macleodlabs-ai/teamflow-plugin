@@ -2815,6 +2815,18 @@ function dashboardFromBundle(index, orgName) {
     members: rosterOf(index.members)
   };
 }
+function readNext(raw) {
+  if (!raw || typeof raw !== "object") return void 0;
+  const { key, title: title2, because, who, line } = raw;
+  if (typeof key !== "string" || typeof line !== "string" || !line) return void 0;
+  return {
+    key,
+    title: typeof title2 === "string" ? title2 : "",
+    because: Array.isArray(because) ? because.filter((b) => typeof b === "string") : [],
+    ...typeof who === "string" ? { who } : {},
+    line
+  };
+}
 var DEADLINE_KEYS = ["deploy", "ci", "test", "audit"];
 function readServiceState(index) {
   const list = (value, keep) => Array.isArray(value) ? value.filter(keep) : [];
@@ -2843,6 +2855,7 @@ function readServiceState(index) {
   const sessions = readSessions(index.sessions);
   const watching = readWatching(index.agentViewWatching);
   const adhocTickets = readAdhocTickets(index.adhocTickets);
+  const next = readNext(index.next);
   return {
     members,
     attention,
@@ -2859,7 +2872,9 @@ function readServiceState(index) {
     ...liveness ? { liveness } : {},
     ...sessions ? { sessions } : {},
     // MACLEOD-793: left out when the service did not send it.
-    ...watching ? { watching } : {}
+    ...watching ? { watching } : {},
+    // MACLEOD-958: left out when nothing is ready to pick up.
+    ...next ? { next } : {}
   };
 }
 function readMainChecks(raw) {
