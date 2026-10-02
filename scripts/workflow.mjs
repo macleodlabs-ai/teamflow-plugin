@@ -1258,6 +1258,8 @@ export function openTickets(workflow) {
 
 /** The statuses a run is still open in: the service's OPEN_RUNS too. */
 export const OPEN_RUN_STATUSES = ['planning', 'running', 'stalled', 'blocked'];
+/** The statuses that end a run (MACLEOD-956): the service's word on these is taken. */
+export const CLOSED_RUN_STATUSES = ['done', 'cancelled', 'archived'];
 
 /**
  * Whether a run is over because all its work is: it holds tickets, and
@@ -1323,14 +1325,21 @@ export function adoptServed(workflow, served) {
   const ended = served.ended && typeof served.ended === 'object' ? served.ended : undefined;
   const undone = served.endUndone && typeof served.endUndone === 'object' ? served.endUndone : undefined;
   const open = OPEN_RUN_STATUSES.includes(workflow.status);
-  if (ended && ['done', 'cancelled'].includes(served.status) && open) {
+  /*
+   * One rule for the run (MACLEOD-956): a run the service ended -- done,
+   * cancelled or archived, with an `ended` record or without one -- ends
+   * here too, unless this machine reopened it after that end
+   * (`reopenedAt` newer than the end). On 2026-10-02 four plans the
+   * service held done with no `ended` record stayed open here, because
+   * only an end with a record was taken.
+   */
+  const closed = CLOSED_RUN_STATUSES.includes(served.status);
+  const endAt = String(ended?.at || served.updatedAt || '');
+  const reopenedHere = Boolean(workflow.reopenedAt) && String(workflow.reopenedAt) > endAt;
+  if (closed && open && !reopenedHere) {
     workflow.status = served.status;
-    workflow.ended = ended;
+    if (ended) workflow.ended = ended;
     out.status = served.status;
-  } else if (served.status === 'archived' && open && !(workflow.tickets || []).length) {
-    // An empty plan the service archived after a day (MACLEOD-844).
-    workflow.status = 'archived';
-    out.status = 'archived';
   } else if (!ended && undone && OPEN_RUN_STATUSES.includes(served.status) && !open
       && String(undone.at || '') > String(workflow.updatedAt || '')) {
     workflow.status = served.status;

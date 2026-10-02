@@ -2900,6 +2900,121 @@ export function landedKeys(command, input = {}, state = {}, config = {}) {
   }
 }
 
+/*
+ * Merged here, not shipped (MACLEOD-956).
+ *
+ * On 2026-10-02 the main session merged an agent's branch into its local
+ * main at 15:30. `landedKeys` credited MACLEOD-954 as merged, the service
+ * ended its plan as finished and moved the Linear issue to Done, while a
+ * follow-up agent went on working the same key. A local merge changes one
+ * computer's copy; nobody else has the work until it reaches origin's
+ * default branch. So a local merge only remembers what it landed, here, by
+ * the merge commit it made. A push of the trunk then credits the keys
+ * whose merge commit the push sent (`pushedKeys`): agent branches merged
+ * by the main session are still credited (MACLEOD-640), at the moment the
+ * work is shared. Keys, branch names and commit ids only; it never leaves
+ * the machine.
+ */
+const LANDED_HERE_MAX = 200;
+
+function landedHerePath() {
+  return path.join(dataDir(), 'landed-here.json');
+}
+
+/** Remember the keys a local merge landed, by the commit it made. */
+export function noteLandedHere(cwd, landed = []) {
+  try {
+    if (!cwd || !landed.length) return;
+    const head = git(cwd, ['rev-parse', 'HEAD']).stdout.trim();
+    if (!/^[0-9a-f]{40}$/.test(head)) return;
+    const held = readJson(landedHerePath(), {}) || {};
+    const rows = Array.isArray(held.rows) ? held.rows : [];
+    const at = new Date().toISOString();
+    for (const one of landed) rows.push({ key: one.key, ...(one.branch ? { branch: one.branch } : {}), head, at });
+    writeJson(landedHerePath(), { rows: rows.slice(-LANDED_HERE_MAX) });
+  } catch { /* the push still reads the keys its commits name */ }
+}
+
+/** The remembered rows whose merge commit is in `shas`, removed from the file. */
+function takeLandedHere(shas) {
+  try {
+    const held = readJson(landedHerePath(), {}) || {};
+    const rows = Array.isArray(held.rows) ? held.rows : [];
+    const taken = rows.filter((row) => shas.has(row.head));
+    if (taken.length) writeJson(landedHerePath(), { rows: rows.filter((row) => !shas.has(row.head)) });
+    return taken;
+  } catch {
+    return [];
+  }
+}
+
+/** The remote a `git push` names, else `origin`. */
+export function pushedRemote(command) {
+  const found = /\bgit\s+push\b([^;&|]*)/i.exec(String(command));
+  const words = found ? found[1].trim().split(/\s+/).filter((t) => t && !t.startsWith('-')) : [];
+  const remote = words[0];
+  return remote && /^[A-Za-z0-9._-]{1,64}$/.test(remote) ? remote : 'origin';
+}
+
+/**
+ * The tickets a successful `git push` of the trunk just shared
+ * (MACLEOD-956): the work is on origin's default branch now, which is
+ * what "merged" means to everybody else.
+ *
+ * The range is exactly what this push moved: the remote-tracking ref's
+ * last reflog entry must be this push (`update by push`), and the range
+ * is its previous value to its new one. A push that sent nothing, a new
+ * branch with no previous value, or a push of a work branch credits
+ * nothing. Keys come from three places: the rows a local merge
+ * remembered whose merge commit this push sent, a merged worktree's
+ * binding while it is still there, and the keys the pushed commits name
+ * (as `landedKeys` read them). Capped, deduplicated, and empty on any
+ * error.
+ */
+export function pushedKeys(command, input = {}, state = {}, config = {}) {
+  try {
+    const cwd = input.cwd;
+    if (!cwd || /everything up[ -]to[ -]date/i.test(JSON.stringify(input.tool_response ?? ''))) return [];
+    const trunks = new Set([...TRUNK_NAMES, defaultBranchName(cwd, config)]);
+    if (config.defaultBranch) trunks.add(String(config.defaultBranch));
+    const current = git(cwd, ['branch', '--show-current']).stdout.trim();
+    const destination = pushedDestination(command) || pushedBranch(command) || current;
+    if (!destination || !isTrunkRef(destination, trunks)) return [];
+    const name = String(destination).replace(/^refs\/heads\//, '');
+    if (!/^[A-Za-z0-9._/-]{1,200}$/.test(name)) return [];
+    const ref = `refs/remotes/${pushedRemote(command)}/${name}`;
+    const moved = git(cwd, ['reflog', '-1', '--format=%gs', ref]);
+    if (!moved.ok || !/^update by push/.test(moved.stdout.trim())) return [];
+    const range = `${ref}@{1}..${ref}`;
+    const sent = git(cwd, ['rev-list', '-n', '2000', range]);
+    if (!sent.ok) return [];
+    const shas = new Set(sent.stdout.split('\n').map((line) => line.trim()).filter(Boolean));
+    if (!shas.size) return [];
+    const found = new Map();
+    const note = (key, branch) => {
+      if (key && !found.has(key) && found.size < MERGE_KEYS_MAX) found.set(key, { key, ...(branch ? { branch } : {}) });
+    };
+    for (const row of takeLandedHere(shas)) note(normalizeIssueKey(row.key), row.branch);
+    // A merged worktree still on this machine: its binding, by its tip.
+    for (const block of git(cwd, ['worktree', 'list', '--porcelain']).stdout.split(/\n\n+/)) {
+      const dir = /^worktree (.+)$/m.exec(block)?.[1];
+      const tip = /^HEAD ([0-9a-f]{40})$/m.exec(block)?.[1];
+      const branch = /^branch refs\/heads\/(.+)$/m.exec(block)?.[1];
+      if (dir && tip && branch && shas.has(tip) && !isTrunkRef(branch, trunks)) {
+        note(normalizeIssueKey(readJson(localBindingPath(dir))?.jiraKey), branch);
+      }
+    }
+    const log = git(cwd, ['log', '--format=%B', '-n', '200', range]).stdout;
+    for (const match of log.matchAll(ISSUE_ALL_RE)) {
+      const key = match[1].toUpperCase();
+      if (creditable(key, state, config)) note(key, undefined);
+    }
+    return [...found.values()];
+  } catch {
+    return [];
+  }
+}
+
 /**
  * The branch a `git push` sends, when the command names one. `git push`,
  * `git push -u origin HEAD` and `git push --force-with-lease` name
@@ -3743,6 +3858,11 @@ const MERGED = Object.freeze({ stage: 'MERGE', status: 'success', summary: 'Merg
  * card stays where it is and is not counted as merged or finished.
  */
 const NOTHING_MERGED = Object.freeze({ summary: 'Nothing to merge', heartbeat: true });
+/*
+ * A local merge (MACLEOD-956): no stage, so the card stays at its step and
+ * is not counted as merged or finished. The words say where the work is.
+ */
+const MERGED_HERE = Object.freeze({ summary: 'Merged here. Not pushed yet.' });
 const NOTHING_MERGED_RE = /\balready up[ -]to[ -]date\b/i;
 
 /** The merge command's output says it brought in no commit. */
@@ -3889,34 +4009,23 @@ export function classifyTool(input, state, config) {
     if (PR_MERGE_RE.test(command)) return MERGED;
     // A merge that brought in no commit is not a merge (MACLEOD-641, K9).
     if (nothingMerged(input)) return NOTHING_MERGED;
-    const merged = mergedBranchKey(command);
-    // The other tickets whose work this merge landed (MACLEOD-640),
-    // credited beside whichever ticket the merge itself is.
-    const skip = new Set([state.binding?.key, merged?.key]);
-    const landed = landedKeys(command, input, state, config).filter((one) => !skip.has(one.key));
-    const also = landed.length ? { alsoFor: landed } : {};
     /*
-     * The merged branch names another ticket: that ticket is the one
-     * merged, not the one this session is bound to. The transition is
-     * addressed to it (`forKey`) and moves this session's own ticket
-     * nowhere; publishState carries it separately. A branch with no key
-     * is the bound ticket's own merge, as MACLEOD-574 left it.
+     * A local `git merge` is not shipped (MACLEOD-956): nobody else has
+     * the work until a push. It moves no card to Merge, settles no plan
+     * step and asks no tracker for Done. What it landed is remembered,
+     * by the merge commit, and credited when a push of the trunk sends
+     * that commit (`pushedKeys`). The merged branch's own key comes
+     * first, then the keys `landedKeys` reads, each only if creditable
+     * (MACLEOD-640): of the bound ticket's project, of a prefix this
+     * machine knows, or ad hoc. Any `WORD-1` in a branch name is a key
+     * by shape only — `git merge hotfix-3` — so it must pass that rule.
      */
-    if (merged && state.binding?.key && merged.key !== state.binding.key) {
-      /*
-       * Only a key `creditable` allows: of the bound ticket's own
-       * project, of a prefix this machine knows, or ad hoc. Any `WORD-1`
-       * in a branch name is a key by shape — `git merge hotfix-3` would
-       * otherwise put a HOTFIX-3 card on the board that no tracker
-       * holds — and a GitHub tenant's keys are `repo#N`, which a branch
-       * name never carries, so nothing but an ad hoc key is attributed
-       * there rather than a ghost.
-       */
-      if (creditable(merged.key, state, config)) {
-        return { stage: 'MERGE', status: 'success', summary: 'Merged', forKey: merged.key, forBranch: merged.branch, ...also };
-      }
-    }
-    return { ...MERGED, ...also };
+    const merged = mergedBranchKey(command);
+    const landed = [
+      ...(merged && creditable(merged.key, state, config) ? [merged] : []),
+      ...landedKeys(command, input, state, config),
+    ];
+    return { ...MERGED_HERE, ...(landed.length ? { landedHere: landed } : {}) };
   }
 
   if (PR_RE.test(command)) {
@@ -3933,6 +4042,25 @@ export function classifyTool(input, state, config) {
    * error, not rework.
    */
   if (GIT_PUSH_RE.test(command)) {
+    /*
+     * A push of the trunk shares the work (MACLEOD-956): the keys whose
+     * commits it sent are merged now, for everybody. The bound ticket
+     * moves only when the push sent its work; a stale binding stays
+     * where it is.
+     */
+    const shipped = failed ? [] : pushedKeys(command, input, state, config);
+    if (shipped.length) {
+      const bound = state.binding?.key;
+      const others = shipped.filter((one) => one.key !== bound);
+      if (bound && others.length < shipped.length) {
+        return { ...MERGED, summary: 'Merged into main', shipped: true, ...(others.length ? { alsoFor: others } : {}) };
+      }
+      const [first, ...rest] = shipped;
+      return {
+        stage: 'MERGE', status: 'success', summary: 'Merged into main', shipped: true,
+        forKey: first.key, forBranch: first.branch, ...(rest.length ? { alsoFor: rest } : {}),
+      };
+    }
     if (failed || !PRE_REVIEW_STAGES.has(state.stage) || !pushesBoundBranch(command, state, config)) return undefined;
     return IN_REVIEW;
   }
@@ -4046,7 +4174,9 @@ function withHistory(state, transition, updatedAt, cleared) {
   if (cleared) log = log.map((entry) => (entry.clearedAt ? entry : { ...entry, clearedAt: updatedAt }));
   if (transition.stage && CYCLE_CLOSING_STAGES.has(transition.stage)) cycleClosed = true;
   if (transition.stage && transition.stage !== state.stage) {
-    transitions = [...transitions, { stage: transition.stage, at: updatedAt, by }].slice(-TRANSITIONS_MAX);
+    // The status too (MACLEOD-956): a move to Merge `waiting` is a push
+    // for review, not a merge, and the service must tell them apart.
+    transitions = [...transitions, { stage: transition.stage, ...(transition.status ? { status: transition.status } : {}), at: updatedAt, by }].slice(-TRANSITIONS_MAX);
   }
   return {
     reworkLog: log,

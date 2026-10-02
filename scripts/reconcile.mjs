@@ -594,16 +594,27 @@ export async function adoptServicePlans(config = {}, {
 } = {}) {
   const changed = [];
   try {
-    const state = readWorkflows(config);
-    const open = Object.values(state.workflows || {})
+    const open = Object.values(readWorkflows(config).workflows || {})
       .filter((w) => w?.id && OPEN_RUN_STATUSES.includes(w.status))
       .sort((a, b) => String(a.servedAt || '').localeCompare(String(b.servedAt || '')))
       .slice(0, limit);
     if (!open.length) return changed;
+    const served = [];
     for (const workflow of open) {
       const got = await read(`workflows/${encodeURIComponent(workflow.id)}.json`, config)
         .catch(() => ({ ok: false }));
       if (!got?.ok) break;
+      served.push({ id: workflow.id, got });
+    }
+    /*
+     * Applied to a copy read AFTER the network (MACLEOD-956): the reads
+     * take seconds, and writing back the copy read before them undid
+     * whatever other sessions on this machine wrote meanwhile.
+     */
+    const state = readWorkflows(config);
+    for (const { id, got } of served) {
+      const workflow = state.workflows?.[id];
+      if (!workflow) continue;
       // Local only, never published: when this run was last compared.
       workflow.servedAt = at;
       const took = got.missing ? { steps: [] } : adoptServed(workflow, got.document);
@@ -614,7 +625,7 @@ export async function adoptServicePlans(config = {}, {
         changed.push({ id: workflow.id, name: workflow.name, steps: took.steps.length, status: workflow.status });
       }
     }
-    writeWorkflows(state, config);
+    if (served.length) writeWorkflows(state, config);
   } catch { /* the next pass tries again */ }
   return changed;
 }

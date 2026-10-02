@@ -18,7 +18,20 @@
 // The answer comes back to the asking session in `teamflow status` and
 // `teamflow needs`, once each (`needs/seen.json` remembers which).
 // Nothing in an answer is ever run.
+//
+// This machine answers for its own person (MACLEOD-954, the owner,
+// 2026-10-02: "so that the mod etc can work"):
+//
+//   teamflow needs answer <need_id> --choice <n>|--done|--approve|--decline
+//   teamflow needs answer <ask_id> --session <id> --choice <n>|--allow|--deny
+//
+// The service lets it answer only on its own person's cards and in its
+// own person's sessions, never in the session it runs in, and History
+// says "from Claude Code on <machine>". Every answer is one explicit
+// choice on the command line: there is no default and no Allow by
+// itself. The mod's buttons run exactly this, as an argument list.
 
+import fs from 'node:fs';
 import path from 'node:path';
 
 import * as core from './core.mjs';
@@ -35,6 +48,9 @@ const OPTION_RULES = new Set(['empty', 'too_long', 'url', 'email', 'secret', 'pa
 const KEY = /^(?:[A-Za-z][A-Za-z0-9]{0,19}-\d{1,9}|[\w.-]{1,80}\/[\w.-]{1,80}#\d{1,9}|#\d{1,9})$/;
 const KINDS = ['check', 'decision', 'approval'];
 const ID = /^need_[0-9a-f]{16}$/;
+const ASK_ID = /^ask_[0-9a-f]{16,40}$/;
+const SESSION = /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/;
+export const ANSWER_USAGE = 'Usage: teamflow needs answer <need_id> --choice <n>|--done|--approve|--decline, or teamflow needs answer <ask_id> --session <id> --choice <n>|--allow|--deny';
 const SEEN_MAX = 200;
 const KIND_WORDS = { check: 'a check', decision: 'a decision', approval: 'an approval' };
 
@@ -225,8 +241,116 @@ export async function askMain(args = [], ctx = {}) {
   return 0;
 }
 
+/**
+ * `teamflow needs answer ...` as `{ route, body }`, or `{ error }`. Exactly
+ * one answer flag: nothing here picks one for the person.
+ */
+export function parseAnswer(args = []) {
+  const [verb, id, ...rest] = args;
+  if (verb !== 'answer' || !id) return { error: ANSWER_USAGE };
+  const flags = {};
+  for (let i = 0; i < rest.length; i += 1) {
+    const flag = rest[i];
+    if (flag === '--choice' || flag === '--session') { flags[flag] = rest[i + 1]; i += 1; } else flags[flag] = true;
+  }
+  const given = ['--choice', '--done', '--approve', '--decline', '--allow', '--deny'].filter((f) => flags[f] !== undefined);
+  if (given.length !== 1) return { error: ANSWER_USAGE };
+  const choice = given[0] === '--choice' ? Number(flags['--choice']) : undefined;
+  if (choice !== undefined && !(/^\d$/.test(String(flags['--choice'])) && Number.isInteger(choice))) return { error: ANSWER_USAGE };
+  if (ID.test(id)) {
+    const body = { '--choice': { choice }, '--done': { done: true }, '--approve': { approve: true }, '--decline': { approve: false } }[given[0]];
+    if (!body || flags['--session'] !== undefined) return { error: ANSWER_USAGE };
+    return { route: `/v1/members/needs/${id}/answer`, body };
+  }
+  if (ASK_ID.test(id) && SESSION.test(String(flags['--session'] || ''))) {
+    const body = { '--choice': { choice }, '--allow': { approve: true }, '--deny': { approve: false } }[given[0]];
+    if (!body) return { error: ANSWER_USAGE };
+    return { route: `/v1/members/sessions/${flags['--session']}/answers`, body: { askId: id, ...body } };
+  }
+  return { error: ANSWER_USAGE };
+}
+
+/**
+ * The session this command runs in, as the service names it, or undefined.
+ * The plugin's SessionStart hook puts TEAMFLOW_SESSION_ID in the
+ * environment of every command the session runs (exportSessionId).
+ */
+export function runningSession(env = process.env) {
+  const raw = env.TEAMFLOW_SESSION_ID || env.CLAUDE_SESSION_ID || '';
+  return raw ? core.digest(String(raw)) : undefined;
+}
+
+/**
+ * SessionStart: name this session to the commands its agent runs, so a
+ * session never answers its own question (MACLEOD-954). Claude Code reads
+ * the file CLAUDE_ENV_FILE names. Never throws.
+ */
+export function exportSessionId(sessionId, env = process.env, append = fs.appendFileSync) {
+  try {
+    const file = env.CLAUDE_ENV_FILE;
+    if (!file || !SESSION.test(String(sessionId || ''))) return false;
+    append(file, `export TEAMFLOW_SESSION_ID=${sessionId}\n`);
+    return true;
+  } catch { return false; }
+}
+
+/** One answer from this machine: its credential, its machine id and the session it runs in. */
+export async function sendAnswer(route, body, config = {}, env = process.env) {
+  const cred = await core.credential(config);
+  if (!cred) return { ok: false, reason: 'no service credential available; run `teamflow login`' };
+  const machine = core.machineId();
+  const session = runningSession(env);
+  try {
+    const response = await fetch(`${serviceUrl(config)}${route}`, {
+      method: 'POST',
+      headers: {
+        [cred.header]: cred.value,
+        'content-type': 'application/json',
+        // Identifiers, not content: which machine answers, and which
+        // session it answers from (docs/REPORTING_CONTRACT.md).
+        ...(machine ? { 'X-Machine-Id': machine } : {}),
+        ...(session ? { 'X-TeamFlow-Session': session } : {}),
+      },
+      body: JSON.stringify(body),
+      redirect: 'error',
+      signal: AbortSignal.timeout(Number(config.serviceTimeoutMs || 20000)),
+    });
+    let parsed;
+    try { parsed = await response.json(); } catch { parsed = undefined; }
+    if (!response.ok) return { ok: false, status: response.status, reason: parsed?.message || `service returned ${response.status}` };
+    return { ok: true, status: response.status, body: parsed };
+  } catch (error) {
+    return { ok: false, reason: core.unreachableReason(error, config) };
+  }
+}
+
+/** The plain line a person reads after an answer from this machine. */
+export function answeredLine(parsed, out) {
+  const need = out?.body?.need;
+  const machine = need?.answer?.machine || out?.body?.answer?.machine || 'this computer';
+  if (need) return `TeamFlow took your answer: ${answerWords(need)}. History says it came from Claude Code on ${machine}.`;
+  const said = parsed.body.approve === true ? 'Allowed' : parsed.body.approve === false ? 'Denied' : 'Answered';
+  return `${said}. The agent gets it in a few seconds. History says it came from Claude Code on ${machine}.`;
+}
+
+/** `teamflow needs answer ...`. 0 sent, 1 not sent, 2 a bad argument or refused. */
+export async function answerMain(args = [], ctx = {}) {
+  const print = ctx.print || ((line) => process.stdout.write(`${line}\n`));
+  const fail = ctx.fail || ((line) => process.stderr.write(`${line}\n`));
+  const parsed = parseAnswer(args);
+  if (parsed.error) { fail(parsed.error); return 2; }
+  const out = await (ctx.send || sendAnswer)(parsed.route, parsed.body, ctx.config || {}, ctx.env || process.env);
+  if (!out.ok) {
+    fail(`TeamFlow did not take the answer: ${out.reason}`);
+    return out.status >= 400 && out.status < 500 ? 2 : 1;
+  }
+  print(answeredLine(parsed, out));
+  return 0;
+}
+
 /** `teamflow needs`: what waits for you, then answers to what you asked. */
 export async function needsMain(_args = [], ctx = {}) {
+  if (_args[0] === 'answer') return answerMain(_args, ctx);
   const print = ctx.print || ((line) => process.stdout.write(`${line}\n`));
   const fail = ctx.fail || ((line) => process.stderr.write(`${line}\n`));
   const config = ctx.config || {};

@@ -100,6 +100,9 @@ const USAGE = `teamflow \u2014 delivery reporting for TeamFlow
                                    close it (done) or cancel it (no longer
                                    needed) on the board; reopen for 7 days
   teamflow needs                   what waits for you, and answers to what you asked
+  teamflow needs answer <id> --choice <n>|--done|--approve|--decline|--allow|--deny [--session <id>]
+                                   answer from this computer, for your own cards
+                                   and sessions only; History says it came from here
   teamflow track list|rename|merge|split|move   your tracks, and fix how TeamFlow grouped them
   teamflow adhoc start "<what the work is>" | title "<...>" | done
                                    work that arrived without a ticket: TeamFlow

@@ -27,7 +27,9 @@
 //   of the first commit on the default branch's own line that holds it.
 //
 // What leaves the machine is one derived fact per key:
-// `{ key, merged: true, mergedAt, via: 'branch' | 'commit' }`.
+// `{ key, merged: true, mergedAt, via: 'branch' | 'commit', shared? }`.
+// `shared` says the proof is origin's default branch or a merged pull
+// request (MACLEOD-956); the service finishes a card on that proof only.
 // Never a branch name, a commit message, an id or a diff.
 import fs from 'node:fs';
 import path from 'node:path';
@@ -86,16 +88,30 @@ function git(root, args) {
     { cwd: root, timeout: 15000, maxBuffer: 64 * 1024 * 1024 });
 }
 
-/** The default branch's ref: local first, then origin's copy. */
+/**
+ * The default branch's ref: origin's copy first (MACLEOD-956). Work merged
+ * into a local main is on one computer only; it counts as merged once it
+ * reaches origin's default branch, which is what this machine last heard
+ * from origin. A repository with no `origin` remote has only its own copy.
+ */
 export function defaultRef(root, run = git) {
   const head = run(root, ['symbolic-ref', '--quiet', '--short', 'refs/remotes/origin/HEAD']);
-  const names = [...new Set([...(head.ok ? [head.stdout.replace(/^origin\//, '')] : []), 'main', 'master'])];
-  for (const name of names.filter(branchOk)) {
-    for (const ref of [`refs/heads/${name}`, `refs/remotes/origin/${name}`]) {
-      if (run(root, ['rev-parse', '--verify', '--quiet', `${ref}^{commit}`]).ok) return ref;
-    }
+  const names = [...new Set([...(head.ok ? [head.stdout.replace(/^origin\//, '')] : []), 'main', 'master'])].filter(branchOk);
+  const has = (ref) => run(root, ['rev-parse', '--verify', '--quiet', `${ref}^{commit}`]).ok;
+  for (const name of names) {
+    if (has(`refs/remotes/origin/${name}`)) return `refs/remotes/origin/${name}`;
+  }
+  // A local main counts only where there is no origin to share it with.
+  if (run(root, ['remote', 'get-url', 'origin']).ok) return undefined;
+  for (const name of names) {
+    if (has(`refs/heads/${name}`)) return `refs/heads/${name}`;
   }
   return undefined;
+}
+
+/** True when `ref` is a shared copy: origin's, not this computer's own. */
+export function sharedRef(ref) {
+  return /^refs\/remotes\//.test(String(ref || ''));
 }
 
 /**
@@ -309,6 +325,7 @@ export function mergedFacts(keys, { root, run = git, aliases = {}, pr, config = 
   if (!wanted.size || !root) return [];
   const ref = defaultRef(root, run);
   if (!ref) return [];
+  const shared = sharedRef(ref);
   const history = historyOf(root, ref, run);
   // The prefixes this machine knows: its config and the keys it asks about.
   const known = core.knownPrefixes(config, [...wanted, ...became.keys()]);
@@ -318,7 +335,7 @@ export function mergedFacts(keys, { root, run = git, aliases = {}, pr, config = 
   for (const key of [...wanted].sort()) {
     const names = new Set([key, ...[...became].filter(([, to]) => to === key).map(([from]) => from)]);
     let best;
-    const take = (at, via) => { if (at && (!best || at > best.at)) best = { at, via }; };
+    const take = (at, via, forge = false) => { if (at && (!best || at > best.at)) best = { at, via, forge }; };
     for (const name of names) take(history.byKey.get(name), 'commit');
     for (const branch of branches) {
       const says = [...branch.keys, ...(bound.get(branch.name) || [])].some((k) => names.has(k));
@@ -327,9 +344,11 @@ export function mergedFacts(keys, { root, run = git, aliases = {}, pr, config = 
       if (arrived) { take(arrived, 'branch'); continue; }
       // A squash merge: git cannot see it, the merged PR can (MACLEOD-884).
       const got = pr ? pr(branch.name, branch.sha) : undefined;
-      if (got?.state === 'merged') take(Date.parse(got.mergedAt), 'branch');
+      if (got?.state === 'merged') take(Date.parse(got.mergedAt), 'branch', true);
     }
-    if (best) facts.push({ key, merged: true, mergedAt: new Date(best.at).toISOString(), via: best.via });
+    // `shared` (MACLEOD-956): the proof is origin's default branch or the
+    // forge's merged pull request, never a merge on this computer only.
+    if (best) facts.push({ key, merged: true, mergedAt: new Date(best.at).toISOString(), via: best.via, ...(shared || best.forge ? { shared: true } : {}) });
     if (facts.length >= FACTS_MAX) break;
   }
   return facts;

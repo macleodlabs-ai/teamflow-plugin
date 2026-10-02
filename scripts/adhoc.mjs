@@ -374,6 +374,55 @@ export async function mint(config = {}) {
   }
 }
 
+/*
+ * A session is never invisible (MACLEOD-956).
+ *
+ * A binding goes stale when its ticket ships or a day passes with no edit
+ * (MACLEOD-949), and the session forgets it. Until 2026-10-02 the session
+ * then reported nothing at all: the main session worked for hours and the
+ * board showed no card for it. Now its work goes to one ad hoc card of its
+ * own, named from the repository and the branch, never from a prompt. The
+ * card belongs to this session only: no binding file is written, so no
+ * other session in the repository moves. Any real key -- a branch, a
+ * prompt, `work-on` -- outranks it at once (`confidence` 1). A refused mint
+ * is tried again after SESSION_CARD_RETRY_MS, never on every event.
+ */
+export const SESSION_CARD_RETRY_MS = 10 * 60 * 1000;
+
+/** "Work in teamflow on main": the repository's short name and the branch. */
+export function sessionCardTitle(repository, branch) {
+  const repo = String(repository || '').split('/').filter(Boolean).pop() || 'this repository';
+  const where = branch ? ` on ${String(branch).replace(/\s+/g, ' ').slice(0, 80)}` : '';
+  return `Work in ${repo.slice(0, 80)}${where}`.slice(0, TITLE_MAX);
+}
+
+/**
+ * Bind this session to its own card when it has no binding. Changes
+ * `state` only; the caller publishes. True when the session is bound.
+ */
+export async function sessionCard(state, { repository, branch, config = {}, now = Date.now(), mintKey = mint } = {}) {
+  if (!state || state.binding?.key) return false;
+  const at = new Date(now).toISOString();
+  const held = state.sessionCard;
+  let key = isAdHocKey(held?.key) ? held.key : undefined;
+  const title = held?.title || sessionCardTitle(repository, branch);
+  if (!key) {
+    const tried = Date.parse(held?.triedAt || '') || 0;
+    if (now - tried < SESSION_CARD_RETRY_MS) return false;
+    let minted;
+    try { minted = await mintKey(config); } catch { minted = { ok: false }; }
+    if (!minted?.ok) {
+      state.sessionCard = { triedAt: at };
+      return false;
+    }
+    key = minted.key;
+    state.sessionCard = { key, title, at };
+  }
+  state.binding = { key, tracker: TRACKER, confidence: 1, source: 'session', sticky: false, boundAt: held?.at || at };
+  state.jira = { ...(state.jira?.key === key ? state.jira : {}), key, title };
+  return true;
+}
+
 /** Which binding file this project writes: the worktree's, or the user data directory's. */
 function bindingFile(cwd, config) {
   return dataDirWritable() ? userBindingPath(cwd, config) : localBindingPath(cwd);

@@ -34,6 +34,8 @@ import {
   enrichBinding,
   followKeyAliases,
   isAdHocKey,
+  noteLandedHere,
+  safeExec,
   trackerOf,
   isAgentTool,
   launchFields,
@@ -941,6 +943,19 @@ export async function handleEvent(input = {}) {
   followKeyAliases(state, cwd, config);
   const { candidates, info, refused } = detectCandidates(resolved, cwd, state, config);
   state.binding = chooseBinding(state, candidates);
+  /*
+   * A session with no fresh binding still shows (MACLEOD-956): the main
+   * session's work goes to its own ad hoc card, named from the repository
+   * and the branch. Work only, signed in, not a session another tool drives.
+   */
+  if (!state.binding?.key && !agentKey && event === 'PostToolUse' && WORK_TOOLS.has(resolved.tool_name)
+    && signedIn && !drivenBy(input, process.env, cwd)) {
+    try {
+      const { sessionCard } = await import('./adhoc.mjs');
+      const branch = safeExec(process.env.TEAMFLOW_GIT_BIN || 'git', ['-C', cwd, 'branch', '--show-current'], { cwd, timeout: 2000 }).stdout?.trim() || undefined;
+      await sessionCard(state, { repository: info?.repository, branch, config });
+    } catch { /* the session reports nothing this turn, as before */ }
+  }
   const justBound = Boolean(state.binding?.key && state.binding.key !== beforeKey);
   // An edit keeps the binding it was made under fresh (MACLEOD-949).
   if (state.binding?.source === 'manual' && EDIT_TOOLS.has(resolved.tool_name)) {
@@ -1122,6 +1137,9 @@ export async function handleEvent(input = {}) {
   // for an Edit is not an edit. Those events only set what it waits on.
   const asking = isAskEvent(input);
   const transition = asking ? undefined : classifyTool(resolved, state, config);
+  // A local merge is remembered, never reported as shipped (MACLEOD-956):
+  // the push that sends its merge commit credits these keys.
+  if (transition?.landedHere) noteLandedHere(input.cwd || cwd, transition.landedHere);
   state = applyTransition(state, transition);
   let asked = {};
   if (!input.reporter_tool) {
@@ -1178,7 +1196,9 @@ export async function handleEvent(input = {}) {
    * session that stops without saying anything, which is the common
    * case and the one that would otherwise leave an item open forever.
    */
-  const endingAdHoc = event === 'Stop' && isAdHocKey(state.binding?.key);
+  // A session's own card (MACLEOD-956) lives as long as the session: a
+  // turn ending idles it, as it idles any card, and never ends it.
+  const endingAdHoc = event === 'Stop' && isAdHocKey(state.binding?.key) && state.binding?.source !== 'session';
   if (endingAdHoc) {
     state.status = 'idle';
     state.summary = 'Ad hoc work ended';
@@ -1440,6 +1460,10 @@ export async function handleEvent(input = {}) {
     if (mine.length || heard.length || got.later?.length) saveSession(state);
   }
   if (event === 'SessionStart') {
+    // MACLEOD-954: the commands this session runs know which session they
+    // run in, so `teamflow needs answer` never answers this session's own
+    // question. A file write only: the fast path.
+    try { (await import('./needs.mjs')).exportSessionId(sessionId); } catch { /* no env file: nothing to say */ }
     const local = await sessionStartLines(config, state);
     if (local.performed.length) state.actions = [...(state.actions || []), ...local.performed].slice(-16);
     notices = local.notices;

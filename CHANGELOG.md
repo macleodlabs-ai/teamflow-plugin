@@ -3,6 +3,45 @@
 What changed in each published version of the TeamFlow plugin, newest first.
 Only what a person using it would notice.
 
+## 0.3.60
+
+- **A merge on your computer is not shipped.** A local `git merge` says
+  "Merged here. Not pushed yet." It does not finish a card, a plan step or
+  a plan, and it does not tell your tracker. Work counts as merged when
+  you push it to the main branch on origin, or a pull request merges.
+- **The push counts.** When you push main, each ticket whose work the
+  push sends is merged, also the agents' branches you merged before.
+- **New work opens it again.** If TeamFlow closed a card and work on it
+  goes on, the card, its plan step and its plan open again. If TeamFlow
+  moved the issue to Done, the issue goes back to In Progress. A card you
+  closed yourself stays closed.
+- **Your session always shows.** When your session has no ticket, its
+  work goes to its own card, named from the repository and the branch.
+- **Plans agree with the board.** A plan the board ended ends on your
+  computer too, on the next turn.
+
+## 0.3.59
+
+- **Answer from Claude Code.** In `/teamflow-turn`, Your turn has buttons
+  for each option, Approve or Decline, Done, and Allow or Deny. A press
+  answers for you on your own cards and sessions only. History says the
+  answer came from Claude Code on this computer. Typed answers still open
+  TeamFlow.
+
+## 0.3.58
+
+- **More of TeamFlow inside Claude Code.** The line above the prompt
+  shows your ticket and its step, the last check, your plan's progress,
+  the agents and what needs you. It drops the least needed part first
+  when the window is narrow.
+- **`/teamflow-turn` has five tabs.** Press 1 to 5 for Your turn, Plans,
+  Agents, This ticket and Lately. Your turn shows each question and its
+  options.
+- **You still answer in TeamFlow.** Each answer, close and cancel opens
+  the card in TeamFlow, where you are signed in as yourself.
+- **It stays fast.** It reads the board at most every 30 seconds, and
+  again just after your own session reports.
+
 ## 0.3.57
 
 - **Close or cancel any card.** `teamflow card close <KEY>` says it is
