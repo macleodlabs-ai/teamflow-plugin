@@ -51,7 +51,11 @@ export function paneRows(s = snap) {
   rows.push({ head: 'Your turn' });
   if (s.turn) {
     rows.push({ text: s.turn.headline });
-    for (const r of s.turn.rows || []) rows.push({ text: `${r.word}: ${r.sentence}`, link: r.link, label: r.key ? `Open ${r.key} in TeamFlow` : 'Open in TeamFlow' });
+    for (const r of s.turn.rows || []) {
+      rows.push({ text: `${r.word}: ${r.sentence}`, link: r.link, label: r.key ? `Open ${r.key} in TeamFlow` : 'Open in TeamFlow' });
+      /* MACLEOD-951: Close and Cancel live in the card's menu in the app, as a link. Never a command here. */
+      if (r.key) rows.push({ link: r.link, label: `Close or cancel ${r.key} in TeamFlow` });
+    }
   }
   rows.push({ text: 'Answer in TeamFlow, signed in as yourself. Questions from this session stay here, in Claude Code.' });
   if (s.app) rows.push({ link: s.app, label: 'Open Your turn in TeamFlow' });

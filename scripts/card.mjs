@@ -352,7 +352,13 @@ export async function readTracker(key, config = {}) {
 export async function readWriteBack(config = {}) {
   const got = await fetchState('settings/trackers.json', config);
   if (!got.ok) return { known: false };
-  return { known: true, settings: got.document || {} };
+  // "TeamFlow updates your tracker" (MACLEOD-949): on unless an owner or
+  // admin turned it off. With it on, TeamFlow moves an issue to Done once
+  // its work is proved merged, whatever the older per-stage switch says.
+  const updates = await fetchState('settings/tracker_updates.json', config).catch(() => ({ ok: false }));
+  // Missing reads as on; a read that failed claims nothing either way.
+  const updatesOn = updates.ok ? updates.document?.on !== false : undefined;
+  return { known: true, settings: got.document || {}, updatesOn };
 }
 
 // The tracker's own words for "a person has decided". Mirrors CLOSED in
@@ -414,6 +420,10 @@ export function cardLine(key, card, tracker, writeBack = {}) {
       + 'just now, so why is unknown. Try again, or check Organisation settings';
   }
   const settings = (writeBack.settings || {})[tracker.provider] || {};
+  if (!settings.transitions && writeBack.updatesOn) {
+    return `${said} · ${where} still says ${name}: TeamFlow moves it to Done there once its `
+      + 'work is proved merged';
+  }
   if (!settings.transitions) {
     return `${said} · ${where} still says ${name}: write-back is off for this organisation. `
       + 'Turn it on in Organisation settings, or move it yourself';
@@ -515,9 +525,9 @@ export function trackerAskLines(asking = [], writeBack = {}, { dryRun = false } 
     const where = tracker.provider || 'the tracker';
     if (!writeBack.known) { bucket('unset', where, key); continue; }
     const settings = (writeBack.settings || {})[tracker.provider] || {};
-    bucket(settings.transitions ? 'ask' : 'off', where, key);
+    bucket(settings.transitions ? 'ask' : writeBack.updatesOn ? 'done' : 'off', where, key);
   }
-  const order = ['ask', 'off', 'unset', 'unread'];
+  const order = ['ask', 'done', 'off', 'unset', 'unread'];
   return [...buckets.values()]
     .sort((a, b) => order.indexOf(a.kind) - order.indexOf(b.kind))
     .map(({ kind, where, keys }) => {
@@ -525,6 +535,10 @@ export function trackerAskLines(asking = [], writeBack = {}, { dryRun = false } 
       if (kind === 'ask') {
         // Named, because these are real issues in somebody's Linear.
         return `${dryRun ? 'About to ask' : 'Asking'} ${where} to close: ${keys.join(', ')}.`;
+      }
+      if (kind === 'done') {
+        return `${many}: TeamFlow moves ${keys.length === 1 ? 'it' : 'them'} to Done in ${where} `
+          + 'once the work is proved merged.';
       }
       if (kind === 'off') {
         // Not named: the per-repair lines below already list them, and

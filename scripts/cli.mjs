@@ -96,6 +96,9 @@ const USAGE = `teamflow \u2014 delivery reporting for TeamFlow
                    "<one plain sentence>" [--options "A|B|C"] | --clear <id>
                                    put it in that person's Needs you; they answer
                                    in the app, and the answer comes back here
+  teamflow card close|cancel <KEY> [--reason "<why>"] | reopen <KEY>
+                                   close it (done) or cancel it (no longer
+                                   needed) on the board; reopen for 7 days
   teamflow needs                   what waits for you, and answers to what you asked
   teamflow track list|rename|merge|split|move   your tracks, and fix how TeamFlow grouped them
   teamflow adhoc start "<what the work is>" | title "<...>" | done
@@ -1106,6 +1109,11 @@ try {
     if (args[0] === 'ask') {
       const { askMain } = await import('./needs.mjs');
       process.exit(await askMain(args, { config }));
+    }
+    // `teamflow card close|cancel|reopen KEY` (MACLEOD-951): the app's own route.
+    if (['close', 'cancel', 'reopen'].includes(args[0])) {
+      const { closeMain } = await import('./card-close.mjs');
+      process.exit(await closeMain(args, { config }));
     }
     const { main } = await import('./say.mjs');
     process.exit(await main(args, { config }));

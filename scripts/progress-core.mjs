@@ -1581,11 +1581,24 @@ function umbrellaLines(umbrellas, tickets, isDone) {
   });
 }
 
+// src/lib/cardClose.ts
+function time6(value) {
+  const parsed = Date.parse(value ?? "");
+  return Number.isFinite(parsed) ? parsed : Number.NaN;
+}
+function closedOf(ticket) {
+  return ticket?.closed && ticket.closed.state ? ticket.closed : void 0;
+}
+function cancelledLongAgo(ticket, now) {
+  const mark = closedOf(ticket);
+  return mark?.state === "cancelled" && !(time6(mark.undoUntil) > now);
+}
+
 // src/lib/accounting.ts
 var DAY_MS2 = 24 * 60 * 6e4;
 var DELIVERED_STATUS = /^(done|released|shipped|closed|deployed)$/i;
 var GATE_KINDS = /* @__PURE__ */ new Set(["ci", "deploy", "test", "audit", "security"]);
-function time6(value) {
+function time7(value) {
   const parsed = Date.parse(value);
   return Number.isFinite(parsed) ? parsed : 0;
 }
@@ -1646,11 +1659,11 @@ function gateVerdicts(ticket, pipeline, deadlines, now) {
     const gate = gateFor(run, pipeline);
     if (!gate) continue;
     const held = newest2.get(gate.id);
-    if (!held || time6(run.updatedAt) > time6(held.run.updatedAt)) newest2.set(gate.id, { gate, run });
+    if (!held || time7(run.updatedAt) > time7(held.run.updatedAt)) newest2.set(gate.id, { gate, run });
   }
   for (const verdict of newest2.values()) {
     if (verdict.run.status !== "running") continue;
-    const later = [...newest2.values()].find((other) => other.run.status === "success" && gateIndex(other.gate, pipeline) > gateIndex(verdict.gate, pipeline) && time6(other.run.updatedAt) > time6(verdict.run.updatedAt));
+    const later = [...newest2.values()].find((other) => other.run.status === "success" && gateIndex(other.gate, pipeline) > gateIndex(verdict.gate, pipeline) && time7(other.run.updatedAt) > time7(verdict.run.updatedAt));
     if (later) verdict.assumedFrom = later.gate.id;
     else if (ticket.supersededBy) verdict.assumedFrom = ticket.supersededBy.slot;
     else verdict.deadline = gateDeadline(verdict.run, now, deadlines, pipeline);
@@ -1706,8 +1719,8 @@ function passedAgain(ticket, stage, pipeline) {
   const gate = gateFor({ stage }, pipeline);
   if (!gate) return false;
   const runs = (ticket.executions ?? []).filter((run) => isGateRun(run) && gateFor(run, pipeline) === gate);
-  const failed = Math.max(-Infinity, ...runs.filter(hasFailedStatus).map((run) => time6(run.updatedAt)));
-  return failed > -Infinity && runs.some((run) => run.status === "success" && time6(run.updatedAt) > failed);
+  const failed = Math.max(-Infinity, ...runs.filter(hasFailedStatus).map((run) => time7(run.updatedAt)));
+  return failed > -Infinity && runs.some((run) => run.status === "success" && time7(run.updatedAt) > failed);
 }
 function openRework(ticket, gates, pipeline) {
   if (!reworkHolds(ticket.stage)) return void 0;
@@ -1736,7 +1749,7 @@ function accountingOf(input) {
   const pipeline = input.pipeline ?? DEFAULT_PIPELINE;
   const workflows = input.workflows ?? [];
   const members = new Map((input.members ?? []).map((m) => [m.id, m]));
-  const tickets = input.tickets.filter((ticket) => !ticket.removed && decayOf(ticket) !== "archived");
+  const tickets = input.tickets.filter((ticket) => !ticket.removed && decayOf(ticket) !== "archived" && !cancelledLongAgo(ticket, now));
   const all = new Map(tickets.map((ticket) => [ticket.jiraKey, ticket]));
   const planDone = /* @__PURE__ */ new Set();
   for (const run of workflows) for (const t of run.tickets ?? []) if (t.state === "done" || t.state === "skipped") planDone.add(t.key);
@@ -1744,8 +1757,9 @@ function accountingOf(input) {
   const cards = /* @__PURE__ */ new Map();
   for (const ticket of tickets) {
     const backlog = ticket.stage === "BACKLOG";
-    const done = ticket.stage === "DONE" || trackerDone(ticket);
-    const finished = isFinishedWork(ticket, [ticket.jiraKey, ...ticket.convertedFrom ?? []].some((key) => planDone.has(key)));
+    const closed = closedOf(ticket);
+    const done = ticket.stage === "DONE" || trackerDone(ticket) || Boolean(closed);
+    const finished = Boolean(closed) || isFinishedWork(ticket, [ticket.jiraKey, ...ticket.convertedFrom ?? []].some((key) => planDone.has(key)));
     const gate = restingGate(gateFor(ticket, pipeline), finished && !done, pipeline);
     const column = gateIndex(gate, pipeline);
     const gates = gateVerdicts(ticket, pipeline, input.deadlines, now);
@@ -1768,8 +1782,8 @@ function accountingOf(input) {
     const idle = band === "idle" && !stalled && !blocked && !isRework2;
     const inFlight = midStage && !finished && !stalled && !idle && !(isRework2 && !live);
     const unassigned = !ticket.assignee && !ticket.member;
-    const shipped = shippedAt(ticket);
-    const shippedAge = shipped ? now - time6(shipped) : Number.POSITIVE_INFINITY;
+    const shipped = closed ? closed.state === "done" ? shippedAt(ticket) ?? closed.at : void 0 : shippedAt(ticket);
+    const shippedAge = shipped ? now - time7(shipped) : Number.POSITIVE_INFINITY;
     const lane = laneOf(ticket, members);
     const run = liveRuns2.find((r) => r.tickets.some((t) => t.key === ticket.jiraKey));
     const decay = finished || done ? void 0 : decayOf(ticket);
@@ -1806,7 +1820,8 @@ function accountingOf(input) {
         shipped24h: shippedAge >= 0 && shippedAge <= DAY_MS2,
         shipped7d: shippedAge >= 0 && shippedAge <= 7 * DAY_MS2,
         ...decay === "paused" ? { paused: true } : {},
-        ...decay === "set_aside" ? { setAside: true } : {}
+        ...decay === "set_aside" ? { setAside: true } : {},
+        ...closed ? { closed: closed.state } : {}
       },
       attention: [],
       ...said ? { liveness: said } : {},
@@ -1821,13 +1836,14 @@ function accountingOf(input) {
     }
   }
   const marks = [...input.marks ?? [], ...tickets.flatMap((ticket) => ticket.attention ?? [])];
-  const gone = new Set(input.tickets.filter((ticket) => ticket.removed).map((ticket) => ticket.jiraKey));
-  const asking = new Map([...cards].filter(([, card]) => !card.flags.paused && !card.flags.setAside));
+  const gone = new Set(input.tickets.filter((ticket) => ticket.removed || closedOf(ticket)).map((ticket) => ticket.jiraKey));
+  const asking = new Map([...cards].filter(([, card]) => !card.flags.paused && !card.flags.setAside && !card.flags.closed));
   const rows = attentionRows(asking, { now, marks, members, timeZone: input.timeZone, needs: input.needs, carryOn: input.carryOn, gone });
   for (const row of rows) cards.get(row.key)?.attention.push(row);
   const counted2 = [...cards.values()].filter((c) => !c.flags.setAside);
   const quietFlags = /* @__PURE__ */ new Set(["stalled", "idle", "inFlight", "unassigned"]);
-  const keySet = (flag) => new Set(counted2.filter((c) => c.flags[flag] && !(c.flags.paused && quietFlags.has(flag))).map((c) => c.key));
+  const shippedFlags = /* @__PURE__ */ new Set(["shipped24h", "shipped7d"]);
+  const keySet = (flag) => new Set(counted2.filter((c) => c.flags[flag] && !(c.flags.paused && quietFlags.has(flag)) && !(c.flags.closed && !shippedFlags.has(flag))).map((c) => c.key));
   const keys = {
     inFlight: keySet("inFlight"),
     stalled: keySet("stalled"),
@@ -2166,6 +2182,10 @@ function isHygieneSidecar(sidecar) {
 }
 function mergeHygieneState(issue, hygiene) {
   if (!hygiene) return issue;
+  if (hygiene.closed) {
+    const { removed: _removed, ...rest } = issue;
+    return { ...mergeHygieneState(rest, { ...hygiene, closed: void 0 }), closed: hygiene.closed, stage: "DONE" };
+  }
   const transitions = [...issue.transitions ?? [], ...hygiene.transitions ?? []].sort((a, b) => timestamp(a.at) - timestamp(b.at));
   return {
     ...issue,
@@ -2630,7 +2650,7 @@ function planCompletion(run, board, clock = {}) {
 // src/lib/status.ts
 var DAY_MS4 = 24 * 60 * 6e4;
 var REASON_MAX = 120;
-function time7(value) {
+function time8(value) {
   const parsed = value ? Date.parse(value) : Number.NaN;
   return Number.isFinite(parsed) ? parsed : 0;
 }
@@ -2658,32 +2678,32 @@ function sinceOf(keys, accounting, pipeline, since) {
     for (const run of ticket.executions ?? []) {
       if (!isGateRun(run) || run.status !== "success" && run.status !== "failed") continue;
       const at = run.endedAt ?? run.updatedAt;
-      if (time7(at) <= since) continue;
+      if (time8(at) <= since) continue;
       const column = gateFor(run, pipeline);
       const gate = column?.label ?? plainGateWords(gateName(run), void 0, pipeline);
       out.push({ at, key, kind: "verdict", text: `${gate} ${run.status === "success" ? "passed" : "failed"}` });
     }
     for (const entry of ticket.rework ?? []) {
-      if (time7(entry.at) <= since) continue;
+      if (time8(entry.at) <= since) continue;
       const gate = gateOf(entry.gate, pipeline)?.label ?? STAGE_LABELS[entry.gate];
       out.push({ at: entry.at, key, kind: "rework", text: `sent back from ${gate}: ${clip(entry.summary)}` });
     }
     for (const move of ticket.transitions ?? []) {
-      if (time7(move.at) <= since) continue;
+      if (time8(move.at) <= since) continue;
       if (move.stage === "MERGE") out.push({ at: move.at, key, kind: "merge", text: "up for merge" });
       if (move.stage === "DONE") out.push({ at: move.at, key, kind: "done", text: "done" });
     }
     const shipped = shippedAt(ticket);
-    if (shipped && time7(shipped) > since && !out.some((row) => row.key === key && row.kind === "done")) {
+    if (shipped && time8(shipped) > since && !out.some((row) => row.key === key && row.kind === "done")) {
       out.push({ at: shipped, key, kind: "done", text: "shipped" });
     }
     for (const decision of ticket.decisions ?? []) {
-      if (!decision.escalated || time7(decision.at) <= since) continue;
+      if (!decision.escalated || time8(decision.at) <= since) continue;
       const action = decision.action ? `, ${ACTION_WORDS[decision.action] ?? decision.action}` : "";
       out.push({ at: decision.at, key, kind: "decision", text: `${decision.criticality} decision${action}` });
     }
   }
-  return out.sort((a, b) => time7(b.at) - time7(a.at));
+  return out.sort((a, b) => time8(b.at) - time8(a.at));
 }
 var CRITICALITY_ORDER = ["critical", "high", "medium", "low"];
 var RULE_CRITICALITY = {
@@ -2715,7 +2735,7 @@ var DAY_MS5 = 24 * 60 * 6e4;
 function rankedNeeds(accounting, now = accounting.now) {
   return needYou(accounting.attention, now).map((row) => ({ row, criticality: criticalityOf(row, accounting.cards.get(row.key)?.ticket) })).sort((a, b) => CRITICALITY_ORDER.indexOf(a.criticality) - CRITICALITY_ORDER.indexOf(b.criticality));
 }
-function time8(value) {
+function time9(value) {
   const parsed = value ? Date.parse(value) : Number.NaN;
   return Number.isFinite(parsed) ? parsed : Number.NaN;
 }
@@ -2725,9 +2745,9 @@ function startOfDay(at) {
   return day.getTime();
 }
 function joinedAt(planned, card, start, now) {
-  let at = time8(planned.addedAt);
+  let at = time9(planned.addedAt);
   if (!Number.isFinite(at) && planned.addedBy !== "filter") {
-    const moves = (card?.transitions ?? []).map((move) => time8(move.at)).filter(Number.isFinite);
+    const moves = (card?.transitions ?? []).map((move) => time9(move.at)).filter(Number.isFinite);
     if (moves.length) at = Math.min(...moves);
   }
   return Math.min(Number.isFinite(at) ? Math.max(at, start) : start, now);
@@ -2735,14 +2755,14 @@ function joinedAt(planned, card, start, now) {
 function doneAt(planned, card, joined, now) {
   const done = planned.state === "done" || (card ? isFinishedStage(card.stage) : false);
   if (!done) return void 0;
-  const toDone = (card?.transitions ?? []).filter((move) => move.stage === "DONE").map((move) => time8(move.at)).filter(Number.isFinite);
-  const candidates2 = [time8(card ? shippedAt(card) : void 0), toDone.length ? Math.max(...toDone) : Number.NaN, time8(card?.updatedAt), time8(planned.updatedAt)];
+  const toDone = (card?.transitions ?? []).filter((move) => move.stage === "DONE").map((move) => time9(move.at)).filter(Number.isFinite);
+  const candidates2 = [time9(card ? shippedAt(card) : void 0), toDone.length ? Math.max(...toDone) : Number.NaN, time9(card?.updatedAt), time9(planned.updatedAt)];
   const at = candidates2.find(Number.isFinite) ?? now;
   return Math.min(Math.max(at, joined), now);
 }
 function burndownOf(run, tickets, now) {
   const byKey = new Map(tickets.map((ticket) => [ticket.jiraKey, ticket]));
-  const created = time8(run.createdAt);
+  const created = time9(run.createdAt);
   const start = Number.isFinite(created) ? Math.min(created, now) : now;
   const pool = (run.tickets ?? []).map((planned) => {
     const card = byKey.get(planned.key);
@@ -2799,7 +2819,7 @@ var STATE_WORD = {
 };
 var NO_PLAN = "none";
 var NO_PLAN_NAME = "Not in a plan";
-function time9(value) {
+function time10(value) {
   const parsed = value ? Date.parse(value) : Number.NaN;
   return Number.isFinite(parsed) ? parsed : 0;
 }
@@ -2838,30 +2858,30 @@ var ACTION_WORDS2 = {
 function actionTimes(ticket, fromRuns = []) {
   if (!ticket) return [];
   const out = /* @__PURE__ */ new Map();
-  for (const entry of directionsOf(ticket, fromRuns)) if (!entry.next && !entry.waiting) out.set(`d:${entry.at}:${entry.text}`, time9(entry.at));
-  for (const row of ticket.actionQueue ?? []) if (row.by === "teamflow") out.set(`q:${row.id}`, time9(row.at));
+  for (const entry of directionsOf(ticket, fromRuns)) if (!entry.next && !entry.waiting) out.set(`d:${entry.at}:${entry.text}`, time10(entry.at));
+  for (const row of ticket.actionQueue ?? []) if (row.by === "teamflow") out.set(`q:${row.id}`, time10(row.at));
   const action = ticket.autonomy?.action;
-  if (action && !out.has(`q:${action.id}`)) out.set(`q:${action.id}`, time9(action.at));
+  if (action && !out.has(`q:${action.id}`)) out.set(`q:${action.id}`, time10(action.at));
   return [...out.values()].filter((at) => at > 0);
 }
 function lastAction(ticket, now, fromRuns = []) {
   if (!ticket) return void 0;
-  const log = directionsOf(ticket, fromRuns).sort((a, b) => time9(b.at) - time9(a.at));
-  if (log[0]?.waiting) return { text: log[0].text, at: time9(log[0].at) };
+  const log = directionsOf(ticket, fromRuns).sort((a, b) => time10(b.at) - time10(a.at));
+  if (log[0]?.waiting) return { text: log[0].text, at: time10(log[0].at) };
   const planned = log.find((entry) => entry.next);
   const took = log.find((entry) => !entry.next && !entry.waiting);
-  if (planned && (!took || time9(planned.at) >= time9(took.at))) return { text: `Next: ${planned.text}`, at: time9(planned.at) };
-  if (took) return { text: took.text, at: time9(took.at), acted: true };
+  if (planned && (!took || time10(planned.at) >= time10(took.at))) return { text: `Next: ${planned.text}`, at: time10(planned.at) };
+  if (took) return { text: took.text, at: time10(took.at), acted: true };
   const auto = ticket.autonomy;
-  if (auto?.state === "stopped") return { text: "Stopped acting here. A person decides next", at: time9(auto.at) };
+  if (auto?.state === "stopped") return { text: "Stopped acting here. A person decides next", at: time10(auto.at) };
   const queued = [...ticket.actionQueue ?? []].reverse().find((row) => row.by === "teamflow");
   if (queued && (queued.status === "pending" || queued.status === "served")) {
     const words = ACTION_WORDS2[queued.kind] ?? "Queued an action";
-    const late = queued.status === "pending" && now - time9(queued.at) > DAY_MS6;
-    return { text: `${words}. ${late ? "No session has picked it up" : "It waits for the next session"}`, at: time9(queued.at), acted: true };
+    const late = queued.status === "pending" && now - time10(queued.at) > DAY_MS6;
+    return { text: `${words}. ${late ? "No session has picked it up" : "It waits for the next session"}`, at: time10(queued.at), acted: true };
   }
   if (auto?.state === "acting" && auto.action) {
-    return { text: auto.action.label ?? ACTION_WORDS2[auto.action.kind] ?? auto.action.kind, at: time9(auto.action.at), acted: true };
+    return { text: auto.action.label ?? ACTION_WORDS2[auto.action.kind] ?? auto.action.kind, at: time10(auto.action.at), acted: true };
   }
   return void 0;
 }
@@ -2930,7 +2950,7 @@ function doingOf(row, card, now, pipeline, fromRuns = []) {
   if (row.state === "working") return { text: "Nothing needed" };
   if (row.state === "not_started") return { text: row.planName ? `Queued in ${row.planName}` : "Not planned yet" };
   const column = card.gate?.label ?? STAGE_LABELS[card.ticket.stage];
-  return { text: `Nobody on it. ${stoppedWords(card.liveness, column, now, time9(card.ticket.updatedAt))}` };
+  return { text: `Nobody on it. ${stoppedWords(card.liveness, column, now, time10(card.ticket.updatedAt))}` };
 }
 function failedWords(card, pipeline) {
   if (!card.rework) return "a check failed";
@@ -2947,9 +2967,9 @@ function ownerOf(card, run) {
   return assignee?.name ?? run?.actor?.displayName ?? "Nobody yet";
 }
 function startedOf(ticket) {
-  const moves = (ticket?.transitions ?? []).filter((move) => move.stage !== "BACKLOG").map((move) => time9(move.at)).filter(Boolean);
+  const moves = (ticket?.transitions ?? []).filter((move) => move.stage !== "BACKLOG").map((move) => time10(move.at)).filter(Boolean);
   if (moves.length) return Math.min(...moves);
-  const runs = (ticket?.executions ?? []).map((run) => time9(run.startedAt ?? run.updatedAt)).filter(Boolean);
+  const runs = (ticket?.executions ?? []).map((run) => time10(run.startedAt ?? run.updatedAt)).filter(Boolean);
   return runs.length ? Math.min(...runs) : void 0;
 }
 function progressOf(input) {
@@ -2970,13 +2990,13 @@ function progressOf(input) {
     const gone = !done2 && (closed || planned?.state === "skipped");
     const need = done2 || gone ? void 0 : firstNeed.get(key);
     const state = gone ? "gone" : stateOf(card, planned, done2, Boolean(need));
-    const shipped = done2 ? time9((ticket && shippedAt(ticket)) ?? planned?.updatedAt ?? ticket?.updatedAt) || void 0 : void 0;
+    const shipped = done2 ? time10((ticket && shippedAt(ticket)) ?? planned?.updatedAt ?? ticket?.updatedAt) || void 0 : void 0;
     const base = {
       state,
       planName: run?.name,
       need
     };
-    const lastActivity = Math.max(time9(ticket?.updatedAt), card?.liveness?.lastEventAt ?? 0, time9(planned?.updatedAt)) || void 0;
+    const lastActivity = Math.max(time10(ticket?.updatedAt), card?.liveness?.lastEventAt ?? 0, time10(planned?.updatedAt)) || void 0;
     return {
       key,
       title: ticket?.title?.trim() || ticket?.summary?.trim() || key,
@@ -3288,7 +3308,7 @@ function reworkFacts(ticket, move, now = Date.now()) {
 }
 
 // src/lib/actors.ts
-var time10 = (value) => {
+var time11 = (value) => {
   const parsed = value ? Date.parse(value) : Number.NaN;
   return Number.isFinite(parsed) ? parsed : 0;
 };
@@ -3343,7 +3363,7 @@ function actorTrees(tickets, now = Date.now()) {
         session.startedAt = session.startedAt ?? execution.session.startedAt;
         session.endedAt = execution.session.endedAt ?? session.endedAt;
       }
-      if (time10(execution.updatedAt) > time10(session.at)) session.at = execution.updatedAt;
+      if (time11(execution.updatedAt) > time11(session.at)) session.at = execution.updatedAt;
       const row = {
         id: `${ticket.jiraKey}-${execution.id}`,
         name: execution.agent?.name ?? withoutSubagentSuffix(execution.label),
@@ -3387,7 +3407,7 @@ function actorTrees(tickets, now = Date.now()) {
          for is not a session anybody can say has finished. */
       ended: Boolean(session.endedAt) || session.own.length > 0 && session.own.every((row) => !isRunning(row, now)) && session.own.every((row) => freshness(row.at, now) === "idle"),
       running: session.agents.filter((row) => isRunning(row, now)).length
-    })).sort((a, b) => time10(b.at) - time10(a.at));
+    })).sort((a, b) => time11(b.at) - time11(a.at));
     trees.push({
       actor,
       sessions: list,
@@ -3395,7 +3415,7 @@ function actorTrees(tickets, now = Date.now()) {
       at: list[0]?.at ?? ""
     });
   }
-  return trees.sort((a, b) => b.running - a.running || time10(b.at) - time10(a.at));
+  return trees.sort((a, b) => b.running - a.running || time11(b.at) - time11(a.at));
 }
 function workingOn(trees, jiraKey, now = Date.now()) {
   let best;
@@ -3406,7 +3426,7 @@ function workingOn(trees, jiraKey, now = Date.now()) {
       const row = agent ?? own;
       if (!row) continue;
       const live = isRunning(row, now) && !session.ended;
-      const better = !best || live && !best.live || live === best.live && time10(row.at) > time10(best.row.at);
+      const better = !best || live && !best.live || live === best.live && time11(row.at) > time11(best.row.at);
       if (!better) continue;
       best = { actor: tree.actor, session, row, agent, live };
     }
@@ -3425,8 +3445,8 @@ function reworkLoop(ticket) {
   const to = displayStage(ticket);
   if (stageIndex(from) <= stageIndex(to)) return void 0;
   const atGate = (ticket.executions ?? []).filter((execution) => DISPLAY_STAGE[execution.stage] === from);
-  const failure = atGate.filter(hasFailedStatus).sort((a, b) => time11(b.updatedAt) - time11(a.updatedAt))[0];
-  if (failure && atGate.some((run) => run.status === "success" && time11(run.updatedAt) > time11(failure.updatedAt))) {
+  const failure = atGate.filter(hasFailedStatus).sort((a, b) => time12(b.updatedAt) - time12(a.updatedAt))[0];
+  if (failure && atGate.some((run) => run.status === "success" && time12(run.updatedAt) > time12(failure.updatedAt))) {
     return void 0;
   }
   return { from, to, failure, label: moveLabel(ticket, from, failure), loopCount: ticket.loopCount ?? 0 };
@@ -3438,11 +3458,11 @@ function moveLabel(ticket, from, failure) {
   return said || counts || failure?.label || ticket.summary || STAGE_LABELS[from];
 }
 function failureAt(ticket, column) {
-  return (ticket.executions ?? []).filter((run) => DISPLAY_STAGE[run.stage] === column && hasFailedStatus(run)).sort((a, b) => time11(b.updatedAt) - time11(a.updatedAt))[0];
+  return (ticket.executions ?? []).filter((run) => DISPLAY_STAGE[run.stage] === column && hasFailedStatus(run)).sort((a, b) => time12(b.updatedAt) - time12(a.updatedAt))[0];
 }
 function passedSince(ticket, column, failure) {
   if (!failure) return false;
-  return (ticket.executions ?? []).some((run) => DISPLAY_STAGE[run.stage] === column && run.status === "success" && time11(run.updatedAt) > time11(failure.updatedAt));
+  return (ticket.executions ?? []).some((run) => DISPLAY_STAGE[run.stage] === column && run.status === "success" && time12(run.updatedAt) > time12(failure.updatedAt));
 }
 function backwardMove(ticket) {
   const flagged = reworkLoop(ticket);
@@ -3461,7 +3481,7 @@ function backwardMove(ticket) {
       source: "rework"
     };
   }
-  const failure = (ticket.executions ?? []).filter((run) => !(ticket.alsoFailingOnMain && run.slot === "pr")).filter((run) => hasFailedStatus(run) && stageIndex(DISPLAY_STAGE[run.stage]) > stageIndex(to)).sort((a, b) => time11(b.updatedAt) - time11(a.updatedAt))[0];
+  const failure = (ticket.executions ?? []).filter((run) => !(ticket.alsoFailingOnMain && run.slot === "pr")).filter((run) => hasFailedStatus(run) && stageIndex(DISPLAY_STAGE[run.stage]) > stageIndex(to)).sort((a, b) => time12(b.updatedAt) - time12(a.updatedAt))[0];
   if (!failure) return void 0;
   const from = DISPLAY_STAGE[failure.stage];
   if (passedSince(ticket, from, failure)) return void 0;
@@ -3470,7 +3490,7 @@ function backwardMove(ticket) {
 function ticketActor(ticket, place2, people) {
   return personForTicket(ticket, people, void 0, place2?.workflow.actor)?.label || place2?.workflow.actor?.displayName || "Unassigned";
 }
-var time11 = (iso2) => new Date(iso2).getTime() || 0;
+var time12 = (iso2) => new Date(iso2).getTime() || 0;
 var TRACKER_NAMES = {
   jira: "Jira",
   linear: "Linear",
@@ -3634,7 +3654,7 @@ function whenWords(at, now) {
   const days = Math.floor(hours / 24);
   return days === 1 ? "yesterday" : `${days} days ago`;
 }
-function time12(value) {
+function time13(value) {
   const parsed = value ? Date.parse(value) : Number.NaN;
   return Number.isFinite(parsed) ? parsed : void 0;
 }
@@ -3642,7 +3662,7 @@ function waitingWhy(card, now) {
   const edge = card.openEdges.find((e) => e.from === card.key);
   if (edge) return `waits for ${edge.on}`;
   if (card.flags.backlog) return "not started";
-  const at = time12(card.ticket.updatedAt);
+  const at = time13(card.ticket.updatedAt);
   return at === void 0 ? "nobody is on it" : `no news for ${whenWords(at, now).replace(/ ago$/, "")}`;
 }
 function order(rows, planRank) {
@@ -3660,8 +3680,8 @@ function statusUpdateOf(input) {
   for (const card of input.accounting.cards.values()) {
     const ticket = card.ticket;
     const group = groupOf({ needsYou: needs.has(card.key), finished: card.flags.finished, deployed: wasDeployed(ticket), live: card.flags.live && !card.flags.stalled });
-    const finishedAt = group === "live" || group === "merged" ? time12(shippedAt(ticket)) : void 0;
-    const at = finishedAt ?? time12(ticket.updatedAt);
+    const finishedAt = group === "live" || group === "merged" ? time13(shippedAt(ticket)) : void 0;
+    const at = finishedAt ?? time13(ticket.updatedAt);
     const run = planOf.get(card.key);
     groups[group].push({
       key: card.key,
@@ -3747,7 +3767,7 @@ function workLines(items, pipeline = DEFAULT_PIPELINE) {
 // src/lib/laneModel.ts
 function lastReportAt(ticket) {
   const stamps = [ticket.updatedAt, ...(ticket.executions ?? []).map((run) => run.updatedAt)];
-  return Math.max(0, ...stamps.map((stamp) => time13(stamp)));
+  return Math.max(0, ...stamps.map((stamp) => time14(stamp)));
 }
 function isQuiet(ticket, trees, now = Date.now()) {
   if (displayStage(ticket) === "BACKLOG") return false;
@@ -3756,7 +3776,7 @@ function isQuiet(ticket, trees, now = Date.now()) {
   return !(ticket.executions ?? []).some((run) => isRunningRun(run, now));
 }
 var EARLIER = "earlier";
-var time13 = (value) => {
+var time14 = (value) => {
   const parsed = value ? Date.parse(value) : Number.NaN;
   return Number.isFinite(parsed) ? parsed : 0;
 };
@@ -3886,7 +3906,7 @@ function personLanes(input) {
     }
   }
   const ordered = [...lanes.values()].map((lane) => {
-    const sessions = [...sessionsByLane.get(lane.id).values()].sort((a, b) => Number(a.earlier) - Number(b.earlier) || time13(b.startedAt) - time13(a.startedAt));
+    const sessions = [...sessionsByLane.get(lane.id).values()].sort((a, b) => Number(a.earlier) - Number(b.earlier) || time14(b.startedAt) - time14(a.startedAt));
     return { ...lane, sessions, counts: tally(lane.cards) };
   });
   return {

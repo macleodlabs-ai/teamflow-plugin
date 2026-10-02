@@ -3,6 +3,15 @@
 What changed in each published version of the TeamFlow plugin, newest first.
 Only what a person using it would notice.
 
+## 0.3.57
+
+- **Close or cancel any card.** `teamflow card close <KEY>` says it is
+  done; `teamflow card cancel <KEY>` says it is no longer needed. The
+  card leaves Your turn at once. `teamflow card reopen <KEY>` brings it
+  back within 7 days.
+- **The Claude Code pane links each item to close or cancel it** in
+  TeamFlow.
+
 ## 0.3.56
 
 - **TeamFlow inside Claude Code.** A line above the prompt shows your
