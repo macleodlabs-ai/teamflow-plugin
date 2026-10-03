@@ -439,9 +439,9 @@ export function cardLine(key, card, tracker, writeBack = {}) {
 
 // Plain names for the stages a card can stand at, for the read-back line.
 const STAGE_WORDS = {
-  BACKLOG: 'Backlog', LOCAL_DEV: 'Local Dev', LOCAL_TEST: 'Local Test', LOCAL_AUDIT: 'Local Audit',
-  LOCAL_REWORK: 'Local Dev', MERGE: 'Merge', CI_BUILD: 'CI/CD', DEPLOY_DEV: 'CI/CD',
-  DEV_TEST: 'Test Dev', DEV_AUDIT: 'Dev Audit', DEV_REWORK: 'Local Dev', DEV_VERIFIED: 'Deployed',
+  BACKLOG: 'Backlog', LOCAL_DEV: 'Build', LOCAL_TEST: 'Test', LOCAL_AUDIT: 'Review',
+  LOCAL_REWORK: 'Build', MERGE: 'Merge', CI_BUILD: 'CI/CD', DEPLOY_DEV: 'CI/CD',
+  DEV_TEST: 'Dev test', DEV_AUDIT: 'Dev review', DEV_REWORK: 'Build', DEV_VERIFIED: 'Deployed',
   DONE: 'Done', READY_PROD: 'Done',
 };
 const stageWords = (stage) => STAGE_WORDS[stage] || 'an unknown step';

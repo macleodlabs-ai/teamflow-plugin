@@ -96,9 +96,9 @@ export function pruneSnapshots(now = Date.now()) {
 }
 
 export const STEP = {
-  BACKLOG: 'Backlog', LOCAL_DEV: 'Local Dev', LOCAL_TEST: 'Local Test', LOCAL_AUDIT: 'Local Audit',
-  LOCAL_REWORK: 'Local Rework', MERGE: 'Merge', CI_BUILD: 'CI/CD', DEPLOY_DEV: 'CI/CD', DEV_TEST: 'Dev Test',
-  DEV_AUDIT: 'Dev Audit', DEV_REWORK: 'Dev Rework', DEV_VERIFIED: 'Dev Verified', DONE: 'Done',
+  BACKLOG: 'Backlog', LOCAL_DEV: 'Build', LOCAL_TEST: 'Test', LOCAL_AUDIT: 'Review',
+  LOCAL_REWORK: 'Rework', MERGE: 'Merge', CI_BUILD: 'CI/CD', DEPLOY_DEV: 'CI/CD', DEV_TEST: 'Dev test',
+  DEV_AUDIT: 'Dev review', DEV_REWORK: 'Dev rework', DEV_VERIFIED: 'Deployed', DONE: 'Done',
 };
 
 /**

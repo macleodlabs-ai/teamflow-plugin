@@ -36,8 +36,11 @@ import {
 } from './card.mjs';
 import { readChecks } from './checks.mjs';
 import {
-  EDGE_RULES, RULE_WORDS, WAIT_KINDS, changesNothing, dryRunLines, planChanges, readPlan, unlistedLine,
+  EDGE_RULES, RULE_WORDS, WAIT_KINDS, changesNothing, dryRunLines, planChanges, processLine, readPlan, unlistedLine,
 } from './planfile.mjs';
+import { RISK_AREAS, processesOf } from './process.mjs';
+import { readTicketFacts } from './ticket-facts.mjs';
+import { orgProcesses } from './org-processes.mjs';
 
 // The plan's session block lives beside the card it is stamped on.
 export { planSession };
@@ -78,9 +81,11 @@ export const USAGE = `teamflow workflow — the pool of tickets a run works thro
   teamflow workflow create <name> [--tracker jira|linear|github] [--project <p>]
                                   [--state <s>] [--label <l>]
                                   [--order priority|rank|age] [--deploy]
-                                  [--order-text <sentence>]
+                                  [--order-text <sentence>] [--process <id>]
       Start a workflow. --order-text records what was asked for; it stays
-      on this machine and is never published.
+      on this machine and is never published. --process names one of your
+      organisation's saved processes; without it, the default applies.
+      The run keeps that process even if somebody edits it later.
 
   teamflow workflow add <KEY> [--to <name>]
       Put a ticket in the pool by hand. This is the escape hatch for one
@@ -175,6 +180,13 @@ export const USAGE = `teamflow workflow — the pool of tickets a run works thro
 
   teamflow workflow ready [--to <name>]
       What the current phase has open. This is what a run starts next.
+      It also says when the run's process wants a release or phase review.
+
+  teamflow workflow review --verdict pass|fail --reason <sentence> [--phase <n>] [--to <name>]
+      Record the release review of the whole plan, or of one phase with
+      --phase. The verdict and your one sentence only, never the findings.
+      A run whose process ends with a review cannot finish without a pass.
+      (\`workflow audit\` is the same command.)
 
   teamflow workflow ticket <KEY> [--state <s>] [--cycle <c>] [--reason <why>] [--note <text>]
       [--findings <text>] [--finding <text>]... [--findings-file <path>] [--rechecked] [--done <ID>]... [--reopen <ID>]... [--to <name>]
@@ -627,6 +639,13 @@ export function published(workflow) {
   const filter = pick(workflow.filter, ['tracker', 'project', 'state', 'label', 'order']);
   if (Object.keys(filter).length) out.filter = filter;
   if (workflow.scope) out.scope = pick(workflow.scope, ['deploy']);
+  // The process it follows, and its plan and phase audits (MACLEOD-968):
+  // two choices from closed sets, a verdict and the orchestrator's one
+  // sentence. Never an audit's findings.
+  if (workflow.process?.id) out.process = pick(workflow.process, ['id', 'name', 'tdd', 'audit']);
+  if (Array.isArray(workflow.audits) && workflow.audits.length) {
+    out.audits = workflow.audits.slice(-20).map((row) => pick(row, ['scope', 'phase', 'verdict', 'reason', 'at']));
+  }
   return out;
 }
 
@@ -715,7 +734,7 @@ export function own(workflow, config, info) {
   return workflow;
 }
 
-export function create(name, args, state, owner) {
+export function create(name, args, state, owner, process) {
   const clean = String(name || '').trim();
   if (!clean) throw new Error('Usage: teamflow workflow create <name>');
   if (clean.length > NAME_MAX) {
@@ -737,6 +756,8 @@ export function create(name, args, state, owner) {
   };
   const stamped = ownerFields(owner);
   if (stamped) workflow.actor = stamped;
+  // The process it follows, as it was when the run began (MACLEOD-968).
+  if (process?.id) workflow.process = snapshotProcess(process);
   // Local only. Never copied into `published`.
   const order = flag(args, 'order-text');
   if (order) workflow.order = order;
@@ -1182,7 +1203,8 @@ export function stalledGate(workflow, { now = Date.now(), deadlines } = {}) {
   for (const ticket of workflow.tickets || []) {
     if (ticket.state !== 'running') continue;
     for (const [cycle, status] of Object.entries(gateStatuses(ticket, { now, deadlines }))) {
-      if (status === 'idle') return { key: ticket.key, gate: GATES[cycle].slot };
+      // A skipped gate reads idle with its reason; it is not waiting on anything.
+      if (status === 'idle' && !ticket.skipped?.[cycle]) return { key: ticket.key, gate: GATES[cycle].slot };
     }
   }
   return undefined;
@@ -1269,7 +1291,9 @@ export const CLOSED_RUN_STATUSES = ['done', 'cancelled', 'archived'];
  */
 export function allFinished(workflow) {
   return Boolean(workflow) && OPEN_RUN_STATUSES.includes(workflow.status)
-    && (workflow.tickets || []).length > 0 && !openTickets(workflow).length;
+    && (workflow.tickets || []).length > 0 && !openTickets(workflow).length
+    // And the audit its process holds back for the end (MACLEOD-968).
+    && !auditMissing(workflow);
 }
 
 /**
@@ -1291,6 +1315,198 @@ export function finishRun(workflow) {
   workflow.status = 'done';
   workflow.updatedAt = now();
   return true;
+}
+
+// --- the process a run follows (MACLEOD-968) ---------------------------
+//
+// The owner, 2026-10-03: "Let's simplify the default sdlc in teamflow
+// plugin. as opus only needs occasional audits. But still needs tdd.
+// Allow for saving sdlc's. And respecting them."
+//
+// The rulings, each enforced here and nowhere else in the plugin:
+// - Audits only for risky changes (sign-in, money, what gets reported,
+//   infrastructure), plus one audit of the whole plan before it ends.
+// - Test-first is proved by the hooks (ticket-facts.mjs). A ticket with
+//   no proof does not pass its test step unless a person skipped that
+//   step with a reason, from the card on the board (`skip_gate`).
+// - A plan names a saved process, else the organisation's default. The
+//   run keeps a copy, so an owner editing the process later changes the
+//   runs that start after, never one already going.
+//
+// A run with no `process` started before this existed and keeps working
+// exactly as it did: nothing below refuses or skips anything on it.
+
+/** The copy a run keeps: a name and two choices. */
+export function snapshotProcess(process) {
+  return { id: process.id, name: process.name, tdd: process.tdd, audit: process.audit, checks: Array.isArray(process.checks) ? process.checks : [] };
+}
+
+/** The process `wanted` names among the organisation's, else its default; or a plain sentence why not. */
+export function chooseProcess(served, wanted) {
+  const { default: fallback, list } = processesOf(served);
+  const id = wanted === undefined ? fallback : String(wanted).trim().toLowerCase();
+  const found = list.find((p) => p.id === id);
+  if (found) return { process: snapshotProcess(found) };
+  return { error: `There is no process called "${String(wanted).slice(0, 40)}". Choose one of: ${list.map((p) => p.id).join(', ')}.` };
+}
+
+const TEST_AT = CYCLE_ORDER.indexOf('test');
+const AUDIT_AT = CYCLE_ORDER.indexOf('audit');
+const RISK_WORDS = { auth: 'sign-in', money: 'money', reporting: 'what gets reported', infra: 'infrastructure' };
+const NOT_NEEDED = {
+  risky_and_plan_end: 'Not needed: no security-sensitive change',
+  phase_end: 'Not needed: the phase gets one review at its end',
+  on_request: 'Not needed: reviews happen only when someone asks',
+};
+
+/** Where a ticket stands in the cycle: done is past every step, rework and waiting at none. */
+function position(state, cycle) {
+  if (state === 'done') return Infinity;
+  return CYCLE_ORDER.indexOf(cycle);
+}
+
+/** "sign-in", "sign-in and money", "sign-in, money and infrastructure". */
+function riskWords(risk) {
+  const words = risk.map((area) => RISK_WORDS[area]);
+  return words.length < 2 ? words.join('') : `${words.slice(0, -1).join(', ')} and ${words[words.length - 1]}`;
+}
+
+/**
+ * Whether this ticket needs its own audit under the run's process, and
+ * if not, the reason the audit gate shows instead.
+ */
+export function auditNeed(workflow, key, facts = readTicketFacts) {
+  const process = workflow?.process;
+  if (!process?.id || process.audit === 'every_ticket') return { needed: true };
+  if (process.audit === 'risky_and_plan_end') {
+    let risk = [];
+    try { risk = (facts(key)?.risk || []).filter((area) => RISK_AREAS.includes(area)); } catch { risk = []; }
+    if (risk.length) return { needed: true, risk };
+  }
+  return { needed: false, reason: NOT_NEEDED[process.audit] || NOT_NEEDED.on_request };
+}
+
+/**
+ * Why the run's process will not let this move happen, in plain words, or
+ * '' when it may. Only a move that carries the ticket past its test step
+ * or past its audit step is ever refused; going back never is.
+ */
+export function processRefusal(workflow, ticket, { state, cycle } = {}, facts = readTicketFacts) {
+  const process = workflow?.process;
+  if (!process?.id || !ticket) return '';
+  const toState = state ?? ticket.state;
+  if (!['running', 'done'].includes(toState)) return '';
+  const from = position(ticket.state, ticket.cycle);
+  const to = position(toState, cycle ?? ticket.cycle);
+  const key = ticket.key;
+
+  if (process.tdd === 'proved' && from <= TEST_AT && to > TEST_AT && !ticket.skipped?.test) {
+    let proof = 'none';
+    try { proof = facts(key)?.testFirst || 'none'; } catch { proof = 'none'; }
+    // A ticket whose work changed no code has nothing to test first (owner, 2026-10-03).
+    if (proof !== 'proved' && proof !== 'not_needed') {
+      return [
+        proof === 'red'
+          ? `${key} has a failing test, but no passing run after the code change.`
+          : `${key} has no failing test from before its code change.`,
+        'Write the test first and run it, then write the code and run it again.',
+        'Or a person can skip the test step with a reason, from the card on the board.',
+      ].join(' ');
+    }
+  }
+
+  if (from <= AUDIT_AT && to > AUDIT_AT && !ticket.skipped?.audit) {
+    const audited = ticket.cycle === 'audit' && ticket.state !== 'rework';
+    const need = auditNeed(workflow, key, facts);
+    if (need.needed && !audited) {
+      return need.risk
+        ? `${key} touches ${riskWords(need.risk)}, so it needs a review first. Move it to review (--cycle audit).`
+        : `${key} needs a review first, because this run reviews every ticket. Move it to review (--cycle audit).`;
+    }
+  }
+  return '';
+}
+
+/**
+ * After a move: a ticket that went past its audit step without an audit
+ * its process does not ask for shows that audit as skipped, with the
+ * reason. Never as passed, which only an audit earns. Answers the reason
+ * when it marked one.
+ */
+export function markAuditNotNeeded(workflow, ticket, from, facts = readTicketFacts, at = now()) {
+  if (!workflow?.process?.id || !ticket || ticket.skipped?.audit) return '';
+  const to = position(ticket.state, ticket.cycle);
+  if (!(from <= AUDIT_AT && to > AUDIT_AT)) return '';
+  if ((ticket.verdicts || []).some((v) => v.gate === 'audit' && v.verdict === 'pass')) return '';
+  const need = auditNeed(workflow, ticket.key, facts);
+  if (need.needed) return '';
+  ticket.skipped = { ...(ticket.skipped || {}), audit: { by: 'TeamFlow', reason: need.reason, at } };
+  return need.reason;
+}
+
+/** The latest plan or phase audit, if it is a pass that covers every key it must. */
+function auditPassed(workflow, scope, phase) {
+  const rows = (workflow.audits || []).filter((row) => row.scope === scope && (scope !== 'phase' || row.phase === phase.n));
+  const last = rows[rows.length - 1];
+  if (!last || last.verdict !== 'pass') return false;
+  const keys = scope === 'phase' ? phase.tickets : (workflow.tickets || []).map((t) => t.key);
+  return keys.every((key) => (last.keys || []).includes(key));
+}
+
+/**
+ * The audit the run's process still needs before the run may finish:
+ * `{ scope: 'plan' }`, `{ scope: 'phase', n }`, or undefined.
+ */
+export function auditMissing(workflow) {
+  const audit = workflow?.process?.audit;
+  if (audit === 'risky_and_plan_end') return auditPassed(workflow, 'plan') ? undefined : { scope: 'plan' };
+  if (audit === 'phase_end') {
+    const phase = (workflow.phases || []).find((p) => !auditPassed(workflow, 'phase', p));
+    return phase ? { scope: 'phase', n: phase.n } : undefined;
+  }
+  return undefined;
+}
+
+/** One plain line for an audit that is due now, or ''. */
+export function auditDueLine(workflow, due) {
+  if (!due) return '';
+  return due.scope === 'plan'
+    ? `Release review due: every ticket in "${workflow.name}" is done. Review the whole plan before it ends.`
+    : `Phase ${due.n} review due: its tickets are done. The next phase starts after the review passes.`;
+}
+
+/**
+ * Record the plan's audit, or one phase's. A pass counts only for the
+ * tickets it covered, so work added later needs its own audit. Answers
+ * the row, or `{ error }` with a plain sentence.
+ */
+export function recordAudit(workflow, { verdict, reason, phase, by, at = now() } = {}) {
+  if (!['pass', 'fail'].includes(verdict)) return { error: 'Say if the review passed: --verdict pass or --verdict fail.' };
+  const said = noteLine(reason);
+  if (!said) return { error: 'Say what the review found in one sentence, with --reason.' };
+  let keys;
+  let row;
+  if (phase !== undefined) {
+    const n = Number(phase);
+    const held = (workflow.phases || []).find((p) => p.n === n);
+    if (!held) return { error: `This run has no phase ${String(phase).slice(0, 10)}.` };
+    const open = held.tickets.filter((key) => openTickets(workflow).some((t) => t.key === key));
+    if (open.length) return { error: `Phase ${n} still has open tickets: ${open.join(', ')}. Review it once they are done.` };
+    keys = [...held.tickets];
+    row = { scope: 'phase', phase: n };
+  } else {
+    const open = openTickets(workflow).length;
+    if (open) return { error: `The release review comes once every ticket is done. ${open} still ${open === 1 ? 'is' : 'are'} open.` };
+    keys = (workflow.tickets || []).map((t) => t.key);
+    row = { scope: 'plan' };
+  }
+  Object.assign(row, { verdict, reason: said, at, keys });
+  if (by) row.by = String(by).slice(0, 80);
+  workflow.audits = [...(workflow.audits || []), row].slice(-20);
+  const what = row.scope === 'plan' ? 'release review' : `phase ${row.phase} review`;
+  hygieneRow(workflow, `${what} ${verdict === 'pass' ? 'passed' : 'failed'}`, by, said, at);
+  workflow.updatedAt = at;
+  return { row };
 }
 
 /**
@@ -1409,6 +1625,8 @@ export function render(workflow, state) {
   }
   out.push(`  filter: ${filter}`);
   out.push(`  deploy in scope: ${workflow.scope?.deploy ? 'yes' : 'no'}`);
+  // Which saved process it follows (MACLEOD-968), in one plain line.
+  out.push(`  ${processLine(workflow.process) || 'This run started before saved processes. It works as it always did.'}`);
   if (workflow.order) out.push(`  asked for: ${workflow.order}   (stays on this machine)`);
   if (!pool.length) {
     out.push('  pool: empty. Plan it, or `teamflow workflow add <KEY>`.');
@@ -1471,7 +1689,11 @@ async function readJson(stream) {
 export async function main(args, {
   config = {}, info = {}, stdin = process.stdin, cwd, sessionId, read,
   print = (s) => process.stdout.write(`${s}\n`),
+  // What the hooks learned about a ticket, and how the organisation's
+  // processes are read (MACLEOD-968). Passed in by tests.
+  facts: factsOf, loadProcesses,
 } = {}) {
+  const facts = factsOf || ((key) => readTicketFacts(key, { config, cwd }));
   const [sub = 'show', ...rest] = args;
   if (sub === 'help' || sub === '--help' || sub === '-h') {
     print(USAGE);
@@ -1482,8 +1704,14 @@ export async function main(args, {
   const state = load(config, cwd || sessionId ? placeFor({ config, cwd, info, sessionId }) : undefined);
 
   if (sub === 'create') {
-    const name = rest.filter((a) => !a.startsWith('--'))[0];
-    const workflow = create(name, rest, state, stated(config, info));
+    const name = rest.filter((a, i) => !a.startsWith('--') && !FLAG_VALUE.has(rest[i - 1]))[0];
+    // The process it follows (MACLEOD-968): named, or the organisation's default.
+    const chosen = chooseProcess(await orgProcesses({ config, force: true, load: loadProcesses }), flag(rest, 'process'));
+    if (chosen.error) {
+      print(chosen.error);
+      return 1;
+    }
+    const workflow = create(name, rest, state, stated(config, info), chosen.process);
     save(state, config);
     const sent = await publish(workflow, config);
     print(`TeamFlow started workflow "${workflow.name}" (${workflow.id}).`);
@@ -1494,6 +1722,7 @@ export async function main(args, {
     print(sent.ok ? 'It is on the board. Plan it, or add tickets by hand.'
       : sent.queued ? `It is on this machine and queued: ${sent.reason || 'the service did not answer'}.`
         : `It is on this machine only. The service refused it: ${sent.reason || 'no reason given'}.`);
+    print(processLine(workflow.process));
     return 0;
   }
 
@@ -1644,9 +1873,24 @@ export async function main(args, {
     const file = rest.filter((a) => !a.startsWith('--') && !FLAG_VALUE.has(rest[rest.indexOf(a) - 1]))[0];
     const plan = readPlan(file);
     const existing = find(state, plan.name);
+    /*
+     * The process the file names, or the organisation's default
+     * (MACLEOD-968). An unknown id is refused before anything is written.
+     * A run that already follows one keeps it: a file is no reason to
+     * change the rules under work that is half done.
+     */
+    const named = plan.process ?? flag(rest, 'process');
+    const chosen = chooseProcess(await orgProcesses({ config, force: true, load: loadProcesses }), named);
+    if (chosen.error) {
+      print(chosen.error);
+      return 1;
+    }
+    const keeps = existing?.process?.id && named !== undefined && existing.process.id !== chosen.process.id
+      ? `"${existing.name}" keeps the process it started with, ${existing.process.name}. TeamFlow did not change it.`
+      : '';
     if (rest.includes('--dry-run')) {
       const draft = existing ? structuredClone(existing)
-        : { name: plan.name, tickets: [], dependencies: [], phases: [] };
+        : { name: plan.name, tickets: [], dependencies: [], phases: [], process: chosen.process };
       const changes = planChanges(draft, plan);
       applyPlan(draft, plan, changes);
       print(existing
@@ -1655,13 +1899,15 @@ export async function main(args, {
         : `Applying ${file} would start "${plan.name}" with ${countWords(changes)}.`);
       const extra = unlistedLine(changes);
       if (extra) print(extra);
+      if (keeps) print(keeps);
       for (const line of dryRunLines(draft, {
         checks: readChecks(cwd || process.cwd()), gates: draft.gates || [], policy: policyFor(config),
       })) print(line);
       return 0;
     }
-    const run = existing || create(plan.name, rest, state, stated(config, info));
+    const run = existing || create(plan.name, rest, state, stated(config, info), chosen.process);
     const changes = planChanges(run, plan);
+    if (keeps) print(keeps);
     if (existing && changesNothing(changes)) {
       print(`"${run.name}" already matches ${file}. TeamFlow changed nothing.`);
       const extra = unlistedLine(changes);
@@ -1719,6 +1965,15 @@ export async function main(args, {
     const wanted = rest.filter((a) => !a.startsWith('--'))[0];
     if (!STATUSES.includes(wanted)) {
       throw new Error(`A workflow status is one of ${STATUSES.join(', ')}`);
+    }
+    // A run whose process audits at the end does not finish without it (MACLEOD-968).
+    const missing = wanted === 'done' ? auditMissing(target) : undefined;
+    if (missing) {
+      print(missing.scope === 'plan'
+        ? `"${target.name}" needs a passing release review before it can finish.`
+        : `"${target.name}" needs a passing review of phase ${missing.n} before it can finish.`);
+      print(`Record it with: teamflow workflow review --verdict pass --reason "<what the review found>"${missing.scope === 'phase' ? ` --phase ${missing.n}` : ''}.`);
+      return 1;
     }
     target.status = wanted;
     // Owned again here: the call above ran while this was still a draft,
@@ -1842,6 +2097,10 @@ export async function main(args, {
 
   if (sub === 'ready') {
     const open = ready(target);
+    if (open.due) {
+      print(auditDueLine(target, open.due));
+      return 0;
+    }
     if (!open.phase) {
       print(`"${target.name}" has nothing left to start.`);
       return 0;
@@ -1860,6 +2119,18 @@ export async function main(args, {
     const key = rest.filter((a) => !a.startsWith('--'))[0];
     // `--findings blocking=2,should=2` is counts (MACLEOD-885); other text is the summary.
     const counts = findingCounts(flag(rest, 'findings'));
+    /*
+     * The run's process (MACLEOD-968): no move past the test step without
+     * test-first proof or a person's skip, and none past a required audit
+     * without it. Refused before anything is written or sent.
+     */
+    const before = (target.tickets || []).find((t) => t.key === String(key || '').trim());
+    const refusal = processRefusal(target, before, { state: flag(rest, 'state'), cycle: flag(rest, 'cycle') }, facts);
+    if (refusal) {
+      print(refusal);
+      return 1;
+    }
+    const from = before ? (before.state === 'done' ? Infinity : CYCLE_ORDER.indexOf(before.cycle)) : -1;
     const ticket = move(target, key, {
       state: flag(rest, 'state'), cycle: flag(rest, 'cycle'), note: flag(rest, 'note'),
       findings: counts ? undefined : flag(rest, 'findings'),
@@ -1873,6 +2144,8 @@ export async function main(args, {
       by: actor(config, info).displayName,
     });
     if (verdictNote(ticket)) print(verdictNote(ticket));
+    const notNeeded = markAuditNotNeeded(target, ticket, from, facts);
+    if (notNeeded) print(`${ticket.key}: review skipped. ${notNeeded}.`);
     const deadlines = gateDeadlinesOf(config);
     const at = now();
     /*
@@ -2034,9 +2307,39 @@ export async function main(args, {
         if (disagree) print(disagree);
       }
     }
-    print(open.phase
-      ? `Phase ${open.phase.n} is ${open.phase.state}; ready: ${open.tickets.map((t) => t.key).join(', ') || 'nothing'}.`
-      : 'Every phase is done.');
+    if (open.due) print(auditDueLine(target, open.due));
+    else {
+      print(open.phase
+        ? `Phase ${open.phase.n} is ${open.phase.state}; ready: ${open.tickets.map((t) => t.key).join(', ') || 'nothing'}.`
+        : 'Every phase is done.');
+    }
+    return 0;
+  }
+
+  /*
+   * The audit of the whole plan, or of one phase (MACLEOD-968). The
+   * verdict and the orchestrator's one sentence; never the findings.
+   */
+  if (sub === 'review' || sub === 'audit') {
+    const done = recordAudit(target, {
+      verdict: flag(rest, 'verdict'), reason: flag(rest, 'reason'), phase: flag(rest, 'phase'),
+      by: actor(config, info).displayName,
+    });
+    if (done.error) {
+      print(done.error);
+      return 1;
+    }
+    const what = done.row.scope === 'plan' ? 'The release review' : `The review of phase ${done.row.phase}`;
+    print(done.row.verdict === 'pass' ? `${what} passed.` : `${what} failed. Fix what it found, then review again.`);
+    const finished = finishRun(target);
+    save(state, config);
+    await publish(target, config);
+    if (finished) print(`"${target.name}" has nothing open left; the run is done.`);
+    else {
+      const open = ready(target);
+      if (open.due) print(auditDueLine(target, open.due));
+      else if (open.phase && open.tickets.length) print(`Phase ${open.phase.n} has ${open.tickets.length} ready: ${open.tickets.map((t) => t.key).join(', ')}`);
+    }
     return 0;
   }
 
@@ -2176,8 +2479,18 @@ export function relevel(workflow) {
 export function ready(workflow) {
   const tickets = workflow.tickets || [];
   const byKey = new Map(tickets.map((t) => [t.key, t]));
-  const phase = (workflow.phases || []).find((p) => phaseState(p, tickets) !== 'done');
-  if (!phase) return { phase: null, tickets: [] };
+  /*
+   * An audit the process holds back (MACLEOD-968): a phase whose process
+   * audits at its end does not close until that audit passes, and a plan
+   * audited at the end is due once its last ticket is done.
+   */
+  const missing = auditMissing(workflow);
+  const phase = (workflow.phases || []).find((p) => phaseState(p, tickets) !== 'done'
+    || (missing?.scope === 'phase' && missing.n === p.n));
+  if (!phase) return { phase: null, tickets: [], ...(missing && tickets.length ? { due: missing } : {}) };
+  if (missing?.scope === 'phase' && missing.n === phase.n && phaseState(phase, tickets) === 'done') {
+    return { phase, tickets: [], due: missing };
+  }
   const waiting = (t) => t && (t.state === 'waiting' || t.state === 'rework');
   const open = phase.tickets.map((k) => byKey.get(k)).filter(waiting);
   /*
@@ -2437,7 +2750,7 @@ export function dependsBatch(workflow, entries, { found } = {}) {
 
 // Create flags that take a value, so `apply --tracker linear plan.yaml`
 // does not read "linear" as the file.
-const FLAG_VALUE = new Set(['--tracker', '--project', '--state', '--label', '--order', '--order-text', '--to']);
+const FLAG_VALUE = new Set(['--tracker', '--project', '--state', '--label', '--order', '--order-text', '--to', '--process']);
 
 /**
  * Add what `planChanges` found missing, through the same `seed` and

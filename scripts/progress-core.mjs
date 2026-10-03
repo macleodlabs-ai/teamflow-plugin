@@ -47,13 +47,13 @@ var DEFAULT_PIPELINE = {
   name: "Default",
   gates: [
     { id: "backlog", label: "Backlog", stages: ["BACKLOG"], kind: "plugin" },
-    { id: "build", label: "Local Dev", stages: ["LOCAL_DEV"], kind: "plugin", rework: true },
-    { id: "test", label: "Local Test", stages: ["LOCAL_TEST", "LOCAL_REWORK"], kind: "plugin", rework: true },
-    { id: "audit", label: "Local Audit", stages: ["LOCAL_AUDIT"], kind: "plugin", rework: true },
+    { id: "build", label: "Build", stages: ["LOCAL_DEV"], kind: "plugin", rework: true },
+    { id: "test", label: "Test", stages: ["LOCAL_TEST", "LOCAL_REWORK"], kind: "plugin", rework: true },
+    { id: "audit", label: "Review", stages: ["LOCAL_AUDIT"], kind: "plugin", rework: true },
     { id: "merge", label: "Merge", stages: ["MERGE"], kind: "plugin", rework: true },
     { id: "ci", label: "CI/CD", stages: ["CI_BUILD", "DEPLOY_DEV"], kind: "ci", rework: true },
-    { id: "dev-test", label: "Test Dev", stages: ["DEV_TEST", "DEV_REWORK"], kind: "ci", rework: true },
-    { id: "dev-audit", label: "Dev Audit", stages: ["DEV_AUDIT"], kind: "ci", rework: true },
+    { id: "dev-test", label: "Dev test", stages: ["DEV_TEST", "DEV_REWORK"], kind: "ci", rework: true },
+    { id: "dev-audit", label: "Dev review", stages: ["DEV_AUDIT"], kind: "ci", rework: true },
     { id: "verified", label: "Deployed", stages: ["DEV_VERIFIED"], kind: "plugin", rework: true },
     { id: "done", label: "Done", stages: ["DONE"], kind: "plugin" }
   ]
@@ -104,7 +104,7 @@ function alsoFailingOnMain(checkRuns, main) {
   return failing.length > 0 && failing.every((id) => held[id]?.result === "failing");
 }
 var GATE_ID = /^[a-z0-9][a-z0-9-]{0,39}$/;
-var EXTERNAL_SYSTEMS = ["sonarqube"];
+var EXTERNAL_SYSTEMS = ["sonarqube", "webhook"];
 function pipelineProblems(pipeline) {
   const problems = [];
   if (!pipeline || !Array.isArray(pipeline.gates) || pipeline.gates.length === 0) {
@@ -146,11 +146,19 @@ function pipelineProblems(pipeline) {
   }
   return problems;
 }
+var OLD_LABELS = {
+  verified: ["Verified", "Deployed"],
+  build: ["Local Dev", "Build"],
+  test: ["Local Test", "Test"],
+  audit: ["Local Audit", "Review"],
+  "dev-test": ["Test Dev", "Dev test"],
+  "dev-audit": ["Dev Audit", "Dev review"]
+};
 function pipelineFromBundle(raw) {
   const block = raw;
   const candidate = block?.pipeline;
   if (candidate && pipelineProblems(candidate).length === 0) {
-    const gates = candidate.gates.map((gate) => gate.id === "verified" && gate.label === "Verified" ? { ...gate, label: "Deployed" } : gate);
+    const gates = candidate.gates.map((gate) => OLD_LABELS[gate.id]?.[0] === gate.label ? { ...gate, label: OLD_LABELS[gate.id][1] } : gate);
     return { pipeline: { ...candidate, gates }, source: block?.source ?? "org" };
   }
   return { pipeline: DEFAULT_PIPELINE, source: "default" };
@@ -227,16 +235,16 @@ function ageLabel(ms) {
 var STAGES = columnStages(DEFAULT_PIPELINE);
 var STAGE_LABELS = {
   BACKLOG: "Backlog",
-  LOCAL_DEV: "Local Dev",
-  LOCAL_TEST: "Local Test",
-  LOCAL_AUDIT: "Local Audit",
-  LOCAL_REWORK: "Local Rework",
+  LOCAL_DEV: "Build",
+  LOCAL_TEST: "Test",
+  LOCAL_AUDIT: "Review",
+  LOCAL_REWORK: "Rework",
   MERGE: "Merge",
   CI_BUILD: "CI/CD",
   DEPLOY_DEV: "CI/CD",
-  DEV_TEST: "Test Dev",
-  DEV_AUDIT: "Dev Audit",
-  DEV_REWORK: "Dev Rework",
+  DEV_TEST: "Dev test",
+  DEV_AUDIT: "Dev review",
+  DEV_REWORK: "Dev rework",
   DEV_VERIFIED: "Deployed",
   DONE: "Done"
 };
@@ -618,15 +626,15 @@ var GLOSSARY = {
   rerun_gate: "re-run of the check",
   skip_gate: "skip of the check",
   resume_plan: "plan restart",
-  LOCAL_DEV: "Local Dev",
-  LOCAL_TEST: "Local Test",
-  LOCAL_AUDIT: "Local Audit",
-  LOCAL_REWORK: "Local Rework",
+  LOCAL_DEV: "Build",
+  LOCAL_TEST: "Test",
+  LOCAL_AUDIT: "Review",
+  LOCAL_REWORK: "Rework",
   CI_BUILD: "CI/CD",
   DEPLOY_DEV: "CI/CD",
-  DEV_TEST: "Test Dev",
-  DEV_AUDIT: "Dev Audit",
-  DEV_REWORK: "Dev Rework",
+  DEV_TEST: "Dev test",
+  DEV_AUDIT: "Dev review",
+  DEV_REWORK: "Dev rework",
   DEV_VERIFIED: "Deployed",
   READY_PROD: "Done",
   // A name only TeamFlow's own people know (MACLEOD-646 follow-up).
@@ -3127,8 +3135,8 @@ var GATE_NAMES = {
 var FAILURE_WORDS = /\b(the|a|an|gate|check|checks|step|run|has|have|was|were|is|did|not|pass|passed|failed|fails|fail|failure|failing|again|found|some|problems?|issues?|errors?|red|broke|broken)\b/g;
 function saysMore(summary, names2 = []) {
   let text3 = ` ${String(summary ?? "").toLowerCase()} `;
-  for (const name of names2) {
-    const words = String(name ?? "").toLowerCase().trim();
+  const longest = [...names2].map((name) => String(name ?? "").toLowerCase().trim()).sort((a, b) => b.length - a.length);
+  for (const words of longest) {
     if (words) text3 = text3.split(words).join(" ");
   }
   text3 = text3.replace(FAILURE_WORDS, " ").replace(/[^\p{L}\p{N}%]+/gu, " ").trim();

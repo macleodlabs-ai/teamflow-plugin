@@ -21,6 +21,7 @@
 //       for: pr_approved           # or deploy_window
 //       deadline: 2026-10-01T17:00:00Z
 //   gates: [lint, playwright]
+//   process: standard              # optional: a saved process's id (MACLEOD-968)
 //
 // JSON with the same fields works too. The YAML is a small strict
 // subset, read here without a dependency (the plugin has none and runs on
@@ -32,8 +33,9 @@
 
 import fs from 'node:fs';
 import { CHECKS_FILE, PRESET_GATES, checkLabel, checkNameFor } from './checks.mjs';
+import { stepsLine } from './process.mjs';
 
-const FIELDS = ['name', 'keys', 'edges', 'waits', 'gates'];
+const FIELDS = ['name', 'keys', 'edges', 'waits', 'gates', 'process'];
 const EDGE_FIELDS = ['from', 'on', 'reason', 'rule'];
 /*
  * How a link lets its ticket start (MACLEOD-885, after Archon's trigger
@@ -56,6 +58,9 @@ const WAITS = WAIT_KINDS;
 const KEY = /^[A-Za-z0-9][A-Za-z0-9._/#-]{0,119}$/;
 // A check name is a gate id, as in checks.mjs.
 const GATE = /^[a-z0-9][a-z0-9-]{0,39}$/;
+// A saved process's id, as process.mjs spells it. Which ids exist is the
+// organisation's answer, checked when the file is applied (MACLEOD-968).
+const PROCESS = /^[a-z0-9][a-z0-9-]{0,31}$/;
 const NAME_MAX = 80;
 const REASON_MAX = 180;
 const KEYS_MAX = 1000;
@@ -217,10 +222,10 @@ export function parseYaml(text) {
  * because a plan file holds keys and reasons and never a command.
  */
 export function planFrom(raw) {
-  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) fail('A plan file holds one set of fields: `name`, `keys`, `edges`, `waits` and `gates`.');
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) fail('A plan file holds one set of fields: `name`, `keys`, `edges`, `waits`, `gates` and `process`.');
   const extra = Object.keys(raw).filter((field) => !FIELDS.includes(field));
   if (extra.length) {
-    fail(`A plan file holds \`name\`, \`keys\`, \`edges\`, \`waits\` and \`gates\` only. Remove "${extra[0]}". A plan never holds a command.`);
+    fail(`A plan file holds \`name\`, \`keys\`, \`edges\`, \`waits\`, \`gates\` and \`process\` only. Remove "${extra[0]}". A plan never holds a command.`);
   }
   const name = typeof raw.name === 'string' ? raw.name.trim() : '';
   if (!name) fail('The plan file needs a name.');
@@ -291,7 +296,14 @@ export function planFrom(raw) {
     if (!GATE.test(clean)) fail(`"${clean.slice(0, 40)}" is not a check name. Use small letters, digits and hyphens.`);
     if (!gates.includes(clean)) gates.push(clean);
   }
-  return { name, keys, edges, waits, gates };
+  // The saved process the run follows (MACLEOD-968): an id, never a command.
+  const plan = { name, keys, edges, waits, gates };
+  if (raw.process !== undefined) {
+    const id = String(raw.process ?? '').trim().toLowerCase();
+    if (!PROCESS.test(id)) fail('"process" is the id of a saved process, such as standard or careful.');
+    plan.process = id;
+  }
+  return plan;
 }
 
 /** A plan from text: JSON when it looks like JSON, else the YAML subset. */
@@ -384,6 +396,8 @@ export function unlistedLine(changes) {
  */
 export function dryRunLines(workflow, { checks = {}, gates = [], policy = { attempts: 3, reworkCap: 16 } } = {}) {
   const lines = [];
+  const follows = processLine(workflow.process);
+  if (follows) lines.push(follows);
   const phases = workflow.phases || [];
   const edges = workflow.dependencies || [];
   if (!phases.length) lines.push(`"${workflow.name}" has no tickets yet.`);
@@ -424,6 +438,14 @@ export function dryRunLines(workflow, { checks = {}, gates = [], policy = { atte
     + `After ${policy.reworkCap} rounds of rework on one ticket, it stops and tells you.`);
   lines.push('This was a dry run. TeamFlow changed nothing and sent nothing.');
   return lines;
+}
+
+// --- the process a run follows (MACLEOD-968) ----------------------------
+
+/** One plain line: which process a run follows and what it asks for. Empty for a run without one. */
+export function processLine(process) {
+  if (!process?.id) return '';
+  return `This run follows ${process.name || process.id}: ${stepsLine(process)}`;
 }
 
 export { PlanError };

@@ -3,6 +3,26 @@
 What changed in each published version of the TeamFlow plugin, newest first.
 Only what a person using it would notice.
 
+## 0.3.63
+
+- **A plan follows a saved process.** Your organisation keeps its processes
+  on the Organisation page. A project or a plan picks one. The plan keeps
+  its process, even if somebody edits it later.
+- **Test-driven is the default.** The steps are Write test, Build, Test,
+  Merge, CI/CD and Done. A ticket does not pass Test without a failing test
+  first. A person can skip the step with a reason, from the card.
+- **Reviews only where they count.** A change to sign-in, money, reported
+  data or infrastructure needs a review. Other tickets show "Not needed".
+  The whole plan gets one release review before it ends:
+  `teamflow workflow review`.
+- **Work with no code needs no test.** A ticket that only changed docs,
+  text or images shows "Write test not needed".
+- **Your own checks.** A process can add a repository check, SonarQube or
+  any tool that posts to a signed webhook. Each sits after Test, after
+  Review or inside CI/CD.
+- **The columns use the stage names.** Build, Test and Review replace
+  Local Dev, Local Test and Local Audit.
+
 ## 0.3.62
 
 - **Worktree teams start with `work-on`.** The build skill now tells a team

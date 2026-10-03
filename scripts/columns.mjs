@@ -5,7 +5,7 @@
 // And: the plugin DOWNLOADS the columns from the organisation's or the
 // project's pipeline, never a built-in list, custom columns included.
 //
-//   Local Test · Fixing plugin sign-in · MACLEOD-757
+//   Test · Fixing plugin sign-in · MACLEOD-757
 //
 // The pipeline is read from the service (`GET /v1/members/pipeline`, the
 // project's when this repository is in one) and kept on disk with its

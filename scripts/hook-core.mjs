@@ -1136,7 +1136,18 @@ export async function handleEvent(input = {}) {
   // Asking a person (MACLEOD-845) is not a stage: a permission request
   // for an Edit is not an edit. Those events only set what it waits on.
   const asking = isAskEvent(input);
-  const transition = asking ? undefined : classifyTool(resolved, state, config);
+  let transition = asking ? undefined : classifyTool(resolved, state, config);
+  /*
+   * Test-first and risk (MACLEOD-968): the bound ticket's record on this
+   * machine notes each edit and test run. A failing run after only test
+   * edits is the expected red, a step of Local Test and not rework. A
+   * throw keeps the classifier's own transition.
+   */
+  try {
+    const { noteTicketWork, readTicketFacts } = await import('./ticket-facts.mjs');
+    transition = noteTicketWork(state, resolved, transition);
+    if (state.binding?.key) state.ticketFacts = { key: state.binding.key, ...readTicketFacts(state.binding.key) };
+  } catch { /* the card moves as the classifier said */ }
   // A local merge is remembered, never reported as shipped (MACLEOD-956):
   // the push that sends its merge commit credits these keys.
   if (transition?.landedHere) noteLandedHere(input.cwd || cwd, transition.landedHere);

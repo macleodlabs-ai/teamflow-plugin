@@ -9,6 +9,7 @@ import { refusalOf } from './refusal.mjs';
 import { TOOL_CAPABILITIES } from './tools.mjs';
 import { checkNameFor, checkNames, readChecks } from './checks.mjs';
 import { advance as advancePoints, stableId } from './points.mjs';
+import { RISK_AREAS } from './process.mjs';
 import { about as aboutLine, title as plainTitle } from './words.mjs';
 import {
   countedByFile, pointFamily, readFailingTests, runnerFamily, testFile, testScope, withFamily,
@@ -4065,10 +4066,13 @@ export function classifyTool(input, state, config) {
     return IN_REVIEW;
   }
 
+  // `localTestRun` marks a test run for ticket-facts.mjs (MACLEOD-968),
+  // which decides whether a failing one was the expected red of
+  // test-first. It is never reported: applyTransition copies named fields.
   if (isLocalTest) {
     return failed
-      ? { stage: 'LOCAL_REWORK', status: 'failed', summary: 'Local tests failed', incrementLoop: true, reworkFrom: 'LOCAL_TEST', evidence: extractTestEvidence(input.tool_response || input.error), sticky: true, ...testRun(input, command, true, config) }
-      : { stage: 'LOCAL_TEST', status: 'success', summary: 'Local tests passed; awaiting audit', evidence: extractTestEvidence(input.tool_response), sticky: true, clearRework: true, ...testRun(input, command, false, config) };
+      ? { stage: 'LOCAL_REWORK', status: 'failed', summary: 'Local tests failed', incrementLoop: true, reworkFrom: 'LOCAL_TEST', evidence: extractTestEvidence(input.tool_response || input.error), sticky: true, localTestRun: true, ...testRun(input, command, true, config) }
+      : { stage: 'LOCAL_TEST', status: 'success', summary: 'Local tests passed; awaiting audit', evidence: extractTestEvidence(input.tool_response), sticky: true, clearRework: true, localTestRun: true, ...testRun(input, command, false, config) };
   }
 
   if (!readOnly && BUILD_RE.test(command)) {
@@ -4661,6 +4665,13 @@ export function spendBlock(state = {}) {
   };
 }
 
+const TEST_FIRST_WORDS = new Set(['proved', 'red', 'none']);
+function factsBlock(facts) {
+  const testFirst = TEST_FIRST_WORDS.has(facts.testFirst) ? facts.testFirst : 'none';
+  const risk = RISK_AREAS.filter((area) => Array.isArray(facts.risk) && facts.risk.includes(area));
+  return { testFirst, risk };
+}
+
 export function issuePayload(state, config, info) {
   if (!state.binding?.key) return undefined;
   const key = state.binding.key;
@@ -4708,6 +4719,9 @@ export function issuePayload(state, config, info) {
     ...(state.directions?.length ? { directions: state.directions.slice(-10) } : {}),
     // MACLEOD-882: what the model used on this card in this session, as numbers.
     ...(spendBlock(state) ? { spend: spendBlock(state) } : {}),
+    // MACLEOD-968: whether the hooks saw the tests written first, and
+    // which risk areas the work touched. A word and area names, never a path.
+    ...(state.ticketFacts?.key === key ? factsBlock(state.ticketFacts) : {}),
     // MACLEOD-510. Set by refreshDelivery, and absent rather than empty
     // outside a repository or when the branch has no pull request.
     git: state.git,
@@ -4836,7 +4850,8 @@ export function sanitizePayload(value, { kind = 'issue' } = {}) {
   // counts. Never the words the reviewer wrote; there is no field for them.
   const reviewOnly = new Set(['lens', 'result', 'round', 'findings', 'high', 'medium', 'low', 'stated']);
   // `asks` (MACLEOD-845): what the session waits for a person to answer.
-  const issueRoot = new Set(['actions', 'asks', 'spend']);
+  // `testFirst` and `risk` (MACLEOD-968): a word and area names.
+  const issueRoot = new Set(['actions', 'asks', 'spend', 'testFirst', 'risk']);
   // MACLEOD-882: what the model used, as numbers and a model id. Nothing else.
   const spendOnly = new Set(['id', 'model', 'input', 'output', 'cacheRead', 'cacheWrite', 'usd']);
   // Its kind and, for a permission, a built-in tool's name. Never the

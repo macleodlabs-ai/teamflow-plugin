@@ -46,6 +46,9 @@ but skip the auth work" is `--state open` plus a judgment you apply when you
 select. `--order-text` keeps the sentence so `show` can say what was asked
 for; it stays on this machine and is never published.
 
+`--process <id>` picks one of the organisation's saved processes; without it,
+the organisation's default applies. The run keeps it to the end.
+
 Pass `--deploy` only if the user asked for deployment. Without it, deploying is
 out of scope for the run and you must not do it.
 
@@ -118,7 +121,8 @@ the board draws on the arrow.
 reviews, in a pull request if they want: the run's name, the keys in priority
 order, every edge with its reason, and the checks the run expects. It holds
 keys and reasons only. Never put a command in it; TeamFlow refuses any field
-but `name`, `keys`, `edges`, `waits` and `gates`.
+but `name`, `keys`, `edges`, `waits`, `gates` and `process` (the id of a saved
+process; without it, the organisation's default applies).
 
 ```yaml
 # .teamflow/plans/backlog-sweep.yaml
@@ -252,10 +256,21 @@ started state at the same moment, with its MCP: TeamFlow's write-back only
 fires at `DEV_VERIFIED`, so this earlier one is genuinely yours and no command
 will do it for you.
 
-**Test.** The suite for what changed.
+The run follows a saved process; `workflow show` prints its steps in one
+line. The default, Test-driven, is Write test → Build → Test → Review
+(security-sensitive changes only) → Done, then a release review of the plan.
 
-**Audit.** A separate reviewer, with the ticket and the diff. Not the team
-that wrote it.
+**Test first.** The team writes the failing test and runs it, then writes the
+code and runs the test again. The hooks see both runs; that is the proof. Without it,
+TeamFlow refuses to move the ticket past its test step and says what is
+missing. Only a person can skip that step, with a reason, from the card.
+
+**Review when the run says it is due.** A ticket whose change touches
+sign-in, payments, reported data or infrastructure must stand at review
+(`--cycle audit`) first; TeamFlow refuses to move it on and names why. Any
+other ticket goes straight from test to status, and its review reads "Not
+needed". The review itself is a separate reviewer, with the ticket and the
+diff. Not the team that wrote it.
 
 **Deploy** only if the workflow's scope says so, and only yourself — see
 "What you never delegate" below.
@@ -286,15 +301,16 @@ run `teamflow workflow reconcile` afterwards to confirm it took.
 
 Every `workflow ticket --state` also reads the card back from the board once.
 When the board, or a tracker, disagrees with what the run just said, one more
-line says so — "The board shows MACLEOD-538 at Local Test, but the run put it
-at Local Dev", or "linear says MACLEOD-538 is done, but the run still works on
+line says so — "The board shows MACLEOD-538 at Test, but the run put it
+at Build", or "linear says MACLEOD-538 is done, but the run still works on
 it". Exit 0 is not proof. Act on that line before you move on.
 
 Do not treat a ticket as closed on the strength of having run the command. The
 line is the evidence; if you did not read it, you do not know.
 
 When the phase's tickets are all done, `ready` moves to the next phase on its
-own, and when the last ticket of the run is verified the run finishes itself.
+own. When `ready` says `Phase N review due` instead, review that phase first
+(`teamflow workflow review --phase N --verdict pass|fail --reason "<sentence>"`).
 
 For an ad hoc item, finish it as well: `teamflow adhoc done` publishes its
 last state and unbinds. It never reopens — a later request about the same
@@ -374,8 +390,8 @@ teamflow gates
 
 It lists, in plain words, each added check this card still has to pass and
 where it sits, for example `Lint: this repository's "lint" check must pass,
-between Local Test and Local Audit` or `Quality gate: TeamFlow asks SonarQube
-for a pass, between Local Audit and Merge`. **Put each one in the plan as its
+between Test and Review` or `Quality gate: TeamFlow asks SonarQube
+for a pass, between Review and Merge`. **Put each one in the plan as its
 own step, at that place.** A repository check is the command this repository
 names in `.teamflow/checks.json`; run exactly that command, and the hooks
 report its pass or fail. The service never sends a command, and this skill
@@ -383,7 +399,7 @@ never takes one from anywhere but that file. A check that says `not set up in
 this repository` does not stop the card: say so in your summary and move on.
 A declared check wins over the test and audit patterns: if the repository
 declares `"unit": "npm test"`, a run of `npm test` is the unit check's pass or
-fail, not Local Test.
+fail, not Test.
 A SonarQube gate needs nothing from you: TeamFlow asks SonarQube itself, and a
 failure comes back as a ticket sent back with the failed conditions.
 
@@ -469,6 +485,17 @@ An edge that turns out to be wrong comes out the same way, with `--remove`
 
 ## 5. Finish
 
+**Release review.** When every ticket is done, `ready` says
+`Release review due`. A separate reviewer reads the whole change, then record it:
+
+```bash
+teamflow workflow review --verdict pass --reason "<one sentence about the verdict>"
+```
+
+The verdict and your sentence only; never the findings. A fail keeps the run
+open: fix what it found, then review again. The run cannot finish without a
+pass, and the pass finishes it.
+
 Reconcile, exactly as at the end of a phase: `--dry-run` first, then the
 pass, then again until it prints `Nothing to reconcile`.
 
@@ -478,10 +505,9 @@ it names and run it again. This is the last chance to notice that three of the
 tickets you are about to report as shipped still read "In Progress" in the
 tracker.
 
-When it is empty, the run has usually already finished itself: verifying the
-last open ticket sets the run to `done`. `teamflow workflow show` says so. If
-it has not — the run was stopped early, or tickets are blocked — say so
-explicitly:
+When it is empty, the run has usually finished itself: with the last ticket
+verified, or with the release review's pass. `teamflow workflow show` says so. If
+not — stopped early, or tickets blocked — say so:
 
 ```bash
 teamflow workflow status done
