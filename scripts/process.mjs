@@ -55,7 +55,7 @@ export const CHECK_AT = Object.freeze(['test', 'review', 'ci']);
 export const CHECKS_MAX = 10;
 const CHECK_KEYS = ['id', 'label', 'source', 'at', 'check', 'project', 'url', 'note', 'options'];
 const NOTE_MAX = 500;
-/** The board's switches for a check column (pipeline GateOptions), kept through the migration. Never a command. */
+/** The board's switches for a check column (pipeline GateOptions). Never a command. */
 const VIDEO = ['off', 'on-pass'];
 
 /** One check, cleaned, or a plain sentence saying why not. */

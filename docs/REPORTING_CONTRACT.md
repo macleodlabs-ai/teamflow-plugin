@@ -1231,9 +1231,9 @@ actually uses, so a branch called `next-15` opens no card.
 
 ### The pipeline document
 
-`pipelines/default.json` is the organisation's pipeline and
-`projects/<id>/pipeline.json` is one project's own copy, written only once
-somebody edited it (copy-on-write). A pipeline is `{id, name, gates[]}` and a
+A pipeline is never stored (MACLEOD-968). It is derived from the process a
+project follows: the ten default columns, with the process's checks as gates
+between them. A pipeline is `{id, name, gates[]}` and a
 gate is `{id, label, stages[], kind, rework?, deadlineMin?, external?}`: an
 ordered mapping of the thirteen delivery stages into named columns, and
 nothing else. `stages` are drawn from `STAGES` and no gate classifies an
@@ -1243,16 +1243,14 @@ event. `PIPELINE` in `adapters/teamflow/schema.py` is the table;
 **No reporter writes one.** `pipeline` is not in `schema.KINDS` and
 `POST /v1/report` refuses it, for the reason a project is refused: a
 reporting credential sits on every laptop, and one that could rewrite the
-organisation's columns could hide every ticket from everybody. Pipelines are
-written by owners and admins through `PUT /v1/members/pipeline` and
-`PUT /v1/members/projects/{id}/pipeline`; `GET /v1/members/pipeline?project=`
-resolves project → org → default and says which answered (`source`), and the
-bundle's `pipeline` field carries the same resolution plus every project's
-copy. Solo and Team may reorder and rename the default gates and set
-`rework` and `deadlineMin`; adding, removing or re-staging a gate, and any
-external gate, is Growth and above. The one free-text field is a gate's
-`label`, capped at forty characters; `updatedBy` is the saving member's
-address as the ledger names the seat.
+organisation's columns could hide every ticket from everybody. Owners and
+admins change the checks through the process editor
+(`PUT /v1/members/processes`), and only there. `GET /v1/members/pipeline?project=`
+resolves the project's own process, else the default process, and says which
+answered (`source`); the bundle's `pipeline` field carries the same
+resolution plus the pipeline of every project with a process of its own. A
+custom check is Growth and above. The one free-text field is a gate's
+`label`, capped at forty characters.
 
 ### Custom gates: repository checks and SonarQube (MACLEOD-639, ADHOC-20)
 

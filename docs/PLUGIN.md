@@ -906,18 +906,17 @@ name and no line of code leave SonarQube for TeamFlow.
    your organisation uses (`next-15`) is accepted and not written, by the
    same rule that keeps a Dependabot pull request off the board.
 
-4. **Give it a column.** An owner adds an external gate to the
-   organisation's pipeline (`PUT /v1/members/pipeline`, Growth and above):
+4. **Give it a column.** An owner adds a SonarQube check to a process in
+   How work is done (`PUT /v1/members/processes`, Growth and above):
 
    ```json
-   {"id": "quality", "label": "SonarQube", "stages": [], "kind": "external",
-    "rework": true, "deadlineMin": 60,
-    "external": {"system": "sonarqube", "project": "my-service"}}
+   {"id": "quality", "label": "SonarQube", "source": "sonarqube",
+    "at": "review", "project": "my-service"}
    ```
 
-   With the gate in place the verdict is drawn in that column; without one it
+   With the check in place the verdict is drawn in that column; without one it
    is drawn at Local Audit under the gate id `sonarqube`, so the connection
-   works before the pipeline is edited. `project` is optional: a gate that
+   works before a check is added. `project` is optional: a gate that
    names one matches only that SonarQube project, a gate that names none
    matches every project on the connection.
 

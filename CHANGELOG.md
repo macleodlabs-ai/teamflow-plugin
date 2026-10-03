@@ -3,6 +3,13 @@
 What changed in each published version of the TeamFlow plugin, newest first.
 Only what a person using it would notice.
 
+## 0.3.64
+
+- **One name for the plan review.** Use `teamflow workflow review`. The
+  name `workflow audit` no longer works.
+- **Steps change only in the process editor.** You can no longer drag
+  columns on the board.
+
 ## 0.3.63
 
 - **A plan follows a saved process.** Your organisation keeps its processes

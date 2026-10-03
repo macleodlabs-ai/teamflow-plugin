@@ -186,7 +186,6 @@ export const USAGE = `teamflow workflow — the pool of tickets a run works thro
       Record the release review of the whole plan, or of one phase with
       --phase. The verdict and your one sentence only, never the findings.
       A run whose process ends with a review cannot finish without a pass.
-      (\`workflow audit\` is the same command.)
 
   teamflow workflow ticket <KEY> [--state <s>] [--cycle <c>] [--reason <why>] [--note <text>]
       [--findings <text>] [--finding <text>]... [--findings-file <path>] [--rechecked] [--done <ID>]... [--reopen <ID>]... [--to <name>]
@@ -2320,7 +2319,7 @@ export async function main(args, {
    * The audit of the whole plan, or of one phase (MACLEOD-968). The
    * verdict and the orchestrator's one sentence; never the findings.
    */
-  if (sub === 'review' || sub === 'audit') {
+  if (sub === 'review') {
     const done = recordAudit(target, {
       verdict: flag(rest, 'verdict'), reason: flag(rest, 'reason'), phase: flag(rest, 'phase'),
       by: actor(config, info).displayName,

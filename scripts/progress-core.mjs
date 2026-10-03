@@ -146,20 +146,11 @@ function pipelineProblems(pipeline) {
   }
   return problems;
 }
-var OLD_LABELS = {
-  verified: ["Verified", "Deployed"],
-  build: ["Local Dev", "Build"],
-  test: ["Local Test", "Test"],
-  audit: ["Local Audit", "Review"],
-  "dev-test": ["Test Dev", "Dev test"],
-  "dev-audit": ["Dev Audit", "Dev review"]
-};
 function pipelineFromBundle(raw) {
   const block = raw;
   const candidate = block?.pipeline;
   if (candidate && pipelineProblems(candidate).length === 0) {
-    const gates = candidate.gates.map((gate) => OLD_LABELS[gate.id]?.[0] === gate.label ? { ...gate, label: OLD_LABELS[gate.id][1] } : gate);
-    return { pipeline: { ...candidate, gates }, source: block?.source ?? "org" };
+    return { pipeline: candidate, source: block?.source ?? "org" };
   }
   return { pipeline: DEFAULT_PIPELINE, source: "default" };
 }
