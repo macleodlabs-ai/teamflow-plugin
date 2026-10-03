@@ -3,6 +3,14 @@
 What changed in each published version of the TeamFlow plugin, newest first.
 Only what a person using it would notice.
 
+## 0.3.62
+
+- **Worktree teams start with `work-on`.** The build skill now tells a team
+  in a git worktree to run `teamflow work-on <KEY>`. Worktree guards refuse
+  a command with "bind" in it.
+- **The note TeamFlow writes into CLAUDE.md has a command that works.** It
+  points to the plugin's skills, or to `npx` from a shell.
+
 ## 0.3.61
 
 - **Work shipped in another repository counts.** When a ticket ships in

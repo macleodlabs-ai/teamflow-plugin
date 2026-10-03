@@ -236,9 +236,11 @@ problem costs a rework round. The build takes the session's default. TeamFlow
 reports which model each agent ran, so the lead can see the choice.
 
 **Build.** Dispatch a team in its own git worktree. Its first command, before
-any edit, is `teamflow bind <KEY> --local`: a worktree is its own repository
+any edit, is `teamflow work-on <KEY>`: a worktree is its own repository
 root, so nothing else attributes its hooks to the ticket, and unbound work
-reaches the board under no key or a stale one. Mark the ticket as you go:
+reaches the board under no key or a stale one. If even that is refused, the
+key in the branch name and every commit message does the job. Mark the ticket
+as you go:
 
 ```bash
 teamflow workflow ticket MACLEOD-538 --state running --cycle build
@@ -267,8 +269,8 @@ teamflow workflow ticket MACLEOD-538 --state done --cycle verified
 That publishes the ticket's own card at `DEV_VERIFIED`, closes any run still
 claiming to be working on it, and — if the organisation has write-back on —
 is what moves the tracker's own issue. You do not move the tracker by hand as
-a matter of course; that was a step an agent had to remember per ticket at 4am
-and it was forgotten three times out of nineteen.
+a matter of course; a step an agent has to remember for every ticket is a step
+that gets forgotten.
 
 **Read the line it prints.** It says what the card AND the tracker now say:
 
@@ -317,8 +319,8 @@ teamflow workflow reconcile             # confirm: expect "Nothing to reconcile"
 ```
 
 **Always the dry run first.** It changes nothing and it prints two things you
-need before you repair anything: how many reports the pass will send (on a bad
-morning that has been 161) and, separately, one line
+need before you repair anything: how many reports the pass will send and,
+separately, one line
 per tracker saying what the pass will ask of it. `About to ask linear to
 close: …` names the real issues in somebody's Linear it will ask the service
 to close, and names only the ones that tracker has not already closed. Read
@@ -327,7 +329,7 @@ that line. If a key on it should not be closed, fix the run first.
 `Cards only … write-back is off for this organisation` means the opposite:
 the cards move on the board and nothing at all moves in the tracker. Do not
 read it as "closed"; the issues still have to be moved by whoever holds them,
-or write-back turned on in Organisation settings (MACLEOD-603).
+or write-back turned on in Organisation settings.
 
 The repair pass tags every line `repaired`, `owed` or `refused`, so a pass
 that repaired everything still prints a non-empty list. That is why the
@@ -473,8 +475,8 @@ pass, then again until it prints `Nothing to reconcile`.
 **The run cannot be declared done until it does.** Work it to that line: let
 it repair what it can, and for anything left `owed` or `refused` do the thing
 it names and run it again. This is the last chance to notice that three of the
-tickets you are about to report as shipped still read "In Progress" in Linear,
-which is exactly what happened on 2026-09-20.
+tickets you are about to report as shipped still read "In Progress" in the
+tracker.
 
 When it is empty, the run has usually already finished itself: verifying the
 last open ticket sets the run to `done`. `teamflow workflow show` says so. If
@@ -494,17 +496,16 @@ A phase fans out for build and funnels for verification. Several teams may be
 building at the same time; **one ticket at a time holds the test and audit
 gate**.
 
-This is not a tuning preference. Two agents plus the main session each running
-a full gate took a developer's machine to a load average of 97 and crashed it.
-`scripts/one-suite-at-a-time.mjs` now refuses rather than piling on, but a
-schedule that relies on being refused deadlocks its own teams. Schedule around
-it: hold the other teams at build until the gate is free.
+This is not a tuning preference: several full test runs at once can overload
+the machine, and a guard that refuses the extra runs deadlocks a schedule
+that relies on being refused. Hold the other teams at build until the gate
+is free.
 
 ## What you never delegate
 
 **Deploying.** Never from a worktree, a subagent or a teammate — only from the
-main session, which is you. `docs/DEPLOYMENT.md` is the procedure and it is not
-optional reading.
+main session, which is you, following the repository's own deployment
+procedure.
 
 **The plan.** A team reports what it found; you decide what that means for the
 phases. A team that edits the workflow is a plan with two authors.

@@ -53,8 +53,9 @@ export const RULE_END = '<!-- END teamflow workflow -->';
 export const WORKFLOW_RULE = `## TeamFlow: every plan and every dispatched agent is on the board
 
 Before any agent or team is dispatched, the run exists on the board and each
-piece of work is a node in it. In Claude Code the command is
-\`node "\${CLAUDE_PLUGIN_ROOT}/scripts/cli.mjs"\`; elsewhere it is \`teamflow\`.
+piece of work is a node in it. In Claude Code the plugin's skills
+(\`/teamflow:build\`) run these with the plugin's own path; from a shell,
+\`teamflow\` is \`npx -y github:macleodlabs-ai/teamflow-plugin\`.
 
 1. \`teamflow workflow create "<name>"\` (or \`/teamflow:build\`) — one run per plan.
 2. \`teamflow workflow plan --keys A,B,C\` or \`teamflow workflow add <KEY>\` for every
