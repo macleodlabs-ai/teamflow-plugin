@@ -4290,7 +4290,6 @@ function workingOf(tickets, now, liveness) {
   }
   return { agents: count, tickets: keys.size };
 }
-var WEEK_MS = 7 * DAY_MS8;
 
 // src/lib/plansAndTracks.ts
 var DAY_MS9 = 24 * 60 * 6e4;

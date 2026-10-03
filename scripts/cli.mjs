@@ -104,6 +104,7 @@ const USAGE = `teamflow \u2014 delivery reporting for TeamFlow
                                    answer from this computer, for your own cards
                                    and sessions only; History says it came from here
   teamflow track list|rename|merge|split|move   your tracks, and fix how TeamFlow grouped them
+  teamflow task new "<name>" | in <id> | show   put this session's task in a new project, or in one you have
   teamflow adhoc start "<what the work is>" | title "<...>" | done
                                    work that arrived without a ticket: TeamFlow
                                    mints the key; \`teamflow adhoc --help\` has the rest
@@ -1134,6 +1135,11 @@ try {
     // Tracks (MACLEOD-936): list them, or rename, merge, split or move by hand.
     const { trackMain } = await import('./tracks.mjs');
     process.exit(await trackMain(args, { config }));
+  }
+  else if (command === 'task') {
+    // Tasks (MACLEOD-970): name a new project for this task, or move it.
+    const { taskMain } = await import('./tasks.mjs');
+    process.exit(await taskMain(args, { config, cwd, info }));
   }
   else if (command === 'workflow') {
     const { main } = await import('./workflow.mjs');

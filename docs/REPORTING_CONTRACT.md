@@ -389,6 +389,7 @@ It may carry:
 - `directions[]` — what auto-continue told a session to do next (MACLEOD-726): `at`, `kind` (`fix`, `points`, `finish`, `next`, `waiting`; and for an agent told to wait, MACLEOD-733, `start` and `wait`), `key` (absent on `waiting`) and `said` (≤ 240), capped at 20. `said` is the plugin's own fixed words with keys, step names, counts and the run's name reduced to plain characters; never a title, a point's text, a note or anything else the service sent. `continued` is how many times the plugin kept a session going on this run. The Progress view reads both
 - `origin` may also be `track` (MACLEOD-936): a run the plugin found rather than one anybody made. An `auto` run becomes a track too; it keeps its id and its `auto`.
 - `track` — one person's threads grouped into an impromptu project (MACLEOD-936). `members[]` (`id` and `kind`: `session` or `agent`; the same ids every execution already carries; at most 50), `state` (`active`, `quiet` or `ended`), `by[]` (the names of the signals that joined it: `person`, `project`, `parent`, `run`, `ticket`, `branch`, `files`, `waits`), `startedAt`, `lastAt`, `endedAt`, and `named` and `mergedInto` once a person renamed or merged it. The grouping runs on the machine. File names are hashed there and never sent; branch names, prompts and agent descriptions are inputs to it and never outputs. The name is the tickets' titles or the first agent's description, both already reported. The same repository in the same hour joins nothing on its own. `WORKFLOW_CARRIED` keeps `track` when a run republishes without it, and a person's rename, merge, split or move (`/v1/members/tracks/{id}/…`, kept in `tracks/corrections.json`) is re-applied to every later report until the machine has pulled it.
+- `track.members[].kind` may also be `task` (MACLEOD-970, docs/PROJECTS.md): one thing a person asked for and the edits, agents and commits it caused. Its id is `<Claude Code session id>#<n>` (at most 80 characters), keyed by the session and never by the account, so a rotated session keeps its tasks. A session that has tasks is sent as its tasks, not as one `session` member. `track.project` (optional) is a formal project id (`prj-…`): the track is this person's lane in that project, not an informal project of its own. The track's `name` is the name Claude passed to `teamflow task new "<name>"` or a person gave (`named: true`), else the formal project's name. Nothing else about a task travels: the prompt is read on the machine only to tell a slash command or a one-word reply from work, and is never stored or sent; file names are hashed and stay on the machine.
 
 **The user's order does not travel.** The order is a prompt, and the rule
 above admits no exception for this one: it selects tickets on the machine and
@@ -874,6 +875,9 @@ written by members, through routes:
 | `POST /v1/members/projects` | owners and admins. The service mints the id |
 | `PUT /v1/members/projects/{id}` | owners and admins. Replaces the document whole |
 | `DELETE /v1/members/projects/{id}` | owners and admins. Removes the document and nothing else |
+| `POST /v1/members/projects/{id}/close` | owners and admins, signed in (MACLEOD-970). Sets `closed`; with tracker write-back on, marks its Linear projects completed |
+| `POST /v1/members/projects/{id}/reopen` | owners and admins, signed in. Clears `closed`; with write-back on, sets its Linear projects started |
+| `POST /v1/members/tracks/{id}/promote` | the track's person or an owner or admin, signed in. Makes a project from an informal one |
 
 It may carry:
 
@@ -883,6 +887,8 @@ It may carry:
 - `jira[]`: `{ key, name }`
 - `default` — the project a member lands on until they choose. **Exactly one** may hold it: creating or saving a default clears the previous one
 - `createdAt`, `updatedAt` — set by the service, not by the body
+- `cards[]`: ad hoc keys (`ADHOC-<n>`) listed in a project made by promote (MACLEOD-970). A save that leaves it out keeps it
+- `closed` `{at, by, tracker?}`, `history[]` `{at, by, action, words}` (at most 50) and `promotedFrom` (the track's id) — the service's only (MACLEOD-970). A body never sets them, and a save keeps the stored ones. `tracker` is `sent` or `refused`: what Linear said when write-back was on
 
 Identifiers and display names, and nothing else. A project is filled in by a
 person in a dialog, which is exactly where a description, a README or a pasted

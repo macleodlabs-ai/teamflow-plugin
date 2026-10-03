@@ -3,6 +3,23 @@
 What changed in each published version of the TeamFlow plugin, newest first.
 Only what a person using it would notice.
 
+## 0.3.65
+
+- **Everything is a project.** The Plans tab is now Projects. It lists
+  team projects and your own smaller pieces of work in one list.
+- **Claude sorts your work.** When you ask for something new, Claude names
+  it with `teamflow task new "<name>"`. Work for a listed project goes in
+  with `teamflow task in <id>`. Your words stay on your machine.
+- **Close a project.** An owner or admin can close a project, and reopen
+  it. TeamFlow also closes it in Linear. A project done for 7 days leaves
+  the list by itself.
+- **Make it a team project.** Your own piece of work can become a team
+  project, with a Linear project of its own.
+- **A project's board shows its finished work.** Open its board to see
+  all of its tickets.
+- **A session with no ticket gets one short line.** It offers the next
+  ticket or a name for new work.
+
 ## 0.3.64
 
 - **One name for the plan review.** Use `teamflow workflow review`. The

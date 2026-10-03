@@ -234,11 +234,12 @@ export function group(threads, found = [], constraints = {}) {
  * holding the group's tickets gives its id to a group that continues no
  * track, so the run and the track are one thing.
  */
-export function carryIds(groups, previous = {}, { autoRunOf = () => undefined } = {}) {
-  const taken = new Set();
+export function carryIds(groups, previous = {}, { autoRunOf = () => undefined, forced = [] } = {}) {
+  const taken = new Set(forced.filter(Boolean));
   const scored = groups.map((g, i) => {
     let best; let score = 0;
     for (const [id, track] of Object.entries(previous)) {
+      if (taken.has(id)) continue;
       const n = (track.members || []).filter((m) => g.members.includes(m)).length;
       if (n > score) { best = id; score = n; }
     }
@@ -246,6 +247,7 @@ export function carryIds(groups, previous = {}, { autoRunOf = () => undefined } 
   }).sort((a, b) => b.score - a.score);
   const ids = new Array(groups.length);
   for (const { i, best } of scored) {
+    if (forced[i]) { ids[i] = forced[i]; continue; }
     if (best && !taken.has(best)) { ids[i] = best; taken.add(best); continue; }
     const run = autoRunOf(groups[i]);
     if (run && !taken.has(run)) { ids[i] = run; taken.add(run); continue; }
@@ -281,7 +283,36 @@ export function stateOf(threads, now = Date.now()) {
 
 /** Whether a track is worth a row: two threads or more, or one a person made. */
 export function reportable(track) {
-  return (track.members || []).length >= 2 || Boolean(track.named) || Boolean(track.made);
+  return (track.members || []).length >= 2 || Boolean(track.named) || Boolean(track.made) || Boolean(track.project);
+}
+
+// --- tasks (MACLEOD-970) --------------------------------------------
+
+const BY_SIGNAL = { key: 'ticket', files: 'files', agents: 'parent' };
+
+/**
+ * Where each sorted task belongs: a person's move first, else the task's
+ * own sort. Tasks in one project are joined; tasks in two are held apart
+ * for this pass, so no signal carries a task out of the project it was
+ * sorted into.
+ */
+export function taskAssignments(threads, held) {
+  const pinned = threads.filter((t) => t.kind === 'task' && (held.taskMoves?.[t.id] || t.assigned))
+    .map((t) => ({ t, at: held.taskMoves?.[t.id] || t.assigned }));
+  const edges = [];
+  const apart = [];
+  for (let i = 0; i < pinned.length; i += 1) {
+    for (let j = i + 1; j < pinned.length; j += 1) {
+      const x = pinned[i]; const y = pinned[j];
+      if (x.at.kind === y.at.kind && x.at.id === y.at.id) {
+        const by = held.taskMoves?.[y.t.id] ? 'person' : BY_SIGNAL[y.t.sortedBy] || 'person';
+        edges.push({ a: x.t.id, b: y.t.id, by });
+      } else {
+        apart.push([x.t.id, y.t.id]);
+      }
+    }
+  }
+  return { pinned: new Map(pinned.map(({ t, at }) => [t.id, at])), edges, apart };
 }
 
 // --- the local state ------------------------------------------------
@@ -302,6 +333,10 @@ export function readTracks(config = {}) {
     lineage: held.lineage && typeof held.lineage === 'object' ? held.lineage : {},
     sent: held.sent && typeof held.sent === 'object' ? held.sent : {},
     applied: Array.isArray(held.applied) ? held.applied : [],
+    // MACLEOD-970: a formal project's lane id on this machine, and the
+    // tasks a person moved by hand, which no pass sorts back.
+    formal: held.formal && typeof held.formal === 'object' ? held.formal : {},
+    taskMoves: held.taskMoves && typeof held.taskMoves === 'object' ? held.taskMoves : {},
     passAt: held.passAt,
   };
 }
@@ -330,7 +365,9 @@ export function constrain(held, kind, a, b) {
  */
 export function regroup(held, threads, runs = {}, now = Date.now()) {
   const { keyRuns, edges } = runFacts(runs);
-  const groups = group(threads, joins(threads, { keyRuns, edges, lineage: held.lineage }), held.constraints);
+  const tasks = taskAssignments(threads, held);
+  const constraints = { together: held.constraints.together, apart: [...held.constraints.apart, ...tasks.apart] };
+  const groups = group(threads, [...tasks.edges, ...joins(threads, { keyRuns, edges, lineage: held.lineage })], constraints);
   const byId = new Map(threads.map((t) => [t.id, t]));
   const autoRunOf = (g) => {
     for (const run of Object.values(runs.workflows || {})) {
@@ -343,19 +380,34 @@ export function regroup(held, threads, runs = {}, now = Date.now()) {
   // Only groups a track could be: more than one thread, or a thread a
   // track already holds (a person's split or move made it so).
   const holding = new Set(Object.values(held.tracks).flatMap((t) => t.members || []));
-  const live = groups.filter((g) => g.members.length > 1 || holding.has(g.members[0]));
-  const ids = carryIds(live, held.tracks, { autoRunOf });
+  const live = groups.filter((g) => g.members.length > 1 || holding.has(g.members[0]) || tasks.pinned.has(g.members[0]));
+  // A group holding a sorted task takes its project's id: an informal
+  // project's own, or this machine's lane id for a formal project.
+  const homeOf = (g) => g.members.map((m) => tasks.pinned.get(m)).find(Boolean);
+  const forced = live.map((g) => {
+    const home = homeOf(g);
+    if (!home) return undefined;
+    if (home.kind === 'informal') return home.id;
+    held.formal = held.formal || {};
+    held.formal[home.id] = held.formal[home.id] || newId();
+    return held.formal[home.id];
+  });
+  const ids = carryIds(live, held.tracks, { autoRunOf, forced });
   const next = {};
   live.forEach((g, i) => {
     const id = ids[i];
     const was = held.tracks[id] || {};
     const members = g.members.slice(0, MEMBERS_MAX);
     const mine = members.map((m) => byId.get(m)).filter(Boolean);
+    const home = homeOf(g);
     next[id] = {
       id,
-      name: nameOf(mine, was.named),
+      name: home?.kind === 'formal' && !was.named ? String(home.name || nameOf(mine)).slice(0, NAME_MAX)
+        : home?.kind === 'informal' && !was.named ? String(was.name || home.name || nameOf(mine)).slice(0, NAME_MAX)
+          : nameOf(mine, was.named),
       named: was.named,
       made: was.made,
+      project: home?.kind === 'formal' ? home.id : undefined,
       members,
       kinds: Object.fromEntries(mine.map((t) => [t.id, t.kind])),
       keys: [...new Set(mine.map((t) => t.key).filter(Boolean))].slice(0, 20),
@@ -393,7 +445,7 @@ export function trackDocument(track, run = undefined) {
   base.name = run && !track.named ? run.name : track.name;
   if (!run) base.origin = 'track';
   base.track = {
-    members: track.members.map((id) => ({ id, kind: track.kinds?.[id] === 'agent' ? 'agent' : 'session' })),
+    members: track.members.map((id) => ({ id, kind: ['agent', 'task'].includes(track.kinds?.[id]) ? track.kinds[id] : 'session' })),
     state: track.state,
     by: track.by.filter((s) => s === 'person' || SIGNALS.includes(s)),
     startedAt: track.startedAt,
@@ -401,6 +453,8 @@ export function trackDocument(track, run = undefined) {
   };
   if (track.endedAt) base.track.endedAt = track.endedAt;
   if (track.named) base.track.named = true;
+  // A person's lane in a formal project (MACLEOD-970), not a project of its own.
+  if (track.project) base.track.project = track.project;
   return base;
 }
 
@@ -417,7 +471,13 @@ export async function tracksOnStop(config = {}, { cwd, now = Date.now(), send = 
     await pull(config, held);
     const org = reportScope(config);
     const scope = organisationScope(config);
-    const mine = (threads || localThreads(now)).filter((t) => !scope || !t.account || t.account === scope);
+    let local = threads;
+    if (!local) {
+      local = localThreads(now);
+      // A session that has tasks is its tasks (MACLEOD-970).
+      try { local = (await import('./tasks.mjs')).withTasks(local, now); } catch { /* the sessions stand */ }
+    }
+    const mine = local.filter((t) => !scope || !t.account || t.account === scope);
     for (const t of mine) {
       if (t.branch && !(t.branch in held.lineage)) held.lineage[t.branch] = createdFrom(cwd, t.branch) || null;
     }
@@ -510,7 +570,15 @@ export function applyCorrection(held, c = {}) {
   if (c.kind === 'rename') return rename(held, c.track, c.name);
   if (c.kind === 'merge') return merge(held, c.track, c.from);
   if (c.kind === 'split') return split(held, c.track, c.threads, c.made);
-  if (c.kind === 'move') return moveThread(held, c.thread, c.track);
+  if (c.kind === 'move') {
+    const moved = moveThread(held, c.thread, c.track);
+    // A task moved on the board stays there (MACLEOD-970).
+    if (!moved.error && String(c.thread).includes('#')) {
+      moved.track.kinds = { ...moved.track.kinds, [c.thread]: 'task' };
+      held.taskMoves = { ...(held.taskMoves || {}), [c.thread]: { kind: 'informal', id: moved.track.id, name: moved.track.name } };
+    }
+    return moved;
+  }
   return { error: 'unknown' };
 }
 

@@ -81,6 +81,7 @@ import { REVIEW_NEXT_MS, batchSize, changesFiles, reviewStartOf, stripMark, team
 import {
   boundToTeamflow, closeDispatched, dispatchOf, launchesOf, planLaunch, publishOwed, replanUnbound, settle, withMint,
 } from './dispatch.mjs';
+import { isTaskLine, noIssueLine, taskCommand } from './task-line.mjs';
 
 /** Whether a launch in this session was claimed by this agent id. Local files only. */
 function seenLaunch(sessionId, agentId) {
@@ -252,10 +253,14 @@ export function claudeContext(event, state, justBound, stale = staleBuildNotice(
   const soft = event === 'SessionStart' ? sessionSoftRefusal(state) : undefined;
   if (soft) credential.push(`TeamFlow: reporting is paused — ${soft.reason}`);
   if (!state.binding?.key) {
+    // MACLEOD-970: the task line and this one ask the same thing, so a
+    // session with no ticket gets one short line that offers both.
+    const asked = fixes.some(isTaskLine);
+    const first = asked ? noIssueLine(taskCommand()) : NO_ISSUE;
     return JSON.stringify({
       hookSpecificOutput: {
         hookEventName: event,
-        additionalContext: [...fixes, ...credential, NO_ISSUE, ...(named ? [named] : []), ...notice].join(' '),
+        additionalContext: [...fixes.filter((line) => !isTaskLine(line)), ...credential, first, ...(named ? [named] : []), ...notice].join(' '),
       },
     });
   }
@@ -1209,7 +1214,9 @@ export async function handleEvent(input = {}) {
    */
   // A session's own card (MACLEOD-956) lives as long as the session: a
   // turn ending idles it, as it idles any card, and never ends it.
-  const endingAdHoc = event === 'Stop' && isAdHocKey(state.binding?.key) && state.binding?.source !== 'session';
+  // A task's card (MACLEOD-970) lives as long as its task, not one turn,
+  // and its binding is the session's own: no working-copy file to clear.
+  const endingAdHoc = event === 'Stop' && isAdHocKey(state.binding?.key) && !['session', 'task'].includes(state.binding?.source);
   if (endingAdHoc) {
     state.status = 'idle';
     state.summary = 'Ad hoc work ended';
@@ -1237,6 +1244,16 @@ export async function handleEvent(input = {}) {
       const { noteTrackSignals } = await import('./tracks.mjs');
       noteTrackSignals(state, input);
     } catch { /* a track misses one signal; the others still join it */ }
+  }
+  // The task this work belongs to (MACLEOD-970): started by the first
+  // edit, dispatch or commit after a prompt, sorted into a project. The
+  // main session only; keyed on the session id, never the account.
+  if (event === 'PostToolUse' && !agentKey && !input.reporter_tool) {
+    try {
+      const { noteTaskWork } = await import('./tasks.mjs');
+      const task = noteTaskWork(sessionId, input, { config, state, repository: info?.repository });
+      if (task?.releasedCard && state.binding?.key === task.releasedCard) delete state.binding;
+    } catch { /* the task misses one piece of work; the next one sorts it */ }
   }
   saveSession(state);
 
@@ -1508,6 +1525,15 @@ export async function handleEvent(input = {}) {
   // never blocked. Local files only; the heartbeat keeps the service's word.
   if (FAST.includes(event) && !input.reporter_tool) {
     try { notices = [...notices, ...sessionLines(sessionId, cwd)]; } catch { /* nothing to say */ }
+    // Which project this prompt's work goes in (MACLEOD-970): one line,
+    // once per prompt, never for a slash command or a one-word reply. The
+    // prompt is read here and never kept. Local files only.
+    if (event === 'UserPromptSubmit' && !agentKey) {
+      try {
+        const line = (await import('./tasks.mjs')).onPrompt(sessionId, input.prompt, { config });
+        if (line) notices = [...notices, line];
+      } catch { /* the task keeps the session's last project */ }
+    }
     // Where each running agent's work is, by the board's column names
     // (MACLEOD-773), so the model can say without asking. Kept copies only.
     try {
