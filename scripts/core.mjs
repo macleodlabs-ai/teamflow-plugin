@@ -140,9 +140,26 @@ const GATE_KINDS = {
 
 const stageRank = (stage) => STAGE_ORDER.indexOf(stage);
 
+/*
+ * A temporary folder never names a ticket (MACLEOD-976, audit finding 5).
+ * Claude Code keeps its scratch files under /private/tmp/claude-501/ (501
+ * is the macOS user id), and the key pattern read CLAUDE-501 out of it: a
+ * card nobody made and nobody could close. Each path under a temp root is
+ * taken out whole, up to the next space or quote, before any key is read.
+ */
+const escapeRe = (text) => text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+const TEMP_ROOTS = [...new Set(['/private/tmp', '/tmp', '/private/var/folders', '/var/folders',
+  os.tmpdir(), process.env.TMPDIR].filter(Boolean).map((one) => String(one).replace(/\/+$/, '')).filter(Boolean))];
+const TEMP_PATH_RE = new RegExp(`(?<![\\w.-])(?:${TEMP_ROOTS.map(escapeRe).join('|')})(?=/)[^\\s"'\`<>|;,)]*`, 'g');
+
+/** The text with every path under a temporary folder taken out. */
+export function tempPathsOut(value) {
+  return String(value ?? '').replace(TEMP_PATH_RE, ' ');
+}
+
 export function extractJiraKey(value) {
   if (!value) return undefined;
-  const match = String(value).match(ISSUE_RE);
+  const match = tempPathsOut(value).match(ISSUE_RE);
   return match?.[1]?.toUpperCase();
 }
 
@@ -248,7 +265,7 @@ export function believable(key, known) {
 // commit message. A prompt, a bind argument and a tracker tool's own payload are somebody
 // saying which ticket they mean, and are believed whatever prefix they use.
 export function detectIssueRef(value, config = {}, info = {}, known = undefined) {
-  const text = String(value ?? '');
+  const text = tempPathsOut(value);
   if (!text) return undefined;
 
   const linearUrl = text.match(LINEAR_URL_RE);
@@ -653,6 +670,115 @@ export function touchBinding(cwd, config = {}, key, at = new Date()) {
     }
   } catch { /* an unwritten stamp only shortens the binding's life */ }
   return false;
+}
+
+// --- a finished ticket takes no new work (MACLEOD-973) ----------------
+//
+// On 2026-10-04 a session bound by hand to MACLEOD-970 reported a day of
+// work under it after 970 went Done, while its branches and commits named
+// 971 and 972: the board and Projects showed none of that work. A binding
+// to a ticket that is Done or cancelled now takes no new work. The work
+// goes to the branch's key, else the commit's key, else a new ad hoc card.
+//
+// How this machine knows: the service says so in its reply to a report or
+// a heartbeat it already sends (`finished: "done" | "cancelled"`, or
+// `false` when the card is open again). No request is added. The word is
+// kept in one small file of keys, words and times.
+
+const FINISHED_MAX = 500;
+// A bind or a move made by a person after the ticket finished is their
+// word that the work goes there, and it holds.
+const PERSON_SOURCES = new Set(['manual', 'moved']);
+
+function finishedPath() {
+  return path.join(dataDir(), 'finished.json');
+}
+
+/** What a service reply says about the card it was sent for: 'done', 'cancelled', 'open', or undefined. */
+export function finishedFrom(body) {
+  if (!body || typeof body !== 'object' || !('finished' in body)) return undefined;
+  const word = body.finished;
+  if (word === false || word === null || word === 'open') return 'open';
+  const text = String(word).toLowerCase();
+  if (text === 'done') return 'done';
+  if (text === 'cancelled' || text === 'canceled') return 'cancelled';
+  return undefined;
+}
+
+/** `{ as, at }` when this machine was told `key` is finished, else undefined. */
+export function finishedOf(key) {
+  if (!key) return undefined;
+  const held = readJson(finishedPath(), {}) || {};
+  const one = held[String(key).toUpperCase()];
+  return one && typeof one.at === 'string' ? one : undefined;
+}
+
+/** Remember that `key` is finished. The first word stands. Never throws. */
+export function noteFinished(key, as, at = new Date().toISOString()) {
+  try {
+    if (!key || !['done', 'cancelled'].includes(as)) return false;
+    const held = readJson(finishedPath(), {}) || {};
+    const name = String(key).toUpperCase();
+    if (held[name]) return false;
+    held[name] = { as, at };
+    const kept = Object.entries(held).sort((a, b) => String(a[1]?.at).localeCompare(String(b[1]?.at))).slice(-FINISHED_MAX);
+    writeJson(finishedPath(), Object.fromEntries(kept));
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** The card is open again. Never throws. */
+export function clearFinished(key) {
+  try {
+    const held = readJson(finishedPath(), {}) || {};
+    const name = String(key || '').toUpperCase();
+    if (!held[name]) return false;
+    delete held[name];
+    writeJson(finishedPath(), held);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** Apply a service reply's word about `key`. */
+export function noteFinishedReply(key, body, at) {
+  const word = finishedFrom(body);
+  if (word === 'open') return clearFinished(key);
+  return word ? noteFinished(key, word, at) : false;
+}
+
+/**
+ * Whether a binding (or a candidate) names a finished ticket and so takes
+ * no new work. A person's bind or move made after it finished holds.
+ */
+export function takesNoWork(binding, finished = finishedOf(binding?.key)) {
+  if (!binding?.key || !finished) return false;
+  if (PERSON_SOURCES.has(binding.source) && (binding.boundAt || '') > (finished.at || '')) return false;
+  return true;
+}
+
+/**
+ * chooseBinding, with every finished ticket left out: the session's own
+ * binding and any candidate naming one. Returns the binding, or undefined
+ * when nothing open is named.
+ */
+export function pickBinding(state, candidates = []) {
+  const open = candidates.filter((one) => !takesNoWork(one));
+  const held = state?.binding && takesNoWork(state.binding) ? { ...state, binding: undefined } : state;
+  return chooseBinding(held || {}, open);
+}
+
+/**
+ * The keys a merge or a push credits, for the "write one line" ask: the
+ * merged work's keys, never the bound key when the merge was another's.
+ */
+export function creditedKeys(transition = {}, bound) {
+  const others = (transition.alsoFor || []).map((one) => one?.key).filter(Boolean);
+  if (transition.forKey) return [transition.forKey, ...others];
+  return [...(bound ? [bound] : []), ...others];
 }
 
 /**
@@ -1562,6 +1688,31 @@ export function workflowRef(key, config = {}) {
 /** A short stable digest. The one place a path becomes an identifier. */
 export function digest(value, length = 12) {
   return crypto.createHash('sha256').update(String(value)).digest('hex').slice(0, length);
+}
+
+/**
+ * A beat asked for now (MACLEOD-976). The events that change what is
+ * running — a start, a stop, an agent's start or end, a team task, a
+ * bind — leave this mark beside the session's heartbeat record, and the
+ * heartbeat beats within a poll instead of on its two-minute timer. One
+ * mark for any number of events: a burst sends one beat. Here and not in
+ * heartbeat.mjs because intake.mjs asks for one too, and it runs inside
+ * the heartbeat process, which may not import its own entry module.
+ */
+export function beatNowPath(sessionId) {
+  return path.join(dataDir(), 'heartbeats', `${digest(sessionId)}.now`);
+}
+
+/** Ask the session's heartbeat for a beat at once. Only when one runs for it; never throws. */
+export function requestBeat(sessionId) {
+  try {
+    if (!sessionId || sessionId === 'unknown-session') return false;
+    if (!fs.existsSync(path.join(dataDir(), 'heartbeats', `${digest(sessionId)}.json`))) return false;
+    fs.writeFileSync(beatNowPath(sessionId), new Date().toISOString());
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 /**
@@ -2849,6 +3000,22 @@ function creditable(key, state = {}, config = {}) {
 // At most this many tickets are credited by one merge.
 const MERGE_KEYS_MAX = 20;
 
+/*
+ * The commit messages in `range`, for the keys they name (MACLEOD-973).
+ * A merge commit's `TeamFlow-Key` trailer is the merging session's own
+ * binding, stamped by the trailer hook, and not the merged work: merging
+ * MACLEOD-972's branch while bound to MACLEOD-975 credited 975. So that
+ * one line of a merge commit is left out; its subject still counts.
+ */
+function rangeMessages(cwd, range) {
+  const out = git(cwd, ['log', '--format=%P%x1f%B%x1e', '-n', '200', range]).stdout || '';
+  return out.split('\x1e').map((record) => {
+    const [parents = '', body = ''] = record.replace(/^\s+/, '').split('\x1f');
+    const merge = parents.trim().split(/\s+/).filter(Boolean).length > 1;
+    return merge ? body.replace(/^TeamFlow-Key:.*$/gim, '') : body;
+  }).join('\n');
+}
+
 /**
  * The tickets whose work a successful `git merge` just landed on the
  * trunk (MACLEOD-640).
@@ -2890,7 +3057,7 @@ export function landedKeys(command, input = {}, state = {}, config = {}) {
       }
     }
     const branch = sources.length === 1 ? String(sources[0]).slice(0, 200) : undefined;
-    const log = git(cwd, ['log', '--format=%B', '-n', '200', 'HEAD@{1}..HEAD']).stdout;
+    const log = rangeMessages(cwd, 'HEAD@{1}..HEAD');
     for (const match of log.matchAll(ISSUE_ALL_RE)) {
       const key = match[1].toUpperCase();
       if (creditable(key, state, config)) note(key, branch);
@@ -3005,7 +3172,7 @@ export function pushedKeys(command, input = {}, state = {}, config = {}) {
         note(normalizeIssueKey(readJson(localBindingPath(dir))?.jiraKey), branch);
       }
     }
-    const log = git(cwd, ['log', '--format=%B', '-n', '200', range]).stdout;
+    const log = rangeMessages(cwd, range);
     for (const match of log.matchAll(ISSUE_ALL_RE)) {
       const key = match[1].toUpperCase();
       if (creditable(key, state, config)) note(key, undefined);
@@ -3258,11 +3425,17 @@ export function candidate(key, confidence, source, ref = {}) {
 // BASELINE-938 card from a task subject (MACLEOD-944).
 const CODE_NAME_RE = /(?<![A-Za-z0-9-])((?:[a-z][a-z0-9]*-)*)([a-z][a-z0-9]{1,19})-(\d{1,9})(?![A-Za-z0-9-])/g;
 
-/** The text with each lower-case key-shaped word of an unknown prefix removed. */
+/**
+ * The text with each lower-case key-shaped word of an unknown prefix
+ * removed, and every one that is part of a path, known or not: a folder
+ * called `macleod-5` is a folder (MACLEOD-976).
+ */
 export function codeNamesOut(text, known) {
   if (text === undefined || text === null) return text;
-  return String(text).replace(CODE_NAME_RE, (word, lead, prefix, number) => (
-    known?.has(prefix.toUpperCase()) || isAdHocKey(`${prefix}-${number}`) ? word : ' '));
+  return String(text).replace(CODE_NAME_RE, (word, lead, prefix, number, at, whole) => {
+    const inPath = whole[at - 1] === '/' || whole[at + word.length] === '/';
+    return !inPath && (known?.has(prefix.toUpperCase()) || isAdHocKey(`${prefix}-${number}`)) ? word : ' ';
+  });
 }
 
 // Pure half of detectCandidates: git and disk stay in the caller so detection is testable.
@@ -4896,11 +5069,14 @@ export function sanitizePayload(value, { kind = 'issue' } = {}) {
   const sessionOnly = new Set(['id', 'tool', 'startedAt', 'endedAt', 'repository', 'branch', 'label', 'agentTask']);
   // MACLEOD-639. A loop is a gate, two clocks, one derived line and a
   // name; a failure is a stage, a clock and that line; a transition is a
-  // stage, a clock and a name. `summary` is the only prose and it is the
-  // classifier's own sentence, never a command or its output.
+  // stage, its status, a clock and a name. `summary` is the only prose and
+  // it is the classifier's own sentence, never a command or its output.
   const reworkOnly = new Set(['gate', 'at', 'clearedAt', 'summary', 'by']);
   const failureOnly = new Set(['stage', 'at', 'summary']);
-  const transitionOnly = new Set(['stage', 'at', 'by']);
+  // `status` (MACLEOD-956, MACLEOD-973): a move to Merge `waiting` is a
+  // push for review. Dropped here, every Merge move read as a merge and
+  // the tracker went to Done when the agent that pushed ended.
+  const transitionOnly = new Set(['stage', 'status', 'at', 'by']);
   // One try of a gate the plugin ran, and why it is still going
   // (MACLEOD-639). `reason` is the runner's sentence, never output.
   const attemptOnly = new Set(['at', 'status', 'reason']);
@@ -6128,6 +6304,8 @@ async function postEnvelope(endpoint, envelope, idempotencyKey, config, account 
       : {}),
     // The organisation's ad hoc setting for this item (MACLEOD-642).
     ...(body?.adhoc_ticket && typeof body.adhoc_ticket === 'object' ? { adhocTicket: body.adhoc_ticket } : {}),
+    // The card is Done or cancelled, or open again (MACLEOD-973).
+    ...(finishedFrom(body) ? { finished: finishedFrom(body) } : {}),
   });
 }
 
@@ -6870,7 +7048,7 @@ export function attributedPayload(state, attribution, config, info = {}) {
     testRound: undefined,
     testsPassed: undefined,
     waitingOn: undefined,
-    transitions: [{ stage: attribution.stage, at: attribution.at, by: attribution.by }],
+    transitions: [{ stage: attribution.stage, ...(attribution.status ? { status: attribution.status } : {}), at: attribution.at, by: attribution.by }],
     evidence: [],
     git: undefined,
     pr: undefined,
@@ -6989,11 +7167,16 @@ export async function publishState(state, config, info, { force = false, keepTen
     followKeyAliases(state, state.cwd, config);
   }
   // "Ask first" (MACLEOD-642): said on the next prompt, once per item.
+  // A finished card takes no new work (MACLEOD-973): the next hook event
+  // gives the work to the branch's or the commit's key.
+  if (issueResult.finished) noteFinishedReply(payload.jiraKey, { finished: issueResult.finished === 'open' ? false : issueResult.finished });
   const ask = askAboutTicketOnce(issueResult.adhocTicket, config);
   if (ask) state.intakePending = [...(state.intakePending || []), ask].slice(-8);
   if (issueResult.ok || issueResult.queued) {
     state.lastPublishHash = hash;
     state.lastPublishedAt = now;
+    // Which card this actor's run is on (MACLEOD-976): a move ends it there.
+    state.lastPublished = { key: payload.jiraKey, tracker: payload.tracker };
     state.lastRefusedHash = undefined;
     state.lastRefusedAt = undefined;
   } else if (!issueResult.skipped) {

@@ -438,6 +438,7 @@ stall, a crash or an orphaned agent from quiet work.
     "limits": [ { "reason", "until", "estimated", "model", "agentId", "name", "key" } ],   (≤ 8, MACLEOD-920)
     "model": "<model name>", "claudeVersion": "<version>", "pluginVersion": "<version>",
     "agents": [ { "agentId", "name", "key", "stage", "status", "lastEventAt", "model" } ],
+    "team": { "name": "<team name>", "teammates": [ { "name", "open": 0.., "done": 0.. } ] },   (≤ 20, MACLEOD-976)
     "setup": { "machine": "<12-hex digest>", "version": "3" | "3.1", "project": "<project id>",
                "claudeMd": "<16-hex digest>", "settings": "<16-hex digest>", "mcp": "<16-hex digest>",
                "drift": true | false, "missing": 0..100,
@@ -476,6 +477,19 @@ stall, a crash or an orphaned agent from quiet work.
   `kill(pid, 0)`). It is detached, runs no shell, ignores its output and
   never holds the tool open. It beats once at start and then every 120
   seconds.
+- **A beat at once** (MACLEOD-976). `SessionStart`, `Stop`, `SubagentStart`,
+  `SubagentStop`, `TaskCreated`, `TaskCompleted`, a `bind`, `work-on` or
+  `unbind` and a "Wrong ticket?" move leave a local mark, and the process
+  beats within a poll instead of waiting for its timer: at most one such
+  beat every 2 seconds, so a burst of events is one beat. `boundKey` is the
+  newest word on the session's key: a binding file written after the
+  session's last hook event wins over the session's own record.
+- **An agent team** (MACLEOD-976). `team` is the name Claude Code gave the
+  team and, per teammate name, how many of the tasks `TaskCreated` opened
+  are still open and how many `TaskCompleted` closed. Names only, like an
+  agent's `name`; a task's subject, description and id never leave the
+  machine. Until the service's `HEARTBEAT` table lists it, the field is
+  dropped there.
 - **It watches the session's own process**: the hook's parent, which is the
   Claude Code process (a shell in between is stepped over). When that
   process is gone and no `SessionEnd` was recorded, it sends one last beat

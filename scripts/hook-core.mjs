@@ -14,6 +14,7 @@ import path from 'node:path';
 import {
   absorbRootActor,
   dataDir,
+  digest,
   writeJson,
   allActors,
   isPhantomAgent,
@@ -25,7 +26,7 @@ import {
   staleBindingFor,
   touchBinding,
   candidate,
-  chooseBinding,
+  creditedKeys, pickBinding, takesNoWork,
   claimLaunch,
   classifyTool,
   credentialKind,
@@ -69,7 +70,8 @@ import {
 import { NO_PROJECT_SENTENCE, resolveProject } from './project.mjs';
 import { drivenBy } from './driven.mjs';
 import {
-  clearPause, ensureHeartbeat, limitFromText, limitOf, markHandoff, markLimit, noteLimit, rotating, sessionLines, stopHeartbeat,
+  clearPause, ensureHeartbeat, limitFromText, limitOf, markHandoff, markLimit, noteLimit, requestBeat, rotating, sessionLines,
+  stopHeartbeat, teamPath,
 } from './heartbeat.mjs';
 import { pruneSnapshots, resumeNotice, saveSnapshot } from './resume.mjs';
 import { WORK_TOOLS, cardDirections, noteDirection, publishDirections } from './continue.mjs';
@@ -485,6 +487,77 @@ export function recordTeamTask(sessionId, input = {}) {
 }
 
 /**
+ * One report on the card an agent left: the same actor, its run ended and
+ * idle, saying where it went. A copy, so the agent's own state and its
+ * coalescing stay as they were. No git, no title lookup, no attributions.
+ */
+async function endRunOn(left, state, config, info) {
+  try {
+    const at = new Date().toISOString();
+    const old = {
+      ...state,
+      binding: { ...state.binding, key: left.key, tracker: left.tracker || state.binding.tracker },
+      jira: { key: left.key },
+      titleLookedUpFor: left.key,
+      attributions: [],
+      status: 'idle',
+      summary: `Moved to ${state.binding.key}`,
+      agent: { ...state.agent, endedAt: state.agent.endedAt || at },
+      lastPublishHash: undefined,
+      updatedAt: at,
+    };
+    await publishState(old, config, info, { force: true, skipGit: true });
+  } catch { /* the old card keeps the run; the five-minute pass ends it */ }
+}
+
+// The events after which the board should see the session at once (MACLEOD-976).
+const LIVE_EVENTS = new Set(['SessionStart', 'Stop', 'SubagentStart', 'SubagentStop']);
+// `teamflow bind`, `work-on` or `unbind` run in the session's own shell.
+const BIND_COMMAND_RE = /(?:^|[\s/;&|(])(?:teamflow|cli\.mjs)\s+(?:bind|work-on|unbind)\b/;
+
+export function changesWhatRuns(event, input = {}) {
+  if (LIVE_EVENTS.has(event)) return true;
+  return event === 'PostToolUse' && input.tool_name === 'Bash'
+    && BIND_COMMAND_RE.test(String(input.tool_input?.command || ''));
+}
+
+const TEAM_TASKS_MAX = 100;
+const TEAM_NAME_RE = /^[A-Za-z0-9][A-Za-z0-9 ._-]{0,63}$/;
+
+/**
+ * An agent team's task list, for the beat (MACLEOD-976). `TaskCreated`
+ * opens a task and `TaskCompleted` closes it, under the teammate it
+ * names; the beat sends the team's name and the counts per teammate, so
+ * the board can draw the teammates as one team. The task's subject is a
+ * brief and stays here; its id is kept only as a digest, to match the
+ * completion to its creation. Local only; never throws.
+ */
+export function noteTeamTask(sessionId, event, input = {}) {
+  try {
+    if (!sessionId) return undefined;
+    const team = typeof input.team_name === 'string' ? input.team_name.trim().slice(0, 64) : '';
+    const teammate = typeof input.teammate_name === 'string' ? input.teammate_name.trim().slice(0, 64) : '';
+    const file = teamPath(sessionId);
+    const held = readJson(file, undefined) || { tasks: {} };
+    if (TEAM_NAME_RE.test(team)) held.name = team;
+    if (!held.name) return undefined;
+    const raw = String(input.task_id ?? input.task_subject ?? '');
+    const id = digest(`${teammate}\u0000${raw}`);
+    const prior = held.tasks[id];
+    held.tasks[id] = {
+      teammate: TEAM_NAME_RE.test(teammate) ? teammate : prior?.teammate,
+      status: event === 'TaskCompleted' ? 'done' : (prior?.status || 'open'),
+    };
+    const ids = Object.keys(held.tasks);
+    for (const old of ids.slice(0, Math.max(0, ids.length - TEAM_TASKS_MAX))) delete held.tasks[old];
+    writeJson(file, held);
+    return held;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
  * What the session knows about a launch it is making (MACLEOD-722): the
  * batch it is part of, a `teamflow review start` still waiting for its
  * launch, and whether the step's last round found problems. Local only.
@@ -752,7 +825,11 @@ export async function handleEvent(input = {}) {
   }
   // An agent-team task (MACLEOD-722): its subject's lean, kept for the
   // teammate it names. A task being created is nothing more to report.
-  if (event === 'TaskCreated' || event === 'TaskCompleted') recordTeamTask(sessionId, input);
+  if (event === 'TaskCreated' || event === 'TaskCompleted') {
+    recordTeamTask(sessionId, input);
+    // And the team's counts, sent by the heartbeat at once (MACLEOD-976).
+    if (!input.reporter_tool && noteTeamTask(sessionId, event, input)) requestBeat(sessionId);
+  }
   if (event === 'TaskCreated') {
     return { state: readJson(sessionPath(sessionId)) ?? newSession(sessionId, given), justBound: false, event, signedIn: true, refused: undefined, notices: [] };
   }
@@ -957,7 +1034,23 @@ export async function handleEvent(input = {}) {
   // so the manual candidate and the session's own agree on the new key.
   followKeyAliases(state, cwd, config);
   const { candidates, info, refused } = detectCandidates(resolved, cwd, state, config);
-  state.binding = chooseBinding(state, candidates);
+  /*
+   * A ticket that is Done or cancelled takes no new work (MACLEOD-973):
+   * the work goes to the branch's key, else the commit's, else the
+   * session's own ad hoc card below. Its commits stop naming it too: the
+   * working copy's key file is cleared once, so the trailer hook adds
+   * no finished key.
+   */
+  const finishedKey = [state.binding, ...candidates.filter((one) => one.source === 'manual')]
+    .find((one) => one?.key && takesNoWork(one))?.key;
+  state.binding = pickBinding(state, candidates);
+  if (finishedKey && state.keyFileCleared !== finishedKey) {
+    state.keyFileCleared = finishedKey;
+    try {
+      const { clearKeyFile, keyFileOf } = await import('./ticketkey.mjs');
+      if (keyFileOf(cwd) === finishedKey) clearKeyFile(cwd);
+    } catch { /* the branch key still wins on the board */ }
+  }
   /*
    * A session with no fresh binding still shows (MACLEOD-956): the main
    * session's work goes to its own ad hoc card, named from the repository
@@ -1181,8 +1274,9 @@ export async function handleEvent(input = {}) {
   // A merge or a deploy of this session's work (MACLEOD-770): ask for the
   // card's plain line when it has none, or one older than the work.
   if (!agentKey && transition && transition.status !== 'failed' && ['MERGE', 'DEPLOY_DEV'].includes(transition.stage)) {
-    const key = transition.forKey || state.binding?.key;
-    const ask = key ? await sayAt(transition.stage === 'MERGE' ? 'merge' : 'deploy', key) : undefined;
+    // The merged work's keys, never the bound key when the merge was another's (MACLEOD-973).
+    const keys = creditedKeys(transition, state.binding?.key);
+    const ask = keys.length ? await sayAt(transition.stage === 'MERGE' ? 'merge' : 'deploy', keys) : undefined;
     if (ask) state.sayNotice = ask;
   }
 
@@ -1246,7 +1340,8 @@ export async function handleEvent(input = {}) {
     && /\bgit\b[^\n]*\bcommit\b/.test(String(input.tool_input?.command || ''))) {
     try {
       const { lastCommit, moveLine, recordMove, wrongKeyOf } = await import('./ticketkey.mjs');
-      const move = wrongKeyOf(state.binding.key, lastCommit(cwd));
+      // Only while the bound ticket is open (MACLEOD-973): once it is finished, the commit's key wins.
+      const move = wrongKeyOf(state.binding.key, lastCommit(cwd), { finished: takesNoWork(state.binding) });
       if (move && recordMove(move)) noteDirection(sessionId, agentKey, { kind: 'note', text: moveLine(move) });
     } catch { /* the trailer still names the bound ticket */ }
   }
@@ -1303,6 +1398,19 @@ export async function handleEvent(input = {}) {
    * Claude Code's idle notice comes a minute after every turn; only a
    * permission, a choice, a form or a confirmed question reaches the board.
    */
+  /*
+   * An agent that moved to another ticket ends its run on the one it left
+   * (MACLEOD-976). Its first tool event inherits the session's key, and its
+   * brief's `work-on` then binds its own: the old card showed it running
+   * for ever. One report there, the agent ended, before its first report
+   * on the new key. Fails open; a lost end is the old card's only cost.
+   */
+  if (agentKey && state.agent && !LOCAL_ONLY.includes(event) && state.binding?.key
+    && state.lastPublished?.key && state.lastPublished.key !== state.binding.key) {
+    await endRunOn(state.lastPublished, state, config, info);
+    delete state.lastPublished;
+  }
+
   const quietNotice = event === 'Notification' && !asked.ask;
   if (((!LOCAL_ONLY.includes(event) && !quietNotice) || asked.ask) && state.binding?.key) {
     // What TeamFlow told this agent (MACLEOD-726/733), for the card's Progress line.
@@ -1622,6 +1730,13 @@ export async function handleEvent(input = {}) {
   let started;
   if (!input.reporter_tool) {
     try { started = ensureHeartbeat(sessionId, { event, source: input.source, cwd }); } catch { /* no heartbeat this event */ }
+    /*
+     * A beat at once (MACLEOD-976): an event that changes what is running
+     * moves "running", "quiet" and "ended" on the board in seconds, not on
+     * the two-minute timer. A heartbeat that just started beats at once
+     * anyway. One small file write; the heartbeat throttles a burst.
+     */
+    if (!started?.started && changesWhatRuns(event, resolved)) requestBeat(sessionId);
   }
 
   /*

@@ -143,22 +143,27 @@ export function branchCarryKey(root, key, run = git) {
   return run(root, ['branch', '-m', branch, next]).ok ? { branch: next, renamed: branch } : { branch, kept: 'rename failed' };
 }
 
-/** The newest commit here: short sha, its TeamFlow-Key trailers, its subject. */
+/** The newest commit here: short sha, its TeamFlow-Key trailers, its subject, and whether it is a merge. */
 export function lastCommit(root, run = git) {
-  const got = run(root, ['log', '-1', `--format=%h%x09%(trailers:key=${TRAILER},valueonly,separator=%x2C)%x09%s`]);
+  const got = run(root, ['log', '-1', `--format=%h%x09%(trailers:key=${TRAILER},valueonly,separator=%x2C)%x09%p%x09%s`]);
   if (!got.ok) return undefined;
-  const [sha, trailers = '', ...rest] = got.stdout.split('\t');
+  const [sha, trailers = '', parents = '', ...rest] = got.stdout.split('\t');
   if (!SHORT.test(sha || '')) return undefined;
-  return { sha, trailers: trailers.split(',').map(keyOk).filter(Boolean), subject: rest.join('\t') };
+  const merge = parents.trim().split(/\s+/).filter(Boolean).length > 1;
+  return { sha, trailers: trailers.split(',').map(keyOk).filter(Boolean), subject: rest.join('\t'), ...(merge ? { merge } : {}) };
 }
 
 /**
  * A commit made in a working copy bound to `bound` whose subject names
  * another key and not the bound one. `{ key, named, sha }` or undefined.
+ *
+ * Only while the bound ticket is open (MACLEOD-973): a finished ticket
+ * takes no new work, so the key the commit names wins. A merge commit
+ * names the merged work and is never a wrong key.
  */
-export function wrongKeyOf(bound, commit) {
+export function wrongKeyOf(bound, commit, { finished = false } = {}) {
   const key = keyOk(bound);
-  if (!key || !commit || !SHORT.test(commit.sha || '')) return undefined;
+  if (finished || !key || !commit || commit.merge || !SHORT.test(commit.sha || '')) return undefined;
   const named = keysIn(commit.subject);
   if (!named.size || named.has(key)) return undefined;
   return { key, named: [...named].sort()[0], sha: commit.sha.slice(0, 7) };

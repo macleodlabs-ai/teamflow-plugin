@@ -27,6 +27,11 @@
 //                finished from its own merge facts, drops links to
 //                finished cards and asks the session for the card's
 //                plain line. See `tidy` below.
+//   rebind       "Wrong ticket?" (MACLEOD-973): `{ key, session }`. One
+//                ticket key this machine believes, for one of this
+//                machine's own sessions. The plugin's own bind moves that
+//                session to the key (source `moved`, sticky) and leaves
+//                it one plain line. See `rebind` below.
 //
 // Four rules decide the shape of this.
 //
@@ -61,8 +66,9 @@ import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import {
-  STAGE_ORDER, accountName, credential, dataDir, globalConfigPath, isWorktree, machineId, readJson, readKeyAliases,
-  reportScope, repositoryRoot, sendReport, serviceUrl, writeJson,
+  STAGE_ORDER, accountName, believable, candidate, credential, dataDir, globalConfigPath, isAdHocKey, isWorktree,
+  knownPrefixes, machineId, readJson, readKeyAliases, reportScope, repositoryRoot, saveSession, sendReport, serviceUrl,
+  requestBeat, sessionPath, trackerOf, writeJson,
 } from './core.mjs';
 import { step } from './words.mjs';
 import { markSent, mergedFacts, sendInBatches } from './merged.mjs';
@@ -78,7 +84,7 @@ export const TEXT_MAX = 500;
 export const REASON_MAX = 120;
 /** How many actions one round performs; the rest wait for the next. */
 export const BATCH = 8;
-export const KINDS = new Set(['fix', 'bump', 'rerun_gate', 'resume_plan', 'skip_gate', 'tidy']);
+export const KINDS = new Set(['fix', 'bump', 'rerun_gate', 'resume_plan', 'skip_gate', 'tidy', 'rebind']);
 
 // --- the developer's say ------------------------------------------------
 
@@ -484,6 +490,57 @@ export async function tidy(key, {
   return { ...said('done', `${key}: ${did.join(', ')}`), ...(notice ? { notice } : {}) };
 }
 
+// --- rebind: "Wrong ticket?" ----------------------------------------------------
+
+/*
+ * `rebind` (MACLEOD-973) is the machine half of "Wrong ticket?" on a card.
+ * The service queues `{ key, session }` after its own check of who may
+ * ask. Here the key must look like one ticket key and have a prefix this
+ * machine already knows (as `believable` judges a dispatch's key), and the
+ * session must be one of this machine's own. The plugin's own bind then
+ * moves that session: source `moved`, sticky, so a branch key does not
+ * pull it back and a later bind by hand still wins. The session reads one
+ * plain line at its next prompt. Nothing received reaches a shell.
+ */
+const REBIND_KEY = /^[A-Z][A-Z0-9]{1,19}-\d{1,9}$/;
+const SESSION_ID = /^[A-Za-z0-9_-]{1,120}$/;
+
+export function rebindLine(key, by) {
+  return `${by} moved this session to ${key}. New work from now on goes to ${key}.`;
+}
+
+export function rebind(action = {}, { config = {}, local, at = new Date().toISOString(), state } = {}) {
+  const key = String(action.key ?? action.args?.key ?? '').trim().toUpperCase();
+  const session = String(action.session ?? action.args?.session ?? '').trim();
+  const by = oneLine(action.by, 80) || 'A lead';
+  if (!REBIND_KEY.test(key)) return said('refused', 'The move names no ticket key');
+  if (!isAdHocKey(key)) {
+    const seen = [local?.binding?.key];
+    for (const wf of Object.values(state?.workflows || {})) for (const t of wf.tickets || []) seen.push(t.key);
+    const known = knownPrefixes(config, seen);
+    if (!known || !believable(key, known)) return said('refused', `This machine does not know tickets like ${key}`);
+  }
+  if (!SESSION_ID.test(session)) return said('refused', 'The move names no session');
+  const held = readJson(sessionPath(session));
+  if (!held?.sessionId || held.sessionId !== session) return said('refused', 'That session is not on this machine');
+  const tracker = isAdHocKey(key) ? 'teamflow' : trackerOf(config);
+  const binding = { ...candidate(key, 1000, 'moved', { tracker, boundAt: at, ...(held.binding?.account ? { account: held.binding.account } : {}) }), sticky: true };
+  const line = rebindLine(key, by);
+  const move = (one) => {
+    one.binding = binding;
+    one.jira = { key };
+    one.intakePending = [...(one.intakePending || []), line].slice(-8);
+    one.updatedAt = at;
+  };
+  move(held);
+  saveSession(held);
+  // The board sees the move in seconds, not at the next beat (MACLEOD-976).
+  requestBeat(session);
+  // The hook that runs this round saves its own copy afterwards.
+  if (local && local.sessionId === session && !local.agentKey) move(local);
+  return said('done', `${by} moved the session to ${key}`);
+}
+
 /** A held action this old is dropped here; the service gives it its outcome (MACLEOD-726). */
 export const HOLD_MAX_MS = 24 * 60 * 60 * 1000;
 
@@ -503,6 +560,7 @@ export async function perform(action, {
   const key = followedKey(String(action.key || ''), config);
   const by = oneLine(action.by, 80) || 'a lead';
   if (!KINDS.has(kind)) return { ...said('refused', `unknown action kind ${kind}`) };
+  if (kind === 'rebind') return rebind(action, { config, local, at, state });
 
   const mine = bound === key ? localFor(local, key) : undefined;
   const gone = lapsed(action, mine);

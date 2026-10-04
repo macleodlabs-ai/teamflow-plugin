@@ -486,6 +486,13 @@ async function bind(argument = args.filter((a) => a !== '--local').join(' '), { 
     // event will find it, so a failure here is not a failed bind.
     try { saveSession(state); } catch {}
   }
+  // The board sees the new key in seconds (MACLEOD-976): every running
+  // heartbeat here, and the session this bind moved, beat at once.
+  try {
+    const { requestBeat, requestBeatsFor } = await import('./heartbeat.mjs');
+    requestBeatsFor((await import('./core.mjs')).repositoryRoot(cwd));
+    if (state?.sessionId) requestBeat(state.sessionId);
+  } catch { /* the two-minute beat still comes */ }
   // The key travels with the work (MACLEOD-845): a commit trailer, and
   // the branch name when renaming it is safe. Never fails the bind.
   let carried = '';

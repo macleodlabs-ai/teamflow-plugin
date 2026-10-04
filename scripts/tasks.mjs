@@ -31,8 +31,8 @@ import fs from 'node:fs';
 import path from 'node:path';
 
 import {
-  dataDir, digest, isAdHocKey, latestSessionForCwd, ownPromptText, publishState, readJson, readWorkflows,
-  saveSession, sessionPath, writeJson,
+  dataDir, digest, isAdHocKey, latestSessionForCwd, localBindingPath, ownPromptText, publishState, readJson,
+  readUserBinding, readWorkflows, saveSession, sessionPath, takesNoWork, writeJson,
 } from './core.mjs';
 import { projectFor, projectsCachePath } from './project.mjs';
 import { NAME_MAX, moveThread, readTracks, writeTracks } from './tracks.mjs';
@@ -77,6 +77,7 @@ export function readTasks(sessionId) {
     current: held.current,
     promptAt: held.promptAt,
     quiet: Boolean(held.quiet),
+    ...(held.sessionProject?.id ? { sessionProject: held.sessionProject } : {}),
     tasks: held.tasks && typeof held.tasks === 'object' ? held.tasks : {},
   };
 }
@@ -218,8 +219,9 @@ export function noteTaskWork(sessionId, input = {}, { config = {}, state = {}, r
   if (!work) return undefined;
   const file = readTasks(sessionId);
   const current = file.tasks[file.current];
-  const startsNew = file.promptAt && !file.quiet && !(current && time(current.startedAt) >= time(file.promptAt));
-  if (!startsNew && !current) return undefined;
+  // A quiet prompt never splits a task; but work with no task at all
+  // starts one, so a working session is always in a project (MACLEOD-973).
+  const startsNew = !current || (file.promptAt && !file.quiet && !(time(current.startedAt) >= time(file.promptAt)));
   const previous = current;
   const task = startsNew ? currentOrNew(file, now) : current;
   const at = iso(now);
@@ -229,14 +231,19 @@ export function noteTaskWork(sessionId, input = {}, { config = {}, state = {}, r
     task.files = [...(task.files || []).filter((f) => f.h !== h), { h, at }].slice(-FILES_KEPT);
   }
   if (work.agent) task.agents = [...new Set([...(task.agents || []), digest(work.agent, 12)])].slice(-AGENTS_KEPT);
-  if (!STICKY.has(task.by)) sortTask(task, { state, repository, projects: projects || cachedProjects(config), runs: localRuns(config), previous: startsNew ? previous : undefined, now });
+  if (!STICKY.has(task.by)) {
+    sortTask(task, {
+      state, repository, projects: projects || cachedProjects(config), runs: localRuns(config),
+      previous: startsNew ? previous : undefined, now, sessionProject: sessionProjectOf(file, repository),
+    });
+  }
   writeTasks(file);
   // A new task lets go of the last task's card: it was that task's alone.
   if (startsNew && previous && state?.binding?.source === 'task' && state.binding.key === previous.key) task.releasedCard = previous.key;
   return task;
 }
 
-function sortTask(task, { state, repository, projects, runs, previous, now }) {
+function sortTask(task, { state, repository, projects, runs, previous, now, sessionProject }) {
   const key = state?.binding?.key;
   if (key && !isAdHocKey(key)) {
     task.key = key;
@@ -256,7 +263,29 @@ function sortTask(task, { state, repository, projects, runs, previous, now }) {
   if (!task.project && previous?.project) {
     task.project = previous.project;
     task.by = 'default';
+    return;
   }
+  // Every task joins a project (MACLEOD-973): the repository's, else one
+  // informal project for the session. Never sticky: a key sorts it later.
+  if (task.project) return;
+  const repo = repository ? projectFor(repository, projects) : undefined;
+  if (repo) {
+    task.project = { kind: 'formal', id: repo.id, name: repo.name };
+    task.by = 'repo';
+    return;
+  }
+  task.project = sessionProject;
+  task.by = 'session';
+}
+
+/** The session's own informal project: one per session, named from the repository. */
+function sessionProjectOf(file, repository) {
+  if (!file.sessionProject?.id) {
+    const repo = String(repository || '').split('/').pop();
+    const name = (repo ? `Work in ${repo}` : 'Work in this session').slice(0, NAME_MAX);
+    file.sessionProject = { kind: 'informal', id: newId(), name };
+  }
+  return file.sessionProject;
 }
 
 // --- for the tracks pass --------------------------------------------
@@ -365,6 +394,35 @@ export async function sessionTaskCard(title, sessionId, {
   return { key: minted.key, title };
 }
 
+/** A bind by hand this recent keeps the session from a task's new card. */
+export const KEEP_MANUAL_MS = 10 * 60 * 1000;
+
+/**
+ * The ticket `task new` must not take the session from (MACLEOD-973), or
+ * undefined: a key the person bound by hand in the last few minutes, or
+ * an open tracker ticket the session is bound to. A finished ticket takes
+ * no new work, so it keeps nothing.
+ */
+export function keptTicket(sessionId, { cwd, config = {}, now = Date.now() } = {}) {
+  const recent = (b) => b?.source === 'manual' && now - (Date.parse(b.boundAt || '') || 0) <= KEEP_MANUAL_MS;
+  const state = readJson(sessionPath(sessionId)) || {};
+  const files = [];
+  try {
+    const dir = cwd || state.cwd;
+    if (dir) files.push(readJson(localBindingPath(dir)), readUserBinding(dir, config));
+  } catch { /* no binding file: the session's own binding decides */ }
+  const fromFiles = files.filter((f) => f?.jiraKey)
+    .map((f) => ({ key: f.jiraKey, source: 'manual', boundAt: f.boundAt }))
+    .filter((b) => recent(b) && !takesNoWork(b))
+    .sort((a, b) => String(b.boundAt).localeCompare(String(a.boundAt)))[0];
+  if (fromFiles) return fromFiles.key;
+  const b = state.binding;
+  if (!b?.key || takesNoWork(b)) return undefined;
+  if (recent(b)) return b.key;
+  if (!isAdHocKey(b.key)) return b.key;
+  return undefined;
+}
+
 async function defaultAsk(method, route, body, config) {
   const { credential, serviceUrl } = await import('./core.mjs');
   const cred = await credential(config);
@@ -410,8 +468,12 @@ export async function taskMain(args = [], {
     }
     let card;
     let reason;
+    // A ticket the person chose keeps the session (MACLEOD-973): no card is
+    // minted and the binding stays, and the task goes on that ticket.
+    const kept = keptTicket(session, { cwd, config, now });
     try {
-      card = await (startCard ? startCard(name) : sessionTaskCard(name, session, { config, info, now, mintKey, publish }));
+      card = kept ? { key: kept, kept: true }
+        : await (startCard ? startCard(name) : sessionTaskCard(name, session, { config, info, now, mintKey, publish }));
     } catch (error) {
       reason = (error instanceof Error ? error.message : String(error)).slice(0, 200);
     }
@@ -428,7 +490,8 @@ export async function taskMain(args = [], {
     task.lastAt = iso(now);
     writeTasks(file);
     writeTracks(held, config);
-    if (card?.key) print(`New project "${name}". This task is in it, and card ${card.key} is on the board.`);
+    if (card?.kept) print(`New project "${name}". This task is in it, on card ${card.key}.`);
+    else if (card?.key) print(`New project "${name}". This task is in it, and card ${card.key} is on the board.`);
     else print(`New project "${name}". This task is in it. TeamFlow could not add its card: ${reason || 'no reason given'}.`);
     return 0;
   }

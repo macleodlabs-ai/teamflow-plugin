@@ -51,6 +51,8 @@ const LIMITS = { rate_limit: 'rate_limit', billing_error: 'billing' };
 export const CHECK_BACK_MS = 2 * 60 * 1000;
 // One delivery round's network budget: never more than a beat's worth.
 const ROUND_MS = 3_000;
+// The shortest time between two beats asked for at once (MACLEOD-976).
+export const GAP_MS = 2_000;
 
 const SCRIPT = fileURLToPath(import.meta.url);
 
@@ -96,6 +98,29 @@ export function endMarkPath(sessionId) {
 /** The mark a limit leaves: this session may be moving to another account. */
 export function handoffMarkPath(sessionId) {
   return heartbeatPath(sessionId).replace(/\.json$/, '.handoff');
+}
+
+// A beat asked for now (MACLEOD-976): the mark and its request live in core.mjs.
+export const { beatNowPath, requestBeat } = core;
+
+/** An agent team's tasks, as counts per teammate (MACLEOD-976). */
+export function teamPath(sessionId) {
+  return heartbeatPath(sessionId).replace(/\.json$/, '.team');
+}
+
+/** The same, for every running heartbeat in one repository: `teamflow bind` knows no session. */
+export function requestBeatsFor(root) {
+  let asked = 0;
+  try {
+    const dir = path.join(core.dataDir(), 'heartbeats');
+    for (const name of fs.readdirSync(dir).filter((one) => /^[0-9a-f]{8,64}\.json$/.test(one))) {
+      const held = core.readJson(path.join(dir, name));
+      if (!held?.pid || held.endedReason || held.root !== root) continue;
+      fs.writeFileSync(path.join(dir, name.replace(/\.json$/, '.now')), new Date().toISOString());
+      asked += 1;
+    }
+  } catch { /* the two-minute beat still comes */ }
+  return asked;
 }
 
 /** The pause a limit leaves while the session waits for it to reset. */
@@ -764,6 +789,58 @@ export function agentRow(actor) {
 const MODEL_ID = /^[A-Za-z0-9][A-Za-z0-9._:\[\]-]{0,63}$/;
 const VERSION_ID = /^\d+(\.\d+){0,3}$/;
 
+/*
+ * The main actor's key, read the way the hook reads it (MACLEOD-976,
+ * audit A2). `teamflow bind` writes a binding file; the session file
+ * takes the new key only at the session's next hook event, so an idle
+ * session beat its old key with no time limit. A binding file written
+ * after the session last moved is the newer word and wins. One the hook
+ * already saw and set aside — a finished ticket, say — is older than
+ * that event and does not.
+ */
+function boundKeyOf(main) {
+  const own = keyOf(main?.binding?.key);
+  if (!main?.cwd) return own;
+  try {
+    const config = core.loadConfig(main.cwd);
+    const local = core.readJson(path.join(main.cwd, '.teamflow', 'binding.json'));
+    const file = core.usableBinding(core.preferBinding(local, core.readUserBinding(main.cwd, config)), config);
+    const key = keyOf(file?.jiraKey);
+    const seen = [main.binding?.boundAt, main.updatedAt].map((at) => String(at || '')).sort().at(-1);
+    if (key && String(file.boundAt || '') > seen) return key;
+  } catch { /* the session's own key */ }
+  return own;
+}
+
+const TEAMMATES_MAX = 20;
+const NAME_RE = /^[A-Za-z0-9][A-Za-z0-9 ._-]{0,63}$/;
+
+/**
+ * An agent team on the beat (MACLEOD-976): the team's name and, per
+ * teammate, how many of its tasks are open and done. Names are the ones
+ * Claude Code gave the team and its teammates, like an agent's `name`;
+ * a task's subject and id never leave the machine.
+ */
+function teamOf(sessionId) {
+  try {
+    const held = core.readJson(teamPath(sessionId));
+    if (!held || !NAME_RE.test(String(held.name || ''))) return undefined;
+    const per = new Map();
+    for (const task of Object.values(held.tasks || {})) {
+      const name = NAME_RE.test(String(task?.teammate || '')) ? task.teammate : undefined;
+      if (!name) continue;
+      const row = per.get(name) || { name, open: 0, done: 0 };
+      if (task.status === 'done') row.done += 1;
+      else row.open += 1;
+      per.set(name, row);
+    }
+    const teammates = [...per.values()].sort((a, b) => a.name.localeCompare(b.name)).slice(0, TEAMMATES_MAX);
+    return { name: held.name, teammates };
+  } catch {
+    return undefined;
+  }
+}
+
 export function buildBeat(sessionId, { at = new Date().toISOString(), alive = true, endedReason, continues, repo } = {}) {
   const actors = core.sessionActors(sessionId);
   const main = actors.find((one) => !one.agentKey);
@@ -776,8 +853,10 @@ export function buildBeat(sessionId, { at = new Date().toISOString(), alive = tr
   // Which models are limited, and which agents stopped at one (MACLEOD-920).
   const limits = limitsOf(sessionId, Date.parse(at));
   if (limits.length) beat.limits = limits;
-  const bound = keyOf(main?.binding?.key);
+  const bound = boundKeyOf(main);
   if (bound) beat.boundKey = bound;
+  const team = teamOf(sessionId);
+  if (team) beat.team = team;
   // So the service can count its repairs by plugin version (MACLEOD-846).
   const version = core.pluginVersion();
   if (version) beat.pluginVersion = version;
@@ -837,7 +916,7 @@ export async function runHeartbeat({
   sessionId, watchPid, cwd = process.cwd(), beatMs = BEAT_MS, pollMs = POLL_MS,
   maxLifeMs = MAX_LIFE_MS, now = Date.now, sleep = undefined, alive = isAlive,
   send = core.sendHeartbeat, self = process.pid, continues, env = process.env,
-  deliver = deliverRound, notify = notifyDesktop, inventory = sendLedger,
+  deliver = deliverRound, notify = notifyDesktop, inventory = sendLedger, gapMs = GAP_MS,
 }) {
   const file = heartbeatPath(sessionId);
   const started = now();
@@ -847,9 +926,15 @@ export async function runHeartbeat({
     const at = new Date(now()).toISOString();
     let sent = false;
     let reply = {};
+    let payload;
     try {
-      const result = await send(buildBeat(sessionId, { at, alive: sessionAlive, endedReason, continues, repo }), core.loadConfig(cwd));
+      payload = buildBeat(sessionId, { at, alive: sessionAlive, endedReason, continues, repo });
+      const result = await send(payload, core.loadConfig(cwd));
       sent = Boolean(result?.ok);
+      // The bound card is Done or cancelled (MACLEOD-973): it takes no new work.
+      if (sent && payload?.boundKey && result.finished) {
+        core.noteFinishedReply(payload.boundKey, { finished: result.finished === 'open' ? false : result.finished });
+      }
       if (sent && (Array.isArray(result.others) || Array.isArray(result.holds))) reply = othersOf(result);
       // Which team set-up this machine should have (MACLEOD-938).
       if (sent && result.teamSetup?.version) noteWanted(result.teamSetup.version, { data: core.dataDir() });
@@ -857,12 +942,19 @@ export async function runHeartbeat({
     try {
       const held = core.readJson(file);
       const end = endedReason ? { endedReason, endedAt: at } : {};
-      const key = keyOf(core.readJson(core.sessionPath(sessionId))?.binding?.key);
+      const key = payload?.boundKey;
       if (held?.pid === self) core.writeJson(file, { ...held, beatAt: at, sent, ...end, ...reply, ...(key ? { key } : {}) });
     } catch { /* the record is a convenience for `status` */ }
   };
   let next = started;
   let beats = 0;
+  let last = -Infinity;
+  const nowMark = beatNowPath(sessionId);
+  // A beat asked for at once (MACLEOD-976): taken when one is due anyway,
+  // else as soon as `gapMs` has passed since the last one, so a burst of
+  // events is one beat and the mark left meanwhile is the next one.
+  const asked = () => fs.existsSync(nowMark);
+  const wanted = () => asked() && now() - last >= gapMs;
   for (;;) {
     const other = heartbeatState(sessionId, { now: now(), alive, beatMs });
     if (other.running && other.pid !== self) return 'replaced';
@@ -874,19 +966,26 @@ export async function runHeartbeat({
       return why;
     }
     if (now() - started >= maxLifeMs) return 'expired';
-    if (now() >= next) {
+    const due = now() >= next;
+    if (due || wanted()) {
+      if (asked()) fs.rmSync(nowMark, { force: true });
+      last = now();
       await beat(true);
-      try { await deliver(sessionId, { cwd }); } catch { /* the next beat tries again */ }
-      // The machine's inventory: with the first beat, then every tenth.
-      if (beats % INVENTORY_EVERY === 0) {
-        try { await inventory({ cwd }); } catch { /* the next one is twenty minutes away */ }
+      // A beat asked for at once is only the beat: the delivery round and
+      // the inventory keep their own clock.
+      if (due) {
+        try { await deliver(sessionId, { cwd }); } catch { /* the next beat tries again */ }
+        // The machine's inventory: with the first beat, then every tenth.
+        if (beats % INVENTORY_EVERY === 0) {
+          try { await inventory({ cwd }); } catch { /* the next one is twenty minutes away */ }
+        }
+        beats += 1;
       }
-      beats += 1;
       next = now() + beatMs;
     }
     try { await checkBack(sessionId, { now: now(), deliver, notify, cwd }); } catch { /* fails open */ }
     if (sleep) await sleep(pollMs);
-    else await watchfulPause(pollMs, () => !alive(watchPid) || fs.existsSync(endMarkPath(sessionId)));
+    else await watchfulPause(pollMs, () => !alive(watchPid) || fs.existsSync(endMarkPath(sessionId)) || wanted());
   }
 }
 

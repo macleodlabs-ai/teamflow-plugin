@@ -3,6 +3,23 @@
 What changed in each published version of the TeamFlow plugin, newest first.
 Only what a person using it would notice.
 
+## 0.3.67
+
+- **Work goes to the right ticket.** A finished ticket takes no new work.
+  A branch or commit key wins over an old binding to a done ticket.
+- **Merges count on the merged ticket**, not the one the session is bound to.
+- **Every task is in a project.** The order is: its ticket, the same work,
+  your last task, the repository, then your own project.
+- **"Wrong ticket?" works from the app.** When a person moves the work,
+  your session moves to the new ticket by itself.
+- **A push for review is never Done.** The tracker moves to Done only after
+  the work is merged.
+- **The board hears sooner.** A session reports at once when it starts,
+  stops or changes ticket. An agent moved to another ticket ends on the old one.
+- **Agent teams show.** A team's name and each teammate's open and done
+  work reach the board.
+- **No ticket from a temporary folder.** A key in a temp path is ignored.
+
 ## 0.3.66
 
 - **Cursor, Codex, Copilot and Kiro do more.** Each one now gets as much
