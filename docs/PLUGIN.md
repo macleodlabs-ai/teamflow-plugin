@@ -1022,8 +1022,8 @@ are in [CLIENTS.md](CLIENTS.md).
 ## Other IDEs and agent tools
 
 Claude Code was the only automatic client for as long as it was the only
-one with a hook. Seven of the other ten have one now, and TeamFlow uses
-it: `teamflow skills install --for <tool>` writes that tool's hook
+one with a hook. Eight of the other seventeen have one TeamFlow uses now
+(Kiro joined in MACLEOD-972): `teamflow skills install --for <tool>` writes that tool's hook
 configuration alongside its skills, and the hooks call `teamflow hook
 --for <tool>`, which translates that tool's payload into the shape
 `classifyTool` already reads.
@@ -1038,6 +1038,28 @@ the board long before anybody noticed.
 Per-tool install, sign-in and configuration are in
 [CLIENTS.md](CLIENTS.md). `plugin/scripts/tools.mjs` is the same
 information as data, one record per tool, and is what the site reads.
+
+`teamflow hooks install --for <tool>` writes only the hook file;
+`skills install --for <tool>` writes it with the skills, rules and MCP
+server. Re-running either adds events an older install lacks.
+`teamflow doctor` prints `cursorHooks`, `codexHooks` and `kiroHooks` in a
+repository that uses that tool, naming each missing event, and `teamflow
+hooks status` lists them under `missing` (`missingEvents` in
+`hooks.mjs`).
+
+### More than reports (MACLEOD-972)
+
+Cursor, Codex, Copilot and Kiro read some hook output back, so they get
+part of what the Claude Code plugin does: the session-start context, the
+prompt context where the tool takes it, Allow or Deny from TeamFlow
+where the tool has a permission event, and the plan's next step at a
+stop. [TOOL_PARITY.md](TOOL_PARITY.md) is the reference, event by event
+with the vendor's words; ARCHITECTURE.md chapter 4, "What other tools
+hear back", is how the code does it (`cursor.mjs`, `copilot.mjs`,
+`kiro.mjs`, and `--mode answer` / `--mode continue` in `hook-cli.mjs`
+for Codex). `parity` in `tools.mjs` is the short form; `/docs/tools/`
+and each client guide are generated from it. Everything there is from
+documentation (2026-10-04); none of the four has had a real session.
 
 ### What is automatic, per tool
 
@@ -1054,13 +1076,14 @@ plugin was installed in that tool and the payload was watched arriving.
 | Tool | Level | Where the hooks go | Events TeamFlow subscribes to |
 | --- | --- | --- | --- |
 | Claude Code | hooks | in the plugin | `SessionStart`, `UserPromptSubmit`, `PostToolUse`, `PostToolUseFailure`, `TaskCompleted`, `SubagentStart`, `SubagentStop`, `Stop`, `SessionEnd` |
-| [Cursor](https://cursor.com/docs/agent/hooks) | hooks | `.cursor/hooks.json` | `afterFileEdit`, `postToolUse`, `postToolUseFailure`, `afterShellExecution`, `stop` |
-| [VS Code + Copilot](https://code.visualstudio.com/docs/copilot/customization/hooks) and [Copilot CLI](https://docs.github.com/en/copilot/reference/hooks-reference) | hooks | `.github/hooks/teamflow.json` | `PostToolUse`, `PostToolUseFailure`, `Stop` (VS Code); `postToolUse`, `postToolUseFailure`, `agentStop` (CLI) |
+| [Cursor](https://cursor.com/docs/agent/hooks) | hooks | `.cursor/hooks.json` | `sessionStart`, `beforeSubmitPrompt`, `afterFileEdit`, `postToolUse`, `postToolUseFailure`, `afterShellExecution`, `subagentStart`, `subagentStop`, `preCompact`, `afterAgentResponse`, `stop`, `sessionEnd` |
+| [VS Code + Copilot](https://code.visualstudio.com/docs/copilot/customization/hooks) and [Copilot CLI](https://docs.github.com/en/copilot/reference/hooks-reference) | hooks | `.github/hooks/teamflow.json` | `SessionStart`, `UserPromptSubmit`, `PermissionRequest` (CLI), `SubagentStart`, `SubagentStop`, `SessionEnd` (CLI), `PostToolUse`, `PostToolUseFailure`, `Stop`; the older camelCase `postToolUse`, `postToolUseFailure`, `agentStop` stay |
 | [Windsurf](https://docs.devin.ai/desktop/cascade/hooks) | hooks | `.windsurf/hooks.json` | `post_write_code`, `post_run_command`, `post_cascade_response` |
 | [Cline](https://cline.bot/blog/cline-v3-36-hooks) ([payload schema](https://github.com/cline/cline/blob/main/.clinerules/hooks/README.md)) | hooks | `.clinerules/hooks/PostToolUse` | `PostToolUse` |
-| [OpenAI Codex CLI](https://learn.chatgpt.com/docs/hooks) | hooks | `.codex/hooks.json` | `PostToolUse`, `Stop` |
+| [OpenAI Codex CLI](https://learn.chatgpt.com/docs/hooks) | hooks | `.codex/hooks.json` | `SessionStart`, `UserPromptSubmit`, `PermissionRequest`, `PostToolUse`, `SubagentStart`, `SubagentStop`, `PreCompact`, `Stop`, `SessionEnd` |
 | [Gemini CLI](https://github.com/google-gemini/gemini-cli/blob/main/docs/hooks/reference.md) | hooks | `.gemini/settings.json` | `AfterTool`, `AfterAgent` |
 | [JetBrains Junie](https://junie.jetbrains.com/docs/junie-cli-hooks.html) | hooks | `~/.junie/config.json` | `PreToolUse`, `Stop` |
+| [Kiro](https://kiro.dev/docs/hooks/types/) IDE and Kiro CLI | hooks | `.kiro/hooks/teamflow.json` | `SessionStart`, `UserPromptSubmit`, `PostToolUse`, `Stop`, `SessionEnd` (CLI) |
 | [Zed](https://zed.dev/docs/ai/agent-panel) | git hooks | `.git/hooks/` | `post-commit`, `post-merge`, `pre-push` |
 | [Aider](https://aider.chat/docs/usage/lint-test.html) | git hooks | `.git/hooks/` | `post-commit`, `post-merge`, `pre-push` |
 | [Claude Desktop](https://code.claude.com/docs/en/desktop) | rules | nothing on disk | none |
@@ -1129,7 +1152,20 @@ anyway, so the release that ships it is not a silent gap.
 
 **Codex CLI** adopted Claude Code's hook shape field for field, down to
 `tool_input` and `tool_response`, so its adapter is almost a
-passthrough; only `apply_patch` needs a name mapping.
+passthrough; only `apply_patch` needs a name mapping. Its record says
+`envelope: 'claude-code'`, so the parts of the plugin that read only
+that envelope (questions shown, task sorting, the answer and continue
+modes) read Codex too. Codex asks a person to review non-managed hooks
+once with `/hooks` before it runs them.
+
+**Kiro** (the IDE and Kiro CLI 3.0+, which replaced Amazon Q Developer
+CLI) reads `.kiro/hooks/<id>.json` files with `"version": "v1"`. Its
+stdin is close to Claude Code's; its stdout on `SessionStart` and
+`UserPromptSubmit` is added to the context as plain text, and exit 2
+blocks, which TeamFlow never does. There is no failure event, so
+`tool_response.success: false` makes a failure. A CLI 2.x agent config
+with `agentSpawn` / `preToolUse` / `stop` converts with `kiro-cli agent
+migrate`, and the adapter accepts those names too.
 
 **Gemini CLI** parses a hook's stdout as JSON, so TeamFlow's hook prints
 exactly `{}` and logs to stderr. Its tool names are `write_file`,
@@ -1260,6 +1296,12 @@ What to watch for per tool, beyond that:
   and that the board shows `LOCAL_REWORK`. Hooks must be enabled in
   Settings → Features first, or nothing runs at all and it looks
   identical to a broken adapter.
+- **Cursor, Codex, Copilot and Kiro: what goes back (MACLEOD-972).**
+  That the session-start lines appear in the agent's context, that a
+  plan with a next step goes on at a stop (and stops after five in a
+  row), and for Codex and Copilot CLI that a permission waits and takes
+  Allow or Deny pressed in TeamFlow. Each row of
+  [TOOL_PARITY.md](TOOL_PARITY.md) is a claim to check.
 - **VS Code with Copilot**. That the IDE fires `PostToolUseFailure`
   rather than only the CLI's `postToolUseFailure`, and that its result
   arrives as `tool_result`. Both are registered and both are read, so

@@ -82,6 +82,16 @@ import {
   boundToTeamflow, closeDispatched, dispatchOf, launchesOf, planLaunch, publishOwed, replanUnbound, settle, withMint,
 } from './dispatch.mjs';
 import { isTaskLine, noIssueLine, taskCommand } from './task-line.mjs';
+import { BY_ID } from './tools.mjs';
+
+/*
+ * Claude Code's own entry, or a tool that sends Claude Code's envelope
+ * field for field (`envelope` in tools.mjs; Codex, MACLEOD-972). What
+ * reads only that envelope — a permission request as a question, a tool
+ * call as task work — reads such a tool too. Transcripts, the heartbeat
+ * and pauses stay Claude Code's: no other tool writes that shape.
+ */
+const claudeEnvelope = (input) => !input.reporter_tool || BY_ID[input.reporter_tool]?.envelope === 'claude-code';
 
 /** Whether a launch in this session was claimed by this agent id. Local files only. */
 function seenLaunch(sessionId, agentId) {
@@ -1158,8 +1168,11 @@ export async function handleEvent(input = {}) {
   if (transition?.landedHere) noteLandedHere(input.cwd || cwd, transition.landedHere);
   state = applyTransition(state, transition);
   let asked = {};
-  if (!input.reporter_tool) {
+  // Copilot CLI's PermissionRequest waits on a person too (MACLEOD-972).
+  if (claudeEnvelope(input) || input.reporter_tool === 'copilot') {
     try { asked = askStep(input); state = applyAsk(state, asked); } catch { /* the card keeps its last status */ }
+  }
+  if (!input.reporter_tool) {
     // A person typed: the check-in's streak starts again (MACLEOD-845).
     if (event === 'UserPromptSubmit' && !agentKey) {
       try { (await import('./checkin.mjs')).resetStreak(sessionId); } catch { /* the streak cap still holds */ }
@@ -1248,7 +1261,7 @@ export async function handleEvent(input = {}) {
   // The task this work belongs to (MACLEOD-970): started by the first
   // edit, dispatch or commit after a prompt, sorted into a project. The
   // main session only; keyed on the session id, never the account.
-  if (event === 'PostToolUse' && !agentKey && !input.reporter_tool) {
+  if (event === 'PostToolUse' && !agentKey && claudeEnvelope(input)) {
     try {
       const { noteTaskWork } = await import('./tasks.mjs');
       const task = noteTaskWork(sessionId, input, { config, state, repository: info?.repository });
@@ -1523,7 +1536,7 @@ export async function handleEvent(input = {}) {
   }
   // Other sessions on this card or in this folder (MACLEOD-641): told,
   // never blocked. Local files only; the heartbeat keeps the service's word.
-  if (FAST.includes(event) && !input.reporter_tool) {
+  if (FAST.includes(event) && (!input.reporter_tool || input.reporter_context)) {
     try { notices = [...notices, ...sessionLines(sessionId, cwd)]; } catch { /* nothing to say */ }
     // Which project this prompt's work goes in (MACLEOD-970): one line,
     // once per prompt, never for a slash command or a one-word reply. The
@@ -1575,7 +1588,7 @@ export async function handleEvent(input = {}) {
   }
   // The ask for a card's plain line (MACLEOD-770), said the same way; and
   // on a prompt, the merges the background pass saw since the last one.
-  if (!agentKey && FAST.includes(event) && !input.reporter_tool) {
+  if (!agentKey && FAST.includes(event) && (!input.reporter_tool || input.reporter_context)) {
     try {
       const { takeOwed } = await import('./say.mjs');
       const owed = takeOwed();

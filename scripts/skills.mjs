@@ -291,12 +291,21 @@ export const TOOLS = {
     label: 'VS Code with GitHub Copilot',
     skills: agentsSkills,
     rules: (root) => path.join(root, '.github', 'copilot-instructions.md'),
-    mcp: (root) => ({
-      file: path.join(root, '.vscode', 'mcp.json'),
-      // VS Code says `servers`, not `mcpServers`.
-      json: { servers: { teamflow: { type: 'http', url: MCP_URL } } },
-    }),
-    note: 'A browser window opens on the first connection. Agent mode is the only mode that can call MCP tools.',
+    // Two files, one per dialect (MACLEOD-972): Copilot CLI's page says
+    // "The `.vscode/mcp.json` file for VS Code is not read by Copilot
+    // CLI", and reads `.mcp.json` or `.github/mcp.json` instead.
+    mcp: (root) => [
+      {
+        file: path.join(root, '.vscode', 'mcp.json'),
+        // VS Code says `servers`, not `mcpServers`.
+        json: { servers: { teamflow: { type: 'http', url: MCP_URL } } },
+      },
+      {
+        file: path.join(root, '.github', 'mcp.json'),
+        json: { mcpServers: { teamflow: { type: 'http', url: MCP_URL, tools: ['*'] } } },
+      },
+    ],
+    note: 'A browser window opens on the first connection. Agent mode is the only mode that can call MCP tools. The skills show as slash commands in VS Code and in Copilot CLI.',
   },
   windsurf: {
     label: 'Windsurf / Devin Desktop',
@@ -401,11 +410,19 @@ export const TOOLS = {
   },
   kiro: {
     label: 'Kiro',
+    // kiro.dev/docs/skills: workspace `.kiro/skills/`, global
+    // `~/.kiro/skills/`. Kiro does not read `.agents/skills`.
+    skills: (root, user) => (user
+      ? path.join(home(), '.kiro', 'skills')
+      : path.join(root, '.kiro', 'skills')),
     rules: (root) => path.join(root, '.kiro', 'steering', 'teamflow.md'),
-    manual: [
-      `In Kiro, run "Kiro: Open workspace MCP config (JSON)" and add a server named teamflow at ${MCP_URL}.`,
-    ],
-    note: 'Kiro reads steering files from .kiro/steering on every turn.',
+    // kiro.dev/docs/mcp/configuration: workspace `.kiro/settings/mcp.json`,
+    // merged over the user one. Kiro runs the OAuth sign-in itself.
+    mcp: (root) => ({
+      file: path.join(root, '.kiro', 'settings', 'mcp.json'),
+      json: { mcpServers: { teamflow: { url: MCP_URL } } },
+    }),
+    note: 'Kiro reads steering files from .kiro/steering on every turn. Kiro opens the sign-in page the first time it uses the server.',
   },
   qwen: {
     label: 'Qwen Code',
@@ -501,8 +518,8 @@ export function install(tool, { root = process.cwd(), scope = 'project', dryRun 
     else installWorkflowRule({ root, file, written });
   }
 
-  if (spec.mcp) {
-    const target = spec.mcp(root);
+  // One target, or a list where a tool reads two files (Copilot).
+  for (const target of spec.mcp ? [].concat(spec.mcp(root)) : []) {
     if (dryRun) plan(target.file);
     else if (target.json) mergeJson(target.file, target.json, written);
     else if (target.toml) writeTomlTable(target.file, target.toml.table, target.toml.body, written);
@@ -570,8 +587,7 @@ export function uninstall(tool, { root = process.cwd(), scope = 'project', dryRu
     else uninstallWorkflowRule({ root, file, written });
   }
 
-  if (spec.mcp) {
-    const target = spec.mcp(root);
+  for (const target of spec.mcp ? [].concat(spec.mcp(root)) : []) {
     if (dryRun) plan(target.file);
     else if (target.json) unmergeJson(target.file, target.json, written);
     else if (target.toml) removeBlock(target.file, written, { begin: '# BEGIN teamflow', end: '# END teamflow' });

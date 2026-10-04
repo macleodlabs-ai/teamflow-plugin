@@ -606,6 +606,15 @@ async function doctor() {
   // a finding when the last number is not 0, and proof when it is.
   const { dispatchLine, dispatchSummary } = await import('./dispatch.mjs');
   const dispatched = dispatchLine(dispatchSummary(latestSessionForCwd(cwd, config)?.sessionId));
+  // Codex's hooks (MACLEOD-972): an older install misses events, and
+  // nothing else says so. Only for a repository that uses Codex.
+  const { codexHooksLine, cursorHooksLine } = await import('./hooks.mjs');
+  const { repositoryRoot } = await import('./core.mjs');
+  const codexHooks = codexHooksLine(repositoryRoot(cwd));
+  // Cursor's hook file, when this repository has one (MACLEOD-972).
+  const cursorHooks = cursorHooksLine(info.repository || cwd);
+  // Kiro's hook file, when this repository has a .kiro folder (MACLEOD-972).
+  const kiroHooks = (await import('./kiro.mjs')).kiroHooksLine(info.repository || cwd);
   const report = {
     claudeProbe: claudeBin ? 'ran' : `skipped: ${claudeSkipped}`,
     pluginVersion: pluginVersion() || 'unknown',
@@ -620,6 +629,7 @@ async function doctor() {
       : {}),
     reconcile: tidied || 'no pass recorded yet; run `teamflow tidy`',
     dispatched,
+    ...(codexHooks ? { codexHooks } : {}),
     transport,
     serviceUrl: serviceUrl(config),
     // Findings, not trivia (MACLEOD-616). Either one means reports are
@@ -639,6 +649,8 @@ async function doctor() {
     // ticket at all, and no other line here would say so (MACLEOD-586).
     ...(refusedBinding ? { binding: refusedBinding } : {}),
     teamflowMcp,
+    ...(cursorHooks ? { cursorHooks } : {}),
+    ...(kiroHooks ? { kiroHooks } : {}),
     trackerMcp: mcpVisible
       ? `${server} visible`
       : `${server} not visible yet; TeamFlow bundles it, restart/reload plugin then use /mcp to authenticate`,

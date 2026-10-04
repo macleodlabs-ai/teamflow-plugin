@@ -24,7 +24,7 @@
 
 
 
-import { projectId, repositoryRoot } from './core.mjs';
+import { digest, projectId, repositoryRoot } from './core.mjs';
 import { BY_ID } from './tools.mjs';
 
 // A tool that has no session concept still needs a stable key, because
@@ -147,6 +147,9 @@ export const PASSIVE_STDOUT = {
   gemini: '{}',
   codex: '',
   jetbrains: '',
+  // Kiro adds stdout to the agent's context on SessionStart and
+  // UserPromptSubmit, so silence is the only safe default.
+  kiro: '',
   git: '',
 };
 
@@ -262,11 +265,49 @@ ADAPTERS.cursor = (payload = {}) => {
     if (typeof exit !== 'number') return undefined;
     return toolEvent({ ...base, tool: SHELL, input: { command: payload.command }, response: payload.output, ok: exit === 0 });
   }
+  // MACLEOD-972: the rest of Claude Code's lifecycle, renamed. Cursor
+  // documents each field on cursor.com/docs/agent/hooks (2026-10-04).
+  // `loop_count` above 0 means this stop follows an automatic follow-up,
+  // which is what Claude Code calls `stop_hook_active`.
   if (event === 'stop') {
-    return { hook_event_name: 'Stop', session_id: session, cwd };
+    return { hook_event_name: 'Stop', session_id: session, cwd, stop_hook_active: Number(payload.loop_count) > 0 };
+  }
+  if (event === 'sessionStart') {
+    // `reporter_context`: Cursor reads `additional_context` from this
+    // event's stdout into the model's context, so the session lines
+    // Claude Code hears are worth working out here too.
+    return { hook_event_name: 'SessionStart', session_id: session, cwd, reporter_context: true };
+  }
+  if (event === 'beforeSubmitPrompt') {
+    return { hook_event_name: 'UserPromptSubmit', session_id: session, cwd, prompt: payload.prompt };
+  }
+  if (event === 'subagentStart' || event === 'subagentStop') {
+    return {
+      hook_event_name: event === 'subagentStart' ? 'SubagentStart' : 'SubagentStop',
+      session_id: session,
+      cwd,
+      agent_id: cursorAgentId(payload, session),
+      agent_type: payload.subagent_type,
+    };
+  }
+  if (event === 'preCompact') {
+    return { hook_event_name: 'PreCompact', session_id: session, cwd, trigger: payload.trigger };
+  }
+  if (event === 'sessionEnd') {
+    return { hook_event_name: 'SessionEnd', session_id: session, cwd, reason: payload.reason };
   }
   return undefined;
 };
+
+// Cursor gives `subagent_id` on subagentStart and no id at all on
+// subagentStop. Both carry `task`, so the agent's key is made from the
+// task, the same way on both events, and the start's id is only the
+// fallback for a task-less agent.
+function cursorAgentId(payload, session) {
+  const task = typeof payload.task === 'string' ? payload.task.trim() : '';
+  if (task) return `cursor-${digest(`${session}|${task}`, 16)}`;
+  return String(payload.subagent_id || payload.tool_call_id || '').slice(0, 80) || undefined;
+}
 
 // --- GitHub Copilot ---------------------------------------------------
 //
@@ -277,14 +318,64 @@ ADAPTERS.cursor = (payload = {}) => {
 // `toolName` and `toolArgs`, and `toolArgs` is a JSON *string*.
 //
 // One adapter reads both, because one hook file registers both.
+//
+// MACLEOD-972: the session, prompt, permission and subagent events too.
+// Copilot CLI documents a PascalCase name beside each camelCase one, with
+// VS Code's snake_case fields, so the installer registers those; the
+// camelCase spellings are mapped here as well, for a payload that names
+// itself. Renamed only: what each event means is still classifyTool's.
+const COPILOT_EVENTS = {
+  SessionStart: 'SessionStart', sessionStart: 'SessionStart',
+  UserPromptSubmit: 'UserPromptSubmit', userPromptSubmitted: 'UserPromptSubmit',
+  PermissionRequest: 'PermissionRequest', permissionRequest: 'PermissionRequest',
+  SubagentStart: 'SubagentStart', subagentStart: 'SubagentStart',
+  SubagentStop: 'SubagentStop', subagentStop: 'SubagentStop',
+  SessionEnd: 'SessionEnd', sessionEnd: 'SessionEnd',
+};
+
+function copilotArgs(raw) {
+  if (typeof raw !== 'string') return raw && typeof raw === 'object' ? raw : {};
+  try { const parsed = JSON.parse(raw); return parsed && typeof parsed === 'object' ? parsed : {}; } catch { return {}; }
+}
+
 ADAPTERS.copilot = (payload = {}) => {
   const event = payload.hook_event_name || payload.hookEventName || payload.eventName;
   const cwd = payload.cwd || process.cwd();
   const session = sessionFor('copilot', cwd, payload.session_id || payload.sessionId);
   const base = { session, cwd };
+  const text = (value) => (typeof value === 'string' ? value : undefined);
 
   if (/^(Stop|agentStop)$/.test(event || '')) {
-    return { hook_event_name: 'Stop', session_id: session, cwd };
+    return {
+      hook_event_name: 'Stop',
+      session_id: session,
+      cwd,
+      stop_hook_active: payload.stop_hook_active === true,
+      // Neither dialect documents the last message on Stop; it is read
+      // only if a release adds it.
+      last_assistant_message: text(payload.last_assistant_message),
+    };
+  }
+  const mapped = COPILOT_EVENTS[event];
+  if (mapped) {
+    const out = { hook_event_name: mapped, session_id: session, cwd };
+    if (mapped === 'SessionStart') out.source = text(payload.source);
+    if (mapped === 'SessionEnd') out.reason = text(payload.reason);
+    if (mapped === 'UserPromptSubmit') out.prompt = text(payload.prompt) ?? '';
+    if (mapped === 'PermissionRequest') {
+      const input = copilotArgs(payload.tool_input ?? payload.toolInput ?? payload.toolArgs);
+      out.tool_name = normalizeToolName(payload.tool_name || payload.toolName, normalizeInput(input));
+      out.tool_input = input;
+    }
+    if (mapped === 'SubagentStart' || mapped === 'SubagentStop') {
+      out.agent_id = text(payload.agent_id || payload.agentId);
+      out.agent_type = text(payload.agent_type || payload.agentType || payload.agent_name || payload.agentName);
+    }
+    if (mapped === 'SubagentStop') {
+      out.stop_hook_active = payload.stop_hook_active === true;
+      out.last_assistant_message = text(payload.last_assistant_message ?? payload.response);
+    }
+    return out;
   }
   const failure = /^(postToolUseFailure|PostToolUseFailure)$/.test(event || '');
   // Copilot CLI's documented payload names no event at all: it is
@@ -422,24 +513,49 @@ ADAPTERS.gemini = (payload = {}) => {
 // and `tool_response`. The only translations are its tool names
 // (`apply_patch` for an edit) and the absence of a failure event, so
 // the outcome comes out of the response like everywhere else.
+//
+// Since MACLEOD-972 the session events pass on too, because the plugin
+// behind them reads Claude Code's envelope and Codex sends exactly that
+// (https://learn.chatgpt.com/docs/hooks, read 2026-10-04). Each event
+// keeps only the fields that page documents for it. Nothing here decides
+// a stage: SessionStart and UserPromptSubmit are context, PermissionRequest
+// is a question, SubagentStart and SubagentStop name an agent, and the
+// rest end things. `Interrupt` has no Claude Code twin and is dropped;
+// `PreToolUse` is not registered, because Claude Code uses it only for its
+// own `Agent` and `AskUserQuestion` tools, which Codex does not have.
+const CODEX_FIELDS = {
+  SessionStart: ['source'],
+  UserPromptSubmit: ['prompt'],
+  PermissionRequest: ['tool_name', 'tool_input'],
+  SubagentStart: ['agent_id', 'agent_type'],
+  SubagentStop: ['agent_id', 'agent_type', 'last_assistant_message', 'stop_hook_active'],
+  PreCompact: ['trigger'],
+  Stop: ['last_assistant_message', 'stop_hook_active'],
+  SessionEnd: ['reason'],
+};
+
 ADAPTERS.codex = (payload = {}) => {
   const event = payload.hook_event_name;
   const cwd = payload.cwd || process.cwd();
   const session = sessionFor('codex', cwd, payload.session_id);
 
   if (event === 'PostToolUse') {
-    return toolEvent({
+    const out = toolEvent({
       session,
       cwd,
       tool: payload.tool_name,
       input: payload.tool_input,
       response: payload.tool_response,
     });
+    if (out && payload.tool_use_id) out.tool_use_id = payload.tool_use_id;
+    return out;
   }
-  if (event === 'Stop' || event === 'SessionEnd') {
-    return { hook_event_name: event === 'Stop' ? 'Stop' : 'SessionEnd', session_id: session, cwd };
-  }
-  return undefined;
+  const fields = CODEX_FIELDS[event];
+  if (!fields) return undefined;
+  const out = { hook_event_name: event, session_id: session, cwd };
+  if (payload.permission_mode) out.permission_mode = payload.permission_mode;
+  for (const name of fields) if (payload[name] !== undefined) out[name] = payload[name];
+  return out;
 };
 
 // --- JetBrains Junie CLI ----------------------------------------------
@@ -470,6 +586,49 @@ ADAPTERS.jetbrains = (payload = {}) => {
   if (event === 'Stop' || event === 'SessionEnd') {
     return { hook_event_name: event === 'Stop' ? 'Stop' : 'SessionEnd', session_id: session, cwd };
   }
+  return undefined;
+};
+
+// --- Kiro (AWS) ---------------------------------------------------------
+//
+// .kiro/hooks/*.json, read by the Kiro IDE (1.0 and later) and the Kiro
+// CLI (3.0 and later), which replaced Amazon Q Developer CLI. Field names
+// are from kiro.dev/docs/hooks/types, read on 2026-10-04. The samples
+// spell the event in lower camel case (`agentSpawn`, `userPromptSubmit`,
+// `postToolUse`, `stop`) while the hook file names the trigger in
+// PascalCase, so the name is compared without case.
+//
+// There is no failure event: `tool_response.success` says whether the
+// call worked, and failedFrom reads it. Kiro's write tools are `fs_write`
+// (alias `write`), `fs_append`, `str_replace` and `delete_file`; the two
+// the shared pattern does not catch are renamed here. `preToolUse` is
+// dropped, for the reason Junie's shell calls are.
+const KIRO_EDITS = new Set(['fs_append', 'delete_file']);
+
+ADAPTERS.kiro = (payload = {}) => {
+  const event = String(payload.hook_event_name || '').toLowerCase();
+  const cwd = payload.cwd || process.cwd();
+  const session = sessionFor('kiro', cwd, payload.session_id);
+  const base = { session_id: session, cwd };
+
+  if (event === 'agentspawn' || event === 'sessionstart') return { ...base, hook_event_name: 'SessionStart' };
+  if (event === 'userpromptsubmit') {
+    return { ...base, hook_event_name: 'UserPromptSubmit', prompt: typeof payload.prompt === 'string' ? payload.prompt : '' };
+  }
+  if (event === 'posttooluse') {
+    return toolEvent({
+      session,
+      cwd,
+      tool: KIRO_EDITS.has(payload.tool_name) ? EDIT : payload.tool_name,
+      input: payload.tool_input,
+      response: payload.tool_response,
+    });
+  }
+  if (event === 'stop' || event === 'agentstop') {
+    const said = typeof payload.assistant_response === 'string' ? payload.assistant_response : undefined;
+    return { ...base, hook_event_name: 'Stop', ...(said ? { last_assistant_message: said } : {}) };
+  }
+  if (event === 'sessionend') return { ...base, hook_event_name: 'SessionEnd' };
   return undefined;
 };
 

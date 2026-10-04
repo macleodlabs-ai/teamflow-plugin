@@ -89,6 +89,33 @@
 // reports through the git fallback until an adapter is written against
 // a payload somebody has seen, so the pages can say "it has hooks, and
 // TeamFlow does not use them yet" rather than "it has no hooks".
+//
+// `parity` (MACLEOD-972) is the short, customer-facing form of
+// docs/TOOL_PARITY.md for the tools that get more than reporting:
+// Claude Code as the baseline, then Cursor, Codex, Copilot and Kiro.
+// `features` maps each PARITY_FEATURES id to [level, why]: level is
+// 'yes', 'part' or 'no', and `why` is one plain sentence a customer
+// reads (no vendor quotes; those stay in docs/TOOL_PARITY.md). The
+// /docs/tools/ table and each client guide's "What TeamFlow can do"
+// section are generated from it, so a change here is `npm run docs`
+// and `npm run clients`. `checked` is the day the vendor pages were
+// read, not a day the tool was run: `tested` still says that.
+
+export const PARITY_FEATURES = [
+  ['sessionContext', 'Ticket and lead notes at session start'],
+  ['promptContext', 'Ticket and project with each prompt'],
+  ['answers', 'Allow or Deny from TeamFlow'],
+  ['carryOn', 'Plan goes on when a turn ends'],
+  ['agents', 'Helper agents and session end on the board'],
+  ['checkin', 'One-minute check-in on an idle session'],
+  ['skills', 'TeamFlow skills'],
+  ['mcp', 'TeamFlow MCP server'],
+];
+
+export const PARITY_LEVELS = { yes: 'Yes', part: 'Partly', no: 'No' };
+
+// Column order on the page: the baseline first, then the four tools.
+export const PARITY_TOOLS = ['claude-code', 'cursor', 'codex', 'copilot', 'kiro'];
 
 export const TOOL_CAPABILITIES = [
   {
@@ -109,6 +136,14 @@ export const TOOL_CAPABILITIES = [
     // this table. Empty here means `teamflow hook --for claude-code`
     // says nothing, which is right, because nothing calls it.
     notice: [],
+    parity: {
+      label: 'Claude Code',
+      checked: '2026-10-04',
+      features: {
+        sessionContext: ['yes'], promptContext: ['yes'], answers: ['yes'], carryOn: ['yes'],
+        agents: ['yes'], checkin: ['yes'], skills: ['yes'], mcp: ['yes'],
+      },
+    },
     description: 'The plugin carries its own hooks, so every edit, test run, audit, merge and deploy reports itself with nothing to install per repository.',
   },
   {
@@ -116,20 +151,27 @@ export const TOOL_CAPABILITIES = [
     name: 'Cursor',
     automation: 'hooks',
     tested: false,
-    events: ['afterFileEdit', 'postToolUse', 'postToolUseFailure', 'afterShellExecution', 'stop'],
+    events: ['sessionStart', 'beforeSubmitPrompt', 'afterFileEdit', 'postToolUse', 'postToolUseFailure',
+      'afterShellExecution', 'subagentStart', 'subagentStop', 'preCompact', 'stop', 'sessionEnd'],
     doc: 'https://cursor.com/docs/agent/hooks',
     verified: {
-      date: '2026-09-18',
+      date: '2026-10-04',
       from: 'docs',
-      note: '`afterShellExecution` still documents `command`, `output`, `duration` and `sandbox` and no exit status, so a shell command is reported only through `postToolUse` and `postToolUseFailure`; not yet watched arriving from a real Cursor session.',
+      note: 'MACLEOD-972. Session context goes in sessionStart `additional_context` ("Additional context to add to the '
+        + 'conversation\'s initial system context"), and a plan\'s next step in stop `followup_message` ("Can optionally '
+        + 'auto-submit a follow-up user message to keep iterating"). No answers from TeamFlow: beforeShellExecution and '
+        + 'beforeMCPExecution are "Called before any shell command or MCP tool is executed", not only when Cursor would ask, '
+        + 'and preToolUse does not support "ask". beforeSubmitPrompt reads only `continue` and `user_message`, so a prompt '
+        + 'gets no context. No idle, notification or question event exists, so there is no check-in wake-up and no shown '
+        + 'question. subagentStop carries no subagent id, so an agent is keyed by its task. `afterShellExecution` has no '
+        + 'exit status, so shell commands report through postToolUse and postToolUseFailure.',
     },
     // `sessionStart` first, because that is once a session and at the
-    // start of it, which is when a sign-in notice is worth reading.
-    // The installer registers it for the notice alone — it reports
-    // nothing, which is why it is not in `events` above. The two
-    // post-call events stay in the list as the fallback for a
-    // repository whose `.cursor/hooks.json` was written before this
-    // release and has no `sessionStart` entry; the daily stamp is what
+    // start of it, which is when a sign-in notice is worth reading. Its
+    // `additional_context` now also carries the session context Claude
+    // Code hears (MACLEOD-972). The two post-call events stay in the
+    // list as the fallback for a repository whose `.cursor/hooks.json`
+    // was written before sessionStart was; the daily stamp is what
     // stops that fallback becoming a line per edit.
     notice: [{
       events: ['sessionStart', 'postToolUse', 'postToolUseFailure'],
@@ -138,19 +180,39 @@ export const TOOL_CAPABILITIES = [
       quote: 'sessionStart: "Additional context to add to the conversation\'s initial system context"; '
         + 'postToolUse: "Extra context injected into the conversation after the tool result".',
     }],
-    description: 'Cursor has the fullest hook set outside Claude Code, including a distinct failure event, so a red test run reports rework rather than a green gate.',
+    parity: {
+      label: 'Cursor',
+      checked: '2026-10-04',
+      features: {
+        sessionContext: ['yes'],
+        promptContext: ['no', 'Cursor takes no added text when you send a prompt.'],
+        answers: ['no', 'Cursor runs its hooks before every command, not only when it asks you. Waiting there would stop all work.'],
+        carryOn: ['yes'],
+        agents: ['yes'],
+        checkin: ['no', 'Cursor cannot wake an idle session later.'],
+        skills: ['yes'],
+        mcp: ['yes'],
+      },
+    },
+    description: 'Cursor has the fullest hook set outside Claude Code. A red test run reports rework, each session starts with its ticket, and a plan goes on to its next step by itself.',
   },
   {
     id: 'copilot',
     name: 'VS Code with GitHub Copilot',
     automation: 'hooks',
     tested: false,
-    events: ['PostToolUse', 'PostToolUseFailure', 'Stop', 'postToolUse', 'postToolUseFailure', 'agentStop'],
+    events: ['SessionStart', 'UserPromptSubmit', 'PermissionRequest', 'SubagentStart', 'SubagentStop', 'SessionEnd',
+      'PostToolUse', 'PostToolUseFailure', 'Stop', 'postToolUse', 'postToolUseFailure', 'agentStop'],
     doc: 'https://code.visualstudio.com/docs/copilot/customization/hooks',
+    // SessionStart output reaches the model in both dialects, so session
+    // lines and task sorting run for it (MACLEOD-972). Its prompt output
+    // does not: Copilot CLI says "Command and HTTP config-file
+    // `userPromptSubmitted` hooks have their output dropped".
+    context: true,
     verified: {
-      date: '2026-09-18',
+      date: '2026-10-04',
       from: 'docs',
-      note: 'The two dialects out of one file were confirmed field for field: `toolResult.resultType` for the CLI against `tool_result.result_type` for VS Code, and `postToolUseFailure` against `PostToolUseFailure`.',
+      note: 'Re-read for MACLEOD-972 against docs.github.com/en/copilot/reference/hooks-reference and code.visualstudio.com/docs/agents/reference/hooks-reference. Copilot CLI: "Two payload formats are supported, selected by the event name used in the hook configuration", so the PascalCase names carry VS Code\'s fields. sessionStart `additionalContext` is honoured; preToolUse is "fail-closed on errors", so it is not registered; permissionRequest takes `behavior` "allow" | "deny"; agentStop takes `decision` "block" with a `reason`. VS Code has no PermissionRequest, SessionEnd or Notification event, and UserPromptSubmit takes only the common output.',
     },
     // The only one of these that the vendor says reaches the person in
     // so many words, and it is documented for every hook rather than
@@ -163,6 +225,20 @@ export const TOOL_CAPABILITIES = [
       quote: 'One of the three fields "all hooks support", beside `continue` and `stopReason`: '
         + 'it "displays a warning to the user in the chat".',
     }],
+    parity: {
+      label: 'GitHub Copilot',
+      checked: '2026-10-04',
+      features: {
+        sessionContext: ['yes'],
+        promptContext: ['no', 'Copilot drops the text a hook adds to a prompt. The ticket comes at session start.'],
+        answers: ['part', 'Only Copilot CLI asks TeamFlow. The VS Code agent has no event for a permission.'],
+        carryOn: ['part', 'Only for helper agents. At a turn end, Copilot does not send its last answer.'],
+        agents: ['part', 'VS Code reports helper agents but not session end. Copilot CLI reports agent stops and session end.'],
+        checkin: ['no', 'Copilot cannot wake an idle session later.'],
+        skills: ['yes'],
+        mcp: ['yes'],
+      },
+    },
     description: 'One hook file in .github/hooks covers both the VS Code agent and Copilot CLI, which read the same directory in two different dialects.',
   },
   {
@@ -213,21 +289,51 @@ export const TOOL_CAPABILITIES = [
     name: 'OpenAI Codex CLI',
     automation: 'hooks',
     tested: false,
-    events: ['PostToolUse', 'Stop'],
+    events: ['SessionStart', 'UserPromptSubmit', 'PermissionRequest', 'PostToolUse', 'SubagentStart', 'SubagentStop', 'PreCompact', 'Stop', 'SessionEnd'],
     doc: 'https://learn.chatgpt.com/docs/hooks',
+    // What Codex prints back on SessionStart and UserPromptSubmit reaches
+    // the model: "`hookSpecificOutput.additionalContext` – Added as
+    // developer context" (MACLEOD-972).
+    context: true,
+    // Codex sends Claude Code's own envelope, so the parts of the plugin
+    // that read only that envelope (questions shown, task sorting) read
+    // Codex too. Transcripts and the heartbeat stay Claude Code's.
+    envelope: 'claude-code',
     verified: {
-      date: '2026-09-18',
+      date: '2026-10-04',
       from: 'docs',
-      note: 'The envelope is Claude Code\'s field for field, so the only check that matters is the event list, and `PostToolUse` and `Stop` are both still there.',
+      note: 'Codex lists twelve events: SessionStart, SessionEnd, PreToolUse, PermissionRequest, PostToolUse, '
+        + 'PreCompact, PostCompact, UserPromptSubmit, SubagentStart, SubagentStop, Stop and Interrupt, and '
+        + '"Hooks are enabled by default." SessionStart and UserPromptSubmit take '
+        + '"`hookSpecificOutput.additionalContext` – Added as developer context". PermissionRequest takes '
+        + '`hookSpecificOutput.decision.behavior` "allow", or "deny" with `message`, and "any `deny` wins". On '
+        + 'Stop, `decision: "block"` "tells Codex to continue". There is no asyncRewake and no hook for a '
+        + 'question the agent asks the person, so the one-minute check-in and answered questions stay with '
+        + 'Claude Code. "Non-managed hooks require explicit review before execution. Use the `/hooks` command".',
     },
     notice: [{
-      events: ['PostToolUse', 'Stop'],
+      events: ['SessionStart', 'PostToolUse'],
       field: 'systemMessage',
       audience: 'person',
-      quote: 'Claude Code\'s field, kept field for field: "surfaced as a warning in the UI or event '
-        + 'stream". The fields that block are `decision`, `continue` and `permissionDecision`.',
+      quote: 'Codex lists `systemMessage` – "Surfaced as warning" for SessionStart and PostToolUse. Its Stop '
+        + 'table has no `systemMessage`, so Stop is not a channel. The fields that block are `decision`, '
+        + '`continue` and `permissionDecision`.',
     }],
-    description: 'Codex adopted Claude Code’s hook shape field for field, so TeamFlow reports from it exactly as it does from Claude Code.',
+    parity: {
+      label: 'Codex',
+      checked: '2026-10-04',
+      features: {
+        sessionContext: ['yes'],
+        promptContext: ['yes'],
+        answers: ['yes', 'Codex has no event for a question with options, so you answer those in Codex.'],
+        carryOn: ['yes'],
+        agents: ['yes'],
+        checkin: ['no', 'Codex cannot wake an idle session later.'],
+        skills: ['yes'],
+        mcp: ['yes'],
+      },
+    },
+    description: 'Codex adopted Claude Code’s hook shape field for field, so TeamFlow reports from it as it does from Claude Code: context at the start and on each prompt, answers to permission requests from TeamFlow, and plan work that carries on at a stop.',
   },
   {
     id: 'gemini',
@@ -423,18 +529,44 @@ export const TOOL_CAPABILITIES = [
   {
     id: 'kiro',
     name: 'Kiro',
-    automation: 'git-hooks',
+    // The IDE (1.0+) and the Kiro CLI (3.0+), which replaced Amazon Q
+    // Developer CLI ("The Amazon Q Developer CLI has been rebranded to
+    // Kiro", docs.aws.amazon.com, upgrade-to-kiro). Both read the same
+    // `.kiro/hooks/*.json`.
+    automation: 'hooks',
     tested: false,
-    events: ['post-commit', 'post-merge', 'pre-push'],
-    vendorHooks: ['PreToolUse', 'PostToolUse', 'PostFileSave', 'Stop'],
-    doc: 'https://kiro.dev/docs/hooks/',
+    events: ['SessionStart', 'UserPromptSubmit', 'PostToolUse', 'Stop', 'SessionEnd'],
+    vendorHooks: [
+      'SessionStart', 'UserPromptSubmit', 'PreToolUse', 'PostToolUse', 'Stop', 'SessionEnd',
+      'PostFileCreate', 'PostFileSave', 'PostFileDelete', 'PreTaskExec', 'PostTaskExec', 'Manual',
+    ],
+    doc: 'https://kiro.dev/docs/hooks/types/',
+    // SessionStart and UserPromptSubmit stdout reaches the agent, so the
+    // session and task lines go there (hook-core.mjs, `reporter_context`).
+    context: true,
     verified: {
-      date: '2026-09-23',
+      date: '2026-10-04',
       from: 'docs',
-      note: 'Hooks live in `.kiro/hooks/*.json` and a command hook gets session context as JSON on stdin, but the fields are not documented, and stdout goes into the agent’s context.',
+      note: 'kiro.dev/docs/hooks/types documents stdin JSON with `hook_event_name`, `cwd`, `session_id`, plus `prompt`, `tool_name`, `tool_input`, `tool_response` and `assistant_response`. Hook actions: "Exit code 0: Hook succeeded. STDOUT is added to context (SessionStart, UserPromptSubmit) or ignored (others)." A Stop hook may return `{"decision": "block", "reason": ...}`, and "the reason is sent as a new user message to the agent". No permission or question event exists, and SessionStart and SessionEnd are "V3" only on the CLI.',
     },
+    // Kiro's stdout is plain text, not a field, so the sign-in line goes
+    // into the SessionStart context instead (kiro.mjs).
     notice: [],
-    description: 'Kiro has hooks, but it does not document what they send. Until that is seen, TeamFlow reports Kiro work on commit, merge and push.',
+    parity: {
+      label: 'Kiro',
+      checked: '2026-10-04',
+      features: {
+        sessionContext: ['yes'],
+        promptContext: ['yes'],
+        answers: ['no', 'Kiro has no event for a permission. Holding every tool call would stop Kiro.'],
+        carryOn: ['yes'],
+        agents: ['part', 'Kiro has no events for helper agents. Only Kiro CLI reports session end.'],
+        checkin: ['no', 'Kiro cannot wake an idle session later.'],
+        skills: ['yes'],
+        mcp: ['yes'],
+      },
+    },
+    description: 'Kiro hooks report every tool call, prompt and turn end, in the IDE and in Kiro CLI. TeamFlow adds your ticket to the chat and tells Kiro the next plan step.',
   },
   {
     id: 'qwen',

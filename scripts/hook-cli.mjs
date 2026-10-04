@@ -29,10 +29,12 @@ import fs from 'node:fs';
 import path from 'node:path';
 
 import { ADAPTERS, noticeFor, PASSIVE_STDOUT } from './adapters.mjs';
-import { failOpen, handleEvent, readStdin } from './hook-core.mjs';
+import { claudeContext, failOpen, handleEvent, readStdin } from './hook-core.mjs';
 import {
   dataDir, loadConfig, readJson, repositoryRoot, safeExec, transportOf, writeJson,
 } from './core.mjs';
+import { BY_ID } from './tools.mjs';
+import { drivenBy } from './driven.mjs';
 
 /**
  * The quietest failure the plugin has, said in the one channel each
@@ -222,6 +224,80 @@ export function runTestCommand(config, cwd, echo = (text) => process.stderr.writ
   return { command, ok: result.ok, output: output.slice(-4000) };
 }
 
+// --- the modes whose output a tool acts on (MACLEOD-972) ---------------
+//
+// Only for a tool that sends Claude Code's own envelope (`envelope` in
+// tools.mjs), because only there is the output Claude Code's decision
+// fields, which that tool documents as its own. Today that is Codex.
+const claudeEnvelope = (tool) => BY_ID[tool]?.envelope === 'claude-code';
+
+// The events whose output is context for the model, as hook-core's FAST.
+const CONTEXT_EVENTS = new Set(['SessionStart', 'UserPromptSubmit']);
+
+/**
+ * The answer to a permission request, from TeamFlow, or undefined.
+ *
+ * The same waiting as answer-hook.mjs for Claude Code (MACLEOD-848/946),
+ * given the adapter's event so the question id matches the one the
+ * report path sent. What comes back is kept only if it is a
+ * PermissionRequest decision: Codex reads
+ * `hookSpecificOutput.decision.behavior` "allow" or "deny", and nothing
+ * here can make anything else. No answer is no output, and Codex asks in
+ * its own way. Never a default Allow; nothing received reaches a shell.
+ */
+export async function answerFor(tool, payload = {}, { wait, on } = {}) {
+  if (!claudeEnvelope(tool) || payload.hook_event_name !== 'PermissionRequest') return undefined;
+  const twoWay = await import('./two-way.mjs');
+  if (!(on ?? twoWay.twoWaySwitch().on)) return undefined;
+  if (drivenBy(payload, process.env, payload.cwd)) return undefined;
+  const event = ADAPTERS[tool](payload, { cwd: payload.cwd });
+  if (!event) return undefined;
+  const output = await (wait || twoWay.waitForAnswer)(event);
+  const decision = output?.hookSpecificOutput;
+  if (decision?.hookEventName !== 'PermissionRequest') return undefined;
+  if (!['allow', 'deny'].includes(decision.decision?.behavior)) return undefined;
+  return output;
+}
+
+async function runMode(tool, mode) {
+  if (!claudeEnvelope(tool)) return;
+  const payload = await readStdin();
+  if (mode === 'answer') {
+    const output = await answerFor(tool, payload);
+    if (output) process.stdout.write(JSON.stringify(output));
+    return;
+  }
+  if (mode === 'continue') {
+    if (!['Stop', 'SubagentStop'].includes(payload.hook_event_name)) return;
+    const event = ADAPTERS[tool](payload, { cwd: payload.cwd });
+    if (!event) return;
+    // Codex's session id is its own, kept whole as the adapter keeps it,
+    // so the continue check finds the session the reports wrote.
+    const output = await (await import('./continue.mjs')).stopOutput(event);
+    if (output) process.stdout.write(output);
+  }
+}
+
+/**
+ * One JSON object for a context event: the context Claude Code would get,
+ * plus the day's sign-in notice, if this run claimed it. Codex reads one
+ * object; two would be invalid output.
+ */
+function contextOutput(result, said) {
+  let out = {};
+  try {
+    // signedIn is passed as true: the sign-in line meant for Claude Code
+    // names a slash command, and Codex has the person-facing notice below.
+    const text = claudeContext(result.event, result.state, result.justBound, undefined,
+      result.project, true, result.refused, result.credentialRefused, result.notices);
+    if (text) out = JSON.parse(text);
+  } catch { out = {}; }
+  if (said) {
+    try { out = { ...JSON.parse(said), ...out }; } catch { /* the context alone */ }
+  }
+  return Object.keys(out).length ? JSON.stringify(out) : '';
+}
+
 export async function run(argv = process.argv.slice(2), { cwd = process.cwd() } = {}) {
   const options = parse(argv);
   const tool = options.for;
@@ -230,6 +306,10 @@ export async function run(argv = process.argv.slice(2), { cwd = process.cwd() } 
   // stderr is safe; stdout is not.
   if (!adapter) {
     process.stderr.write(`TeamFlow: no hook adapter for "${tool || '(none)'}". Known: ${Object.keys(ADAPTERS).sort().join(', ')}\n`);
+    return;
+  }
+  if (options.mode) {
+    await runMode(tool, options.mode);
     return;
   }
 
@@ -277,17 +357,75 @@ export async function run(argv = process.argv.slice(2), { cwd = process.cwd() } 
     if (notice && passive) process.stdout.write(passive);
     throw error;
   }
-  if (notice) process.stdout.write(sayOnce(tool, payload, notice) ?? passive);
+  // A context event of a tool whose output reaches the model (MACLEOD-972)
+  // writes once, after the pipeline: the context and the notice go out as
+  // one JSON object. Its passive value is empty, so nothing was written yet.
+  // Copilot answers on the same stdout, so its notice waits too and travels
+  // in the one object copilot.mjs writes at the end. A tool that reads an
+  // answer back (Cursor) prints once, after the report, the same way.
+  const speaks = Boolean(BY_ID[tool]?.context) && claudeEnvelope(tool)
+    && CONTEXT_EVENTS.has(eventNameOf(payload)) && !passive;
+  const answers = tool === 'cursor';
+  const said = notice ? sayOnce(tool, payload, notice) : undefined;
+  if (notice && !speaks && !answers && tool !== 'copilot') process.stdout.write(said ?? passive);
 
   const context = { cwd: root, event: options.event, config };
   if (tool === 'git' && options.event === 'pre-push') context.test = runTestCommand(config, root);
 
   const event = adapter(payload, context);
-  if (!event) return;
+  if (!event && !answers) {
+    if (said && (speaks || tool === 'copilot')) process.stdout.write(said);
+    return;
+  }
   // Which tool this is, so the report can name it (MACLEOD-532). After the
   // spread rather than before: the adapter translates the tool's payload and
-  // has no business deciding what the tool is called.
-  await handleEvent({ cwd: root, ...event, reporter_tool: tool });
+  // has no business deciding what the tool is called. The context flag is
+  // the tool's, or the adapter's for one event (Cursor's session start).
+  let result;
+  try {
+    if (event) {
+      result = await handleEvent({
+        cwd: root, ...event, reporter_tool: tool,
+        reporter_context: Boolean(BY_ID[tool]?.context || event.reporter_context),
+      });
+    }
+  } finally {
+    if (answers) {
+      let out;
+      try {
+        const { respond } = await import('./cursor.mjs');
+        out = await respond({ payload, event: event && { cwd: root, ...event }, result, said });
+      } catch { /* the passive value, below */ }
+      process.stdout.write(out ?? said ?? passive);
+    }
+  }
+  if (answers) return;
+  if (tool === 'copilot') {
+    const { copilotOutput } = await import('./copilot.mjs');
+    const out = await copilotOutput({ event: event.hook_event_name, input: { cwd: root, ...event }, result, said });
+    if (out) process.stdout.write(out);
+    return;
+  }
+  // Kiro reads stdout back: context on SessionStart and UserPromptSubmit,
+  // and a continue on Stop (MACLEOD-972). kiro.mjs says why. A session
+  // another tool drives hears nothing that could steer it (MACLEOD-908).
+  if (tool === 'kiro') {
+    if (!drivenBy(event, process.env, root)) {
+      const { kiroOutput } = await import('./kiro.mjs');
+      const out = await kiroOutput(event, result);
+      if (out) process.stdout.write(out);
+    }
+    return;
+  }
+  if (!speaks) return;
+  // A session another tool drives still reports, and hears nothing that
+  // could steer it (MACLEOD-908), as in hook.mjs.
+  if (drivenBy(event, process.env, root)) {
+    if (said) process.stdout.write(said);
+    return;
+  }
+  const output = contextOutput(result || {}, said);
+  if (output) process.stdout.write(output);
 }
 
 export async function main(argv = process.argv.slice(2)) {

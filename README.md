@@ -33,9 +33,10 @@ No hook files are separately injected into a developer repository, so there are 
 ## What happens automatically
 
 In Claude Code, from the plugin's own hooks. In Cursor, Copilot,
-Windsurf, Cline, Codex CLI, Gemini CLI and JetBrains Junie, from the
-hooks `skills install --for <tool>` writes for them. See "Reporting from
-anything else" below.
+Windsurf, Cline, Codex CLI, Gemini CLI, JetBrains Junie and Kiro, from
+the hooks `skills install --for <tool>` writes for them. Cursor, Codex,
+Copilot and Kiro also get some of the steps below, as far as their hooks
+allow. See "Reporting from anything else" below.
 
 1. `SessionStart` restores/detects a tenant-scoped issue binding from a manual override, prompt, branch or recent commit.
 2. The bundled Atlassian v2, Linear and GitHub MCP servers are available for issue context; authenticate the one you use once through `/mcp`.
@@ -159,20 +160,49 @@ npx -y github:macleodlabs-ai/teamflow-plugin skills install --for cursor
 ```
 
 `--for` takes `cursor`, `codex`, `gemini`, `copilot`, `windsurf`,
-`cline`, `zed`, `jetbrains`, `claude-desktop` and `aider`. It writes the
+`cline`, `zed`, `jetbrains`, `claude-desktop`, `aider`, `grok`,
+`codex-ide`, `opencode`, `openhands`, `pi`, `kiro`, `qwen` and
+`claude-code`. It writes the
 skills where that tool discovers them, or generates the rules file it
 reads from the same `SKILL.md` sources; registers the MCP server in that
 tool's own format; and, where the tool has a hook system, writes its
 hook configuration too. `--dry-run` shows the file list first. Per-tool
 detail is in `docs/CLIENTS.md`.
 
-Eight of the eleven clients report automatically:
+Nine of the eighteen clients report automatically:
 
 | Level | Tools |
 | --- | --- |
-| Hooks, per tool call | Claude Code, Cursor, VS Code + Copilot and Copilot CLI, Windsurf, Cline, Codex CLI, Gemini CLI, JetBrains Junie |
-| Git hooks, per commit | Zed, Aider, and anything else |
+| Hooks, per tool call | Claude Code, Cursor, VS Code + Copilot and Copilot CLI, Windsurf, Cline, Codex CLI, Gemini CLI, JetBrains Junie, Kiro (IDE and CLI) |
+| Git hooks, per commit | Zed, Aider, the Codex IDE extension, Grok Build, OpenCode, OpenHands, Pi, Qwen Code, and anything else |
 | Rules only | Claude Desktop's chat side |
+
+`teamflow hooks install --for <tool>` writes only the hooks. Run it
+again after an update to add new hook events. `teamflow doctor` names
+each event an install lacks, and `teamflow hooks status` lists them as
+missing.
+
+### More than reports: Cursor, Codex, Copilot and Kiro
+
+These four tools read some hook output back, so they get part of what
+the Claude Code plugin does. This comes from each vendor's
+documentation, checked 2026-10-04. None of the four has run with
+TeamFlow yet.
+
+| | Claude Code | Cursor | Codex | GitHub Copilot | Kiro |
+| --- | --- | --- | --- | --- | --- |
+| Ticket and lead notes at session start | Yes | Yes | Yes | Yes | Yes |
+| Ticket and project with each prompt | Yes | No | Yes | No | Yes |
+| Allow or Deny from TeamFlow | Yes | No | Yes | Copilot CLI only | No |
+| Plan goes on when a turn ends | Yes | Yes | Yes | Helper agents only | Yes |
+| Helper agents and session end on the board | Yes | Yes | Yes | Partly | Partly |
+| One-minute check-in | Yes | No | No | No | No |
+| Skills and MCP server | Yes | Yes | Yes | Yes | Yes |
+
+An answer from TeamFlow is only ever a person's Allow or Deny. No tool
+allows by default. The check-in needs a hook that wakes an idle session
+later, and only Claude Code has one. `docs/TOOL_PARITY.md` lists the
+events, the fields and the vendor's words for every cell.
 
 The hooks call `teamflow hook --for <tool>`, which translates that
 tool's payload into the one shape `classifyTool` reads. There is one

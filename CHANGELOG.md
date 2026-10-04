@@ -3,6 +3,26 @@
 What changed in each published version of the TeamFlow plugin, newest first.
 Only what a person using it would notice.
 
+## 0.3.66
+
+- **Cursor, Codex, Copilot and Kiro do more.** Each one now gets as much
+  as its own hooks allow. `docs/TOOL_PARITY.md` lists what each tool
+  gets and what it cannot get.
+- **Session start.** All four get the same opening context as Claude
+  Code: the ticket, notes from a lead, the project and the sign-in notice.
+- **Each prompt.** Codex and Kiro also get the ticket and project with
+  each prompt.
+- **Allow or Deny from TeamFlow.** Codex and Copilot CLI wait for a
+  person to press Allow or Deny in TeamFlow. They never allow by default.
+- **The plan carries on.** When a turn ends and the plan has a next step,
+  Cursor, Codex and Kiro go on to it. Copilot does this for subagents.
+- **Kiro uses its own hooks now**, in the Kiro IDE and the Kiro CLI, not
+  only git commits.
+- **More on the board.** Prompts, subagents, compaction and session end
+  are reported where the tool sends them.
+- **`teamflow doctor` names missing hook events** for each tool. Run
+  `teamflow hooks install --for <tool>` again to add them.
+
 ## 0.3.65
 
 - **Everything is a project.** The Plans tab is now Projects. It lists

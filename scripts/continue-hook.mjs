@@ -37,15 +37,8 @@ if (watching && ((input.hook_event_name && input.hook_event_name !== 'Stop')
     || drivenBy(input, process.env, input.cwd))) process.exit(0);
 
 const { failOpen } = await import('./hook-core.mjs');
-const { blockOutput, decide, logDirection, noteDirection, noteHeld, record, recordWait } = await import('./continue.mjs');
+const { stopOutput } = await import('./continue.mjs');
 const { readJson, sessionPath } = await import('./core.mjs');
-const { acquireLock, runsLockPath } = await import('./dispatch.mjs');
-
-const lock = (fn) => {
-  const release = acquireLock(runsLockPath(), { waitMs: 500 });
-  if (!release) return { locked: false };
-  try { return { locked: true, value: fn() }; } finally { release(); }
-};
 
 await failOpen(async () => {
   if (watching) {
@@ -61,17 +54,6 @@ await failOpen(async () => {
     }
     return;
   }
-  const decision = decide(input);
-  if (!decision.continue) {
-    if (input.hook_event_name === 'Stop') noteHeld(input.session_id, decision.why);
-    // Nothing ready, or waiting: what it waits for goes in the run's log.
-    if (decision.direction) logDirection(decision.direction, decision.config, { lock });
-    if (decision.direction?.kind === 'wait') {
-      recordWait(input.session_id, decision.agentKey, decision.direction);
-      noteDirection(input.session_id, decision.agentKey, decision.direction);
-    }
-    return;
-  }
-  record(decision, { lock });
-  process.stdout.write(blockOutput(decision.direction));
+  const output = await stopOutput(input);
+  if (output) process.stdout.write(output);
 });

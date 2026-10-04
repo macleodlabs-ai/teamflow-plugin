@@ -29,6 +29,8 @@ import { fetchAccount, gitInfo, loadConfig, safeExec, transportOf } from './core
 // hook on the machine, and this module is imported by all of them.
 import * as core from './core.mjs';
 import { BY_ID } from './tools.mjs';
+import { WAIT_MAX_S } from './two-way.mjs';
+import { CURSOR_EVENTS } from './cursor.mjs';
 import {
   mergeJson, removeBlock, removeEmptyDir, removeFile, unmergeJson, writeBlock, writeFile,
 } from './write.mjs';
@@ -314,9 +316,9 @@ export function shimScript(tool, { inRepository = true } = {}) {
 # a TeamFlow outage, a missing node or an unreachable network can never
 # block an edit, a command or a turn.
 ${inRepository ? CD_TO_ROOT : ''}if command -v teamflow >/dev/null 2>&1; then
-  teamflow hook --for ${tool}
+  teamflow hook --for ${tool} "$@"
 else
-  npx -y ${PACKAGE} hook --for ${tool}
+  npx -y ${PACKAGE} hook --for ${tool} "$@"
 fi
 exit 0
 `;
@@ -390,6 +392,10 @@ const entry = {
   typed: (command, extra = {}) => ({ type: 'command', command, ...extra }),
 };
 
+// Copilot's PermissionRequest waits for an answer from TeamFlow; the same
+// sum as COPILOT_ANSWER_TIMEOUT_S in copilot.mjs (MACLEOD-972).
+const COPILOT_ANSWER_TIMEOUT_S = WAIT_MAX_S + 20;
+
 // The Windows half of an entry, for the tools that name a field for it.
 const windows = (tool) => ({ powershell: shimRef(tool, 'ps1') });
 
@@ -408,29 +414,22 @@ export const HOOK_SPECS = {
     // On POSIX the .ps1 execs `true` and reports nothing, so exactly one
     // of the two ever reports and the board never double-counts.
     const both = () => [entry.bare(shimRef('cursor')), entry.bare(shimRef('cursor', 'ps1'))];
+    // Every event in CURSOR_EVENTS (MACLEOD-972): the reports, plus
+    // the two Cursor reads an answer from — sessionStart's
+    // `additional_context` and stop's `followup_message` — and
+    // afterAgentResponse, whose text the stop check needs. Never
+    // beforeShellExecution, beforeMCPExecution or preToolUse: they fire
+    // before every command, and a hook there could only hold every
+    // command up or decide for the person (docs/TOOL_PARITY.md).
     return {
-      covers: 'file edits, finished tool calls, finished shell commands and turn end',
+      covers: 'session start, prompts, file edits, finished tool calls, finished shell commands, agents, compaction, turn end and session end',
       targets: [
         ...shims(root, 'cursor'),
         {
           file: path.join(root, '.cursor', 'hooks.json'),
           json: {
             version: 1,
-            hooks: {
-              // Registered for the sign-in notice and nothing else: it
-              // reports no stage, which is why it is not in this tool's
-              // `events` in tools.mjs. Cursor documents
-              // `additional_context` on it as "additional context to
-              // add to the conversation's initial system context",
-              // which is once a session and at the start of it
-              // (MACLEOD-569).
-              sessionStart: both(),
-              afterFileEdit: both(),
-              postToolUse: both(),
-              postToolUseFailure: both(),
-              afterShellExecution: both(),
-              stop: both(),
-            },
+            hooks: Object.fromEntries(CURSOR_EVENTS.map((event) => [event, both()])),
           },
         },
       ],
@@ -449,9 +448,9 @@ export const HOOK_SPECS = {
     // `powershell` is Copilot CLI's own field for the Windows form of a
     // hook. VS Code's half of this file does not document it and ignores
     // the extra key, so one entry shape serves both dialects.
-    const hook = () => [entry.typed(ref, windows('copilot'))];
+    const hook = (extra = {}) => [entry.typed(ref, { ...windows('copilot'), ...extra })];
     return {
-      covers: 'finished tool calls and turn end, in VS Code and in Copilot CLI',
+      covers: 'session start and end, prompts, permission requests, agents, finished tool calls and turn end in VS Code and Copilot CLI',
       targets: [
         ...shims(root, 'copilot'),
         {
@@ -459,6 +458,20 @@ export const HOOK_SPECS = {
           json: {
             version: 1,
             hooks: {
+              // MACLEOD-972. PascalCase only: Copilot CLI documents each
+              // of these beside its camelCase name with VS Code's fields,
+              // and only this spelling carries the event's name. No
+              // PreToolUse: a Copilot CLI preToolUse hook that crashes
+              // denies the tool, and TeamFlow has nothing to say there.
+              SessionStart: hook(),
+              UserPromptSubmit: hook(),
+              // Copilot CLI only; VS Code documents no such event. It
+              // waits for an answer from TeamFlow, so it gets the longest
+              // wait; the default is 30 s and a timeout fails open.
+              PermissionRequest: hook({ timeout: COPILOT_ANSWER_TIMEOUT_S }),
+              SubagentStart: hook(),
+              SubagentStop: hook(),
+              SessionEnd: hook(),
               PostToolUse: hook(),
               PostToolUseFailure: hook(),
               Stop: hook(),
@@ -506,17 +519,47 @@ export const HOOK_SPECS = {
 
   // Codex copied Claude Code's hooks wholesale, matcher shape included,
   // so this is the one config here that would be recognisable to
-  // somebody who only knows plugin/hooks/hooks.json.
+  // somebody who only knows plugin/hooks/hooks.json — and since
+  // MACLEOD-972 it registers the same events that file does, wherever
+  // Codex has them (https://learn.chatgpt.com/docs/hooks, 2026-10-04).
+  //
+  // The same split as Claude Code's: reporting runs in the background
+  // (`async`), and the two handlers whose output Codex acts on run
+  // synchronously. `--mode answer` waits for an answer from TeamFlow on a
+  // PermissionRequest and prints Codex's own decision, or nothing;
+  // `--mode continue` prints `decision: "block"` on a stop only when the
+  // plan has work ready. SessionStart and UserPromptSubmit are synchronous
+  // because their output is the context. SessionEnd keeps Codex's own
+  // one-second default. PostToolUse and the Stop report stay synchronous,
+  // as the first install wrote them: PostToolUse's `systemMessage` carries
+  // the sign-in notice.
   codex: (root) => {
     const ref = shimRef('codex');
-    const matched = (matcher) => ({ matcher, hooks: [entry.typed(ref)] });
+    const one = (...hooks) => [{ hooks }];
+    const background = entry.typed(ref, { async: true });
+    const cont = entry.typed(`${ref} --mode continue`, { timeout: 5 });
     return {
-      covers: 'finished tool calls and turn end',
+      covers: 'session start, prompts, permission requests and answers, finished tool calls, agents, compaction, turn end and session end',
       targets: [
         ...shims(root, 'codex'),
         {
           file: path.join(root, '.codex', 'hooks.json'),
-          json: { hooks: { PostToolUse: [matched('*')], Stop: [{ hooks: [entry.typed(ref)] }] } },
+          json: {
+            hooks: {
+              SessionStart: one(entry.typed(ref, { timeout: 5 })),
+              UserPromptSubmit: one(entry.typed(ref, { timeout: 3 })),
+              // Two-way waits at most 300 s (two-way.mjs WAIT_MAX_S).
+              PermissionRequest: one(background, entry.typed(`${ref} --mode answer`, { timeout: 320 })),
+              PostToolUse: [{ matcher: '*', hooks: [entry.typed(ref)] }],
+              SubagentStart: one(background),
+              SubagentStop: one(background, cont),
+              PreCompact: one(background),
+              // The report group is the one the 2026-09-18 install wrote, so
+              // a reinstall merges into it rather than reporting twice.
+              Stop: [...one(entry.typed(ref)), ...one(cont)],
+              SessionEnd: one(entry.typed(ref)),
+            },
+          },
         },
       ],
     };
@@ -550,6 +593,43 @@ export const HOOK_SPECS = {
               PreToolUse: [{ matcher: '*', hooks: [entry.typed(sh, { timeout: 10 })] }],
               Stop: [{ hooks: [entry.typed(sh, { timeout: 10 })] }],
             },
+          },
+        },
+      ],
+    };
+  },
+
+  // Kiro IDE and Kiro CLI read every `.kiro/hooks/*.json` in the project
+  // ("Hooks activate automatically when a session starts"), so TeamFlow
+  // owns one file of its own there. The schema is a `v1` array, not an
+  // object keyed by event, and a command runs in the project root.
+  // SessionStart and UserPromptSubmit are registered for their context,
+  // Stop for the plan's next step (kiro.mjs). PreToolUse is never
+  // registered: TeamFlow does not gate Kiro's tool calls. No matcher,
+  // because Kiro's matcher is a regex and none means "all tools".
+  kiro: (root) => {
+    const ref = shimRef('kiro');
+    const hook = (trigger, name) => ({
+      name: `teamflow-${name}`,
+      trigger,
+      action: { type: 'command', command: ref },
+      timeout: 10,
+    });
+    return {
+      covers: 'every tool call, prompt, turn end and session boundary, in the IDE and in Kiro CLI',
+      targets: [
+        ...shims(root, 'kiro'),
+        {
+          file: path.join(root, '.kiro', 'hooks', 'teamflow.json'),
+          json: {
+            version: 'v1',
+            hooks: [
+              hook('SessionStart', 'session-start'),
+              hook('UserPromptSubmit', 'prompt'),
+              hook('PostToolUse', 'tool'),
+              hook('Stop', 'stop'),
+              hook('SessionEnd', 'session-end'),
+            ],
           },
         },
       ],
@@ -679,9 +759,58 @@ export function detectedTools(root = process.cwd()) {
     .map(([tool]) => tool);
 }
 
+/**
+ * The events this tool's hooks config should name and does not
+ * (MACLEOD-972). An install from before a tool gained events still has
+ * the file, so "the file exists" is not "it is installed". Only a config
+ * that exists is read; a missing file is the other check's finding.
+ * Every hooks file of the tool is read (Copilot has two). Empty for a
+ * tool whose config is not a `hooks` object of events.
+ */
+export function missingEvents(tool, root = process.cwd()) {
+  if (!HOOK_SPECS[tool]) return [];
+  return HOOK_SPECS[tool](root).targets.flatMap((target) => missingIn(target));
+}
+
+function missingIn(target) {
+  if (!target.json?.hooks || !fs.existsSync(target.file)) return [];
+  let have;
+  try { have = JSON.parse(fs.readFileSync(target.file, 'utf8'))?.hooks || {}; } catch { return Object.keys(target.json.hooks); }
+  return Object.keys(target.json.hooks)
+    .filter((event) => !JSON.stringify(have[event] ?? '').includes('teamflow'));
+}
+
+/** Doctor's line about Codex's hooks, or undefined when this repository shows no sign of Codex. */
+export function codexHooksLine(root = process.cwd()) {
+  if (!detectedTools(root).includes('codex')) return undefined;
+  const file = path.join(root, '.codex', 'hooks.json');
+  if (!fs.existsSync(file)) return 'not installed. Run `teamflow hooks install --for codex`.';
+  const missing = missingEvents('codex', root);
+  if (missing.length) return `missing ${missing.join(', ')}. Run \`teamflow hooks install --for codex\`, then trust the hooks in Codex with /hooks.`;
+  return 'all events set. Codex asks you to trust new hooks once, with /hooks.';
+}
+
 // What `teamflow hooks status` prints: one row per tool this repository
 // shows a sign of, plus the git fallback, plus whether the pre-push
 // half of it can do anything.
+/**
+ * The doctor line for Cursor (MACLEOD-972): undefined when this
+ * repository has no `.cursor/hooks.json`, otherwise whether every event
+ * the installer writes is there. A file from an older install reports
+ * but cannot answer, and nothing else would say so.
+ */
+export function cursorHooksLine(root = process.cwd()) {
+  const file = path.join(root, '.cursor', 'hooks.json');
+  if (!fs.existsSync(file)) return undefined;
+  let hooks = {};
+  try { hooks = JSON.parse(fs.readFileSync(file, 'utf8'))?.hooks || {}; } catch { /* read as empty */ }
+  const ours = (event) => (Array.isArray(hooks[event]) ? hooks[event] : [])
+    .some((one) => String(one?.command || '').includes('teamflow'));
+  const missing = CURSOR_EVENTS.filter((event) => !ours(event));
+  if (!missing.length) return `all ${CURSOR_EVENTS.length} Cursor events are set up`;
+  return `Cursor is missing ${missing.join(', ')}. Run \`teamflow hooks install --for cursor\` to add them.`;
+}
+
 export function hooksStatus(root = process.cwd(), config = {}) {
   const detected = detectedTools(root);
   const git = gitHooksInstalled(root);
@@ -694,9 +823,13 @@ export function hooksStatus(root = process.cwd(), config = {}) {
       return { tool, label: spec.name, automation: 'git-hooks', installed: false, covers: 'no hook system; use the git fallback' };
     }
     const { targets, covers } = HOOK_SPECS[tool](root);
-    const installed = targets.every((t) => fs.existsSync(t.file)
+    const missing = missingEvents(tool, root);
+    const installed = !missing.length && targets.every((t) => fs.existsSync(t.file)
       && fs.readFileSync(t.file, 'utf8').includes('teamflow'));
-    return { tool, label: spec.name, automation: 'hooks', installed, files: targets.map((t) => t.file), covers };
+    return {
+      tool, label: spec.name, automation: 'hooks', installed, files: targets.map((t) => t.file), covers,
+      ...(missing.length ? { missing } : {}),
+    };
   });
 
   return {

@@ -345,7 +345,9 @@ export async function watch(sessionId, { pollMs = 30_000, lifeMs = 25 * 60_000, 
 
 // --- the work, and the streak --------------------------------------------
 
-function streakPath(sessionId, agentKey) {
+// Exported for kiro.mjs: Kiro's Stop sends no `stop_hook_active`, so the
+// streak is read from this file instead (MACLEOD-972).
+export function streakPath(sessionId, agentKey) {
   return path.join(core.dataDir(), 'continue', `${core.digest(agentKey ? `${sessionId}--${agentKey}` : sessionId)}.json`);
 }
 
@@ -600,6 +602,35 @@ export async function publishDirections(config = {}, { publish } = {}) {
 /** The hook's output for a continue, exactly as Claude Code reads it. */
 export function blockOutput(direction) {
   return JSON.stringify({ decision: 'block', reason: direction.reason });
+}
+
+/**
+ * The synchronous stop check, whole: decide, keep what was decided, and
+ * return the line to print, or '' for none. continue-hook.mjs runs it for
+ * Claude Code and `teamflow hook --for codex --mode continue` for Codex,
+ * whose Stop and SubagentStop read the same `decision: "block"` line
+ * (MACLEOD-972).
+ */
+export async function stopOutput(input = {}) {
+  const { acquireLock, runsLockPath } = await import('./dispatch.mjs');
+  const lock = (fn) => {
+    const release = acquireLock(runsLockPath(), { waitMs: 500 });
+    if (!release) return { locked: false };
+    try { return { locked: true, value: fn() }; } finally { release(); }
+  };
+  const decision = decide(input);
+  if (!decision.continue) {
+    if (input.hook_event_name === 'Stop') noteHeld(input.session_id, decision.why);
+    // Nothing ready, or waiting: what it waits for goes in the run's log.
+    if (decision.direction) logDirection(decision.direction, decision.config, { lock });
+    if (decision.direction?.kind === 'wait') {
+      recordWait(input.session_id, decision.agentKey, decision.direction);
+      noteDirection(input.session_id, decision.agentKey, decision.direction);
+    }
+    return '';
+  }
+  record(decision, { lock });
+  return blockOutput(decision.direction);
 }
 
 /** The `teamflow status` line. */
