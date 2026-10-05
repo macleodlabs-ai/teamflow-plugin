@@ -127,6 +127,7 @@ The account behind the credential being the tenant also decides what the plugin 
 - parent/related keys
 - actor, repository and branch
 - `git`: `branch`, `head.sha` and `head.subject`, `commitsSinceMain`, `ahead`, `behind`, `pushed`, `dirty` — where the branch stands, as counts and flags. Derived state: a count of commits is not the commits, and the subject line is capped at one line's length so a hunk cannot ride in as prose.
+- `projectId` (MACLEOD-982): the id (`prj-…`) of the project the reporting session was pinned to when it minted or bound the card. An id only. The service lists the key in that project's `cards` unless a project that links the card's tracker project owns it (the owner rule, docs/PROJECTS.md section 7).
 - `spend`: `id`, `model`, `input`, `output`, `cacheRead`, `cacheWrite`, `usd` — what the AI model used on the card in one session, as token counts, an estimated cost and the model id (MACLEOD-882, below). Numbers and a name, never a word from the session.
 - `pr`: `number`, `url`, `state`, `mergeable`, `checks.{passing,failing,pending}`, `review` — what the forge already publishes about the pull request. Derived state: how many checks are in each state, never which ones and never their output.
 - `testFirst` and `risk` (MACLEOD-968): what the hooks learned about a ticket's work, for its saved process. `testFirst` is one of `proved` (a failing test run before the code change, a passing one after), `red` (only the failing run so far), `none`, or `not_needed` (the work changed no code: only docs, text, images or lock files, so no test is written first). `risk` is a list drawn only from `auth`, `money`, `reporting` and `infra`: the areas the work touched, judged on the machine from the paths it edited. Words from closed sets; the paths, the test names and their output never leave the machine. Any other value refuses the report, like every other enum here. A later report that leaves either field out keeps the card's last one.
@@ -387,9 +388,9 @@ It may carry:
 - `phases[]`: `n`, `state`, `tickets[]`
 - `origin` — `auto` when the plugin created the run itself because a session dispatched agents with no run to hold them (MACLEOD-639). Absent on every run a person created. The board draws an `auto` run as unplanned: its nodes are real, its edges are unknown until `teamflow workflow depends` draws them. `tickets[].addedBy` gains `dispatch` for the same reason: a node the hooks put in the pool because an agent was sent to work on it. Its title is the agent's label and one-line task as the launch registry already carries them, capped like any summary: the label at 64 characters and the task (the `Agent` tool's `description`) at 80, each collapsed to one line; the prompt the agent was given is not an input to it
 - `directions[]` — what auto-continue told a session to do next (MACLEOD-726): `at`, `kind` (`fix`, `points`, `finish`, `next`, `waiting`; and for an agent told to wait, MACLEOD-733, `start` and `wait`), `key` (absent on `waiting`) and `said` (≤ 240), capped at 20. `said` is the plugin's own fixed words with keys, step names, counts and the run's name reduced to plain characters; never a title, a point's text, a note or anything else the service sent. `continued` is how many times the plugin kept a session going on this run. The Progress view reads both
-- `origin` may also be `track` (MACLEOD-936): a run the plugin found rather than one anybody made. An `auto` run becomes a track too; it keeps its id and its `auto`.
-- `track` — one person's threads grouped into an impromptu project (MACLEOD-936). `members[]` (`id` and `kind`: `session` or `agent`; the same ids every execution already carries; at most 50), `state` (`active`, `quiet` or `ended`), `by[]` (the names of the signals that joined it: `person`, `project`, `parent`, `run`, `ticket`, `branch`, `files`, `waits`), `startedAt`, `lastAt`, `endedAt`, and `named` and `mergedInto` once a person renamed or merged it. The grouping runs on the machine. File names are hashed there and never sent; branch names, prompts and agent descriptions are inputs to it and never outputs. The name is the tickets' titles or the first agent's description, both already reported. The same repository in the same hour joins nothing on its own. `WORKFLOW_CARRIED` keeps `track` when a run republishes without it, and a person's rename, merge, split or move (`/v1/members/tracks/{id}/…`, kept in `tracks/corrections.json`) is re-applied to every later report until the machine has pulled it.
-- `track.members[].kind` may also be `task` (MACLEOD-970, docs/PROJECTS.md): one thing a person asked for and the edits, agents and commits it caused. Its id is `<Claude Code session id>#<n>` (at most 80 characters), keyed by the session and never by the account, so a rotated session keeps its tasks. A session that has tasks is sent as its tasks, not as one `session` member. `track.project` (optional) is a formal project id (`prj-…`): the track is this person's lane in that project, not an informal project of its own. The track's `name` is the name Claude passed to `teamflow task new "<name>"` or a person gave (`named: true`), else the formal project's name. Nothing else about a task travels: the prompt is read on the machine only to tell a slash command or a one-word reply from work, and is never stored or sent; file names are hashed and stay on the machine.
+- `project` and `thread` (MACLEOD-982): the project (`prj-…`) and thread (`th-` and 8 hex) the plan belongs to. Ids only. The service makes the thread in that project, as the plan's, when the project does not have it yet. `WORKFLOW_CARRIED` keeps both when a run republishes without them.
+- `track` (plugins up to 0.3.67, MACLEOD-936): **never stored any more** (MACLEOD-982). A workflow report with a `track` block is translated where it arrives and answered ACCEPTED, so an old plugin keeps working: with no `track.project` it becomes or updates the project `prj-` + the first 8 hex of `sha256("track:" + id)`, with one thread named as the track; with `track.project` it becomes or updates the thread `th-` + the first 8 hex of `sha256("thread:" + id)` in that project. Only `state`, `startedAt`, `lastAt`, `endedAt` and `project` are read; `members[]`, `by[]` and the rest are dropped by the walker. The old track ids map to their new homes at `GET /v1/members/projects/aliases`.
+- `migratedTo` `{project, thread?}` and `status: "archived"`: set by the projects migration (`projects.migrate`) on an old track document, which keeps its body and leaves every list.
 
 **The user's order does not travel.** The order is a prompt, and the rule
 above admits no exception for this one: it selects tickets on the machine and
@@ -439,6 +440,7 @@ stall, a crash or an orphaned agent from quiet work.
     "model": "<model name>", "claudeVersion": "<version>", "pluginVersion": "<version>",
     "agents": [ { "agentId", "name", "key", "stage", "status", "lastEventAt", "model" } ],
     "team": { "name": "<team name>", "teammates": [ { "name", "open": 0.., "done": 0.. } ] },   (≤ 20, MACLEOD-976)
+    "project": "<project id>", "thread": "<thread id>",    (the session's pin and its thread, MACLEOD-982)
     "setup": { "machine": "<12-hex digest>", "version": "3" | "3.1", "project": "<project id>",
                "claudeMd": "<16-hex digest>", "settings": "<16-hex digest>", "mcp": "<16-hex digest>",
                "drift": true | false, "missing": 0..100,
@@ -867,13 +869,15 @@ The workflow document's `status` gains `stalled`: a running run whose ticket sta
 
 ### What a lead asked, and what came of it
 
-`actions[]` on the issue document: `id`, `kind` (`fix`, `bump`, `rerun_gate`, `resume_plan`, `skip_gate`, and TeamFlow's own `tidy`, MACLEOD-770), `by`, `at`, `outcome` (`done`, `refused`, `failed`, `not_needed`: a fix or re-run whose step passed, or whose card moved on or finished, before it was shown, MACLEOD-726), `reason` (≤ 120), capped at 16. A lead acts from the dashboard; the service holds the intent for the machine that has the ticket (`GET /v1/members/actions?for=<machineId>`, answered per action at `POST /v1/members/actions/{id}/outcome`); the plugin performs what it can and this is its record. **The action's text never travels back**: a `fix` is shown to the agent on the machine and what the report carries is that it was shown; `reason` is the plugin's own sentence ("deploy runs only from the main session"). Nothing here is a queued command, and nothing here is executed from text.
+`actions[]` on the issue document: `id`, `kind` (`fix`, `bump`, `rerun_gate`, `resume_plan`, `skip_gate`, TeamFlow's own `tidy`, MACLEOD-770, `rebind` `{key, session}`, MACLEOD-973, and `pin` `{session, project, thread?}`, MACLEOD-982: a person moved a session to another project from the app, and the machine sets that session's own pin), `by`, `at`, `outcome` (`done`, `refused`, `failed`, `not_needed`: a fix or re-run whose step passed, or whose card moved on or finished, before it was shown, MACLEOD-726), `reason` (≤ 120), capped at 16. A lead acts from the dashboard; the service holds the intent for the machine that has the ticket (`GET /v1/members/actions?for=<machineId>`, answered per action at `POST /v1/members/actions/{id}/outcome`); the plugin performs what it can and this is its record. **The action's text never travels back**: a `fix` is shown to the agent on the machine and what the report carries is that it was shown; `reason` is the plugin's own sentence ("deploy runs only from the main session"). Nothing here is a queued command, and nothing here is executed from text.
 
 ### The project document
 
-`projects/<id>.json` is the fourth document kind. A project is an
-organisation-level named set: some GitHub repositories, some Linear projects,
-some Jira projects. A ticket belongs to it when its repository is one of the
+`projects/<id>.json` is the fourth document kind. There is one kind of
+project (MACLEOD-982, docs/PROJECTS.md): anything a person or team works
+on, tracked (linked to Linear, Jira or GitHub repositories) or not. It holds
+some GitHub repositories, some Linear projects, some Jira projects, and its
+threads. A ticket belongs to it when its repository is one of the
 project's repositories or its tracker project is one of its tracker projects,
 and the dashboard shows the active project and nothing else.
 
@@ -886,12 +890,17 @@ written by members, through routes:
 | Route | Who |
 | --- | --- |
 | `GET /v1/members/projects` | any member — which projects exist is navigation |
-| `POST /v1/members/projects` | owners and admins. The service mints the id |
-| `PUT /v1/members/projects/{id}` | owners and admins. Replaces the document whole |
-| `DELETE /v1/members/projects/{id}` | owners and admins. Removes the document and nothing else |
-| `POST /v1/members/projects/{id}/close` | owners and admins, signed in (MACLEOD-970). Sets `closed`; with tracker write-back on, marks its Linear projects completed |
-| `POST /v1/members/projects/{id}/reopen` | owners and admins, signed in. Clears `closed`; with write-back on, sets its Linear projects started |
-| `POST /v1/members/tracks/{id}/promote` | the track's person or an owner or admin, signed in. Makes a project from an informal one |
+| `POST /v1/members/projects` | any member while `settings/projects.json` `anyoneCreates` is on (the default), else owners and admins; never a viewer (MACLEOD-982). The service mints the id and sets `createdBy` from the credential. `link[]` `{provider, name, create?}` links trackers in the same call |
+| `PUT /v1/members/projects/{id}` | its `createdBy`, an owner or an admin. Replaces the document whole |
+| `DELETE /v1/members/projects/{id}` | the same. Removes the document and nothing else |
+| `POST /v1/members/projects/{id}/close` | the same, signed in (MACLEOD-970). Sets `closed` and ends its open threads; with tracker write-back on, marks its Linear projects completed |
+| `POST /v1/members/projects/{id}/reopen` | the same, signed in. Clears `closed`; with write-back on, sets its Linear projects started |
+| `POST /v1/members/projects/{id}/link` / `unlink` | the same. A tracker project the organisation's connection sees (404 `no_match`, 409 `ambiguous` with `matches`), or a GitHub repository. Linear is made only on `create` with tracker updates on |
+| `POST /v1/members/projects/{id}/threads[/{tid}[/move｜/merge]]` | any member makes a thread; its starter, the project's maker, an owner or an admin renames, ends, moves or merges it |
+| `POST /v1/members/cards/{key}/project` | the card's developer, the project's maker, an owner or an admin. Sets the card's explicit project; a tracker link still wins |
+| `POST /v1/members/sessions/{session}/pin` | the session's developer, an owner or an admin (as `rebind`). Queues the action `pin` |
+| `GET\|PUT /v1/members/settings/projects` | any member reads; an owner or admin, signed in, writes `anyoneCreates` |
+| `POST /v1/members/tracks/{id}/…`, `GET /v1/members/tracks/corrections` | gone (MACLEOD-982): 410 `gone` for 14 days, then removed |
 
 It may carry:
 
@@ -901,8 +910,10 @@ It may carry:
 - `jira[]`: `{ key, name }`
 - `default` — the project a member lands on until they choose. **Exactly one** may hold it: creating or saving a default clears the previous one
 - `createdAt`, `updatedAt` — set by the service, not by the body
-- `cards[]`: ad hoc keys (`ADHOC-<n>`) listed in a project made by promote (MACLEOD-970). A save that leaves it out keeps it
-- `closed` `{at, by, tracker?}`, `history[]` `{at, by, action, words}` (at most 50) and `promotedFrom` (the track's id) — the service's only (MACLEOD-970). A body never sets them, and a save keeps the stored ones. `tracker` is `sent` or `refused`: what Linear said when write-back was on
+- `cards[]`: keys whose explicit project this is (owner rule step 2, MACLEOD-982): set by the card route and by an issue report's `projectId`
+- `threads[]` (at most 200): `{id, name, state: active|quiet|ended, by: claude|person|plan|migration, createdAt, lastAt, endedAt?, plan?, createdBy?, cards?, mergedInto?}`. Names and ids only. Quiet after three days with no beat (the five-minute pass); ended by a person, a merge or the project closing; ended threads stay
+- `createdBy` (an address, from the caller) and `origin` `{track}` (the old track id, set by the migration and the old-plugin translation only)
+- `closed` `{at, by, tracker?}`, `history[]` `{at, by, action, words}` (at most 50), `createdBy`, `threads`, `origin` and `cards` — the service's only (MACLEOD-970, MACLEOD-982). A body never sets them, and a save keeps the stored ones. `tracker` is `sent` or `refused`: what Linear said when write-back was on. `promotedFrom` is gone: the migration moved it to `origin.track`
 
 Identifiers and display names, and nothing else. A project is filled in by a
 person in a dialog, which is exactly where a description, a README or a pasted
@@ -913,7 +924,7 @@ enforcement.
 Deleting a project deletes no ticket, no sidecar and no workflow. A project is
 a view.
 
-**A repository belongs to at most one project** (MACLEOD-565). A session is in
+**A repository is the default of at most one project** (MACLEOD-565; since MACLEOD-982 only a default: a pinned session's work counts in its project whatever the repository). A session is in
 one repository and `teamflow status` has to be able to name the project that
 session belongs to, so `POST` and `PUT` answer 409 `repo_taken` — naming the
 repository and the owning project's `id` and `name` — rather than letting two

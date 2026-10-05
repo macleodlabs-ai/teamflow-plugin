@@ -24,10 +24,13 @@
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import {
-  actor, actorsForKey, adoptWorkflow, fetchState, fitsRun, latestSessionForCwd, readWorkflows, reportScope,
-  resolveGithubRepo, saveSession, sendReport, trackerOf, unclaimedWorkflows, workflowsPath, writeWorkflows,
+  actor, actorsForKey, adoptWorkflow, fetchState, fitsRun, latestSessionForCwd, readJson as readFileJson, readWorkflows, reportScope,
+  resolveGithubRepo, saveSession, sendReport, sessionPath, trackerOf, unclaimedWorkflows, workflowsPath, writeWorkflows,
 } from './core.mjs';
-import { projectFor, projectsCachePath } from './project.mjs';
+import { fetchProjects, projectFor, projectsCachePath } from './project.mjs';
+import { cachedProjects, newThreadId } from './pin.mjs';
+import { matchProject } from './project-cli.mjs';
+import { isClosed, projectWords } from './pin-line.mjs';
 import {
   POINT_TEXT_MAX, POINTS_MAX, POINTS_PER_ROUND_MAX, advance, pointLine,
 } from './points.mjs';
@@ -82,10 +85,14 @@ export const USAGE = `teamflow workflow — the pool of tickets a run works thro
                                   [--state <s>] [--label <l>]
                                   [--order priority|rank|age] [--deploy]
                                   [--order-text <sentence>] [--process <id>]
+                                  [--in <project id|name>]
       Start a workflow. --order-text records what was asked for; it stays
       on this machine and is never published. --process names one of your
       organisation's saved processes; without it, the default applies.
       The run keeps that process even if somebody edits it later.
+      --in puts the plan in that TeamFlow project, in a thread of its own.
+      Without --in, the plan goes in this session's project. --project is
+      the tracker's project the tickets come from.
 
   teamflow workflow add <KEY> [--to <name>]
       Put a ticket in the pool by hand. This is the escape hatch for one
@@ -635,6 +642,11 @@ export function published(workflow) {
   // one (MACLEOD-639). The board draws it as unplanned -- a run with
   // nodes and no edges -- rather than as a plan somebody wrote.
   if (workflow.origin === 'auto') out.origin = 'auto';
+  // The project and thread it belongs to (MACLEOD-982): ids only.
+  if (/^prj-[0-9a-f]{8}$/.test(String(workflow.home?.project || ''))) {
+    out.project = workflow.home.project;
+    if (/^th-[0-9a-f]{8}$/.test(String(workflow.home.thread || ''))) out.thread = workflow.home.thread;
+  }
   const filter = pick(workflow.filter, ['tracker', 'project', 'state', 'label', 'order']);
   if (Object.keys(filter).length) out.filter = filter;
   if (workflow.scope) out.scope = pick(workflow.scope, ['deploy']);
@@ -765,6 +777,9 @@ export function create(name, args, state, owner, process) {
   // another project is kept out of it.
   if (state.place?.repo) workflow.repo = state.place.repo;
   if (state.place?.project) workflow.project = state.place.project;
+  // The pinned project and thread (MACLEOD-982), sent as `project` and
+  // `thread` on the plan document.
+  if (state.place?.pin?.project) workflow.home = { ...state.place.pin };
   state.workflows[workflow.id] = workflow;
   state.current = workflow.id;
   return workflow;
@@ -1691,6 +1706,8 @@ export async function main(args, {
   // What the hooks learned about a ticket, and how the organisation's
   // processes are read (MACLEOD-968). Passed in by tests.
   facts: factsOf, loadProcesses,
+  // The team's projects, for `create --in` (MACLEOD-982). Passed in by tests.
+  listProjects,
 } = {}) {
   const facts = factsOf || ((key) => readTicketFacts(key, { config, cwd }));
   const [sub = 'show', ...rest] = args;
@@ -1710,10 +1727,33 @@ export async function main(args, {
       print(chosen.error);
       return 1;
     }
+    // The TeamFlow project the plan goes in (MACLEOD-982), matched as
+    // `teamflow project use` matches: more than one match changes nothing.
+    let home;
+    const wanted = flag(rest, 'in');
+    if (wanted) {
+      const list = listProjects ? await listProjects(config) : await (async () => {
+        const got = await fetchProjects(config, { ttlMs: 0 });
+        return got?.ok ? got.projects || [] : cachedProjects(config).projects || [];
+      })();
+      const found = matchProject(list || [], wanted);
+      if (found.matches) {
+        print(`More than one project matches. Run it again with the id: ${found.matches.slice(0, 8).map((p) => `${p.id} ${projectWords(p)}`).join(', ')}.`);
+        return 1;
+      }
+      if (!found.project) { print('TeamFlow has no open project with that id or name. It started no workflow.'); return 1; }
+      if (isClosed(found.project)) { print(`Project "${found.project.name}" is closed. Reopen it in TeamFlow first.`); return 1; }
+      home = found.project;
+    }
     const workflow = create(name, rest, state, stated(config, info), chosen.process);
+    if (home) {
+      // A thread of its own in that project; the service makes it from the plan.
+      workflow.home = { project: home.id, thread: newThreadId() };
+      workflow.project = home.name;
+    }
     save(state, config);
     const sent = await publish(workflow, config);
-    print(`TeamFlow started workflow "${workflow.name}" (${workflow.id}).`);
+    print(`TeamFlow started workflow "${workflow.name}" (${workflow.id})${home ? ` in project ${projectWords(home)}` : ''}.`);
     // A refusal and a queued retry are different facts and a run needs
     // to know which it got: a 400 from a service that has never heard
     // of this document kind will never succeed on its own, and telling
@@ -2749,7 +2789,7 @@ export function dependsBatch(workflow, entries, { found } = {}) {
 
 // Create flags that take a value, so `apply --tracker linear plan.yaml`
 // does not read "linear" as the file.
-const FLAG_VALUE = new Set(['--tracker', '--project', '--state', '--label', '--order', '--order-text', '--to', '--process']);
+const FLAG_VALUE = new Set(['--tracker', '--project', '--in', '--state', '--label', '--order', '--order-text', '--to', '--process']);
 
 /**
  * Add what `planChanges` found missing, through the same `seed` and
@@ -2838,7 +2878,17 @@ export function placeFor({ config = {}, cwd, info = {}, sessionId } = {}) {
     const cached = JSON.parse(fs.readFileSync(projectsCachePath(config), 'utf8'));
     project = info.repository ? projectFor(info.repository, cached?.projects)?.name : undefined;
   } catch { /* no cache: the project is unknown */ }
-  return { sessionId: session, cwd, repository: info.repository, project };
+  // The session's pin (MACLEOD-982) decides the project before the
+  // repository does, and a plan made here becomes a thread of it.
+  let pin;
+  try {
+    const held = session ? readFileJson(sessionPath(session)) : undefined;
+    if (held?.project?.id) {
+      pin = { project: held.project.id, ...(held.thread?.id ? { thread: held.thread.id } : {}) };
+      if (held.project.by !== 'repo' && held.project.name) project = held.project.name;
+    }
+  } catch { /* no session file: the repository decides */ }
+  return { sessionId: session, cwd, repository: info.repository, project, ...(pin ? { pin } : {}) };
 }
 
 /**

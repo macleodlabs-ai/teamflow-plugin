@@ -103,8 +103,17 @@ const USAGE = `teamflow \u2014 delivery reporting for TeamFlow
   teamflow needs answer <id> --choice <n>|--done|--approve|--decline|--allow|--deny [--session <id>]
                                    answer from this computer, for your own cards
                                    and sessions only; History says it came from here
-  teamflow track list|rename|merge|split|move   your tracks, and fix how TeamFlow grouped them
-  teamflow task new "<name>" | in <id> | show   put this session's task in a new project, or in one you have
+  teamflow project                 which project this session is in, and its threads
+  teamflow project list [--mine]   open projects across the team, with their tracker
+  teamflow project create "<name>" [--link linear|jira|github[:"<name>"]]...
+                                   make a project and put this session in it
+  teamflow project use <id|name>   put this session in a project that exists
+  teamflow project link|unlink linear|jira|github ["<name>"] [--project <id|name>]
+                                   link a tracker project or a repository, or take it off
+  teamflow project end [--close]   take this session out of its project; --close
+                                   also closes the project
+  teamflow thread [new "<purpose>" | <id> | list]
+                                   start a thread for a new purpose, or go back to one
   teamflow adhoc start "<what the work is>" | title "<...>" | done
                                    work that arrived without a ticket: TeamFlow
                                    mints the key; \`teamflow adhoc --help\` has the rest
@@ -112,7 +121,7 @@ const USAGE = `teamflow \u2014 delivery reporting for TeamFlow
                                    the next agent you start reviews the card
   teamflow review done --result pass|findings|failed [--high N --medium N --low N]
                                    a reviewer agent states its result for the card
-  teamflow workflow create <name> | add <KEY> | show | status <s>
+  teamflow workflow create <name> [--in <project>] | add <KEY> | show | status <s>
                                    the pool of tickets a run works through;
                                    \`teamflow workflow --help\` lists its flags
   teamflow sync                    publish the current state now
@@ -148,7 +157,7 @@ const USAGE = `teamflow \u2014 delivery reporting for TeamFlow
   teamflow two-way on|off|status [--wait <seconds>]
                                    whether you can answer your agents from
                                    TeamFlow on this computer (on by default)
-  teamflow mod on|off|status        whether Claude Code shows your track and
+  teamflow mod on|off|status        whether Claude Code shows your project and
                                    Your turn inside it (on by default)
   teamflow hooks status | install           report automatically from that tool
   teamflow hooks uninstall --all            take all of it back out again
@@ -283,6 +292,11 @@ async function status() {
   // the checkout it was made from, and a session outside git gets the
   // organisation's default rather than an error.
   const project = await resolveProject(info.repository, config);
+  let pinned;
+  try {
+    const { pinWords } = await import('./project-cli.mjs');
+    pinned = state ? pinWords(state, { config, repository: info.repository }) : undefined;
+  } catch { pinned = undefined; }
   // What the card still has to pass on the organisation's columns
   // (ADHOC-20), so a person or an agent puts them in the plan.
   const toPass = credentialKind(config) ? await gatesToPass(state, project) : undefined;
@@ -378,6 +392,8 @@ async function status() {
     repository: info.repository
       || 'not a git repository — run TeamFlow inside your checkout; a report names the repository it came from',
     project: project.line,
+    // The project this session is pinned to, and its thread (MACLEOD-982).
+    ...(pinned ? { pinnedProject: pinned.project, ...(pinned.thread ? { thread: pinned.thread } : {}) } : {}),
     branch: info.branch,
     tracker: state?.binding?.tracker || trackerOf(config),
     trackerConnections: trackers
@@ -516,6 +532,14 @@ async function bind(argument = args.filter((a) => a !== '--local').join(' '), { 
 async function workOn() {
   const tree = isWorktree(cwd);
   await bind(undefined, { local: args.includes('--local') || tree });
+  // The worktree works in its parent's project (MACLEOD-982): the pin goes
+  // beside the key, in the one file a sandboxed agent can write.
+  if (tree) {
+    try {
+      const { pinForWorktree } = await import('./pin.mjs');
+      pinForWorktree(cwd, config);
+    } catch { /* the key alone still attributes the work */ }
+  }
   // The owner's opt-in copy list, `.teamflow/worktree.json` (MACLEOD-884):
   // ignored files such as `.env`, from the main folder, on this machine only.
   if (tree) {
@@ -1150,15 +1174,20 @@ try {
     const { needsMain } = await import('./needs.mjs');
     process.exit(await needsMain(args, { config }));
   }
-  else if (command === 'track') {
-    // Tracks (MACLEOD-936): list them, or rename, merge, split or move by hand.
-    const { trackMain } = await import('./tracks.mjs');
-    process.exit(await trackMain(args, { config }));
+  else if (command === 'project') {
+    // One kind of project (MACLEOD-982): the session's pin and the team's projects.
+    const { projectMain } = await import('./project-cli.mjs');
+    process.exit(await projectMain(args, { config, cwd, info }));
+  }
+  else if (command === 'thread') {
+    // One purpose inside the session's project (MACLEOD-982).
+    const { threadMain } = await import('./project-cli.mjs');
+    process.exit(await threadMain(args, { config, cwd, info }));
   }
   else if (command === 'task') {
-    // Tasks (MACLEOD-970): name a new project for this task, or move it.
-    const { taskMain } = await import('./tasks.mjs');
-    process.exit(await taskMain(args, { config, cwd, info }));
+    // The old words (MACLEOD-970), for two plugin versions: `project create|use`.
+    const { taskAlias } = await import('./project-cli.mjs');
+    process.exit(await taskAlias(args, { config, cwd, info }));
   }
   else if (command === 'workflow') {
     const { main } = await import('./workflow.mjs');

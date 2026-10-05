@@ -102,8 +102,8 @@
 // read, not a day the tool was run: `tested` still says that.
 
 export const PARITY_FEATURES = [
-  ['sessionContext', 'Ticket and lead notes at session start'],
-  ['promptContext', 'Ticket and project with each prompt'],
+  ['sessionContext', 'Ticket, project and lead notes at session start'],
+  ['promptContext', 'Ticket, project and threads with each prompt'],
   ['answers', 'Allow or Deny from TeamFlow'],
   ['carryOn', 'Plan goes on when a turn ends'],
   ['agents', 'Helper agents and session end on the board'],

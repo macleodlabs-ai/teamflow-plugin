@@ -32,6 +32,10 @@
 //                machine's own sessions. The plugin's own bind moves that
 //                session to the key (source `moved`, sticky) and leaves
 //                it one plain line. See `rebind` below.
+//   pin          Move to project (MACLEOD-982): `{ session, project,
+//                thread? }`. Ids only, for one of this machine's own
+//                sessions; only that session's pin changes, and it reads
+//                one plain line at its next prompt. See pin.mjs `applyPin`.
 //
 // Four rules decide the shape of this.
 //
@@ -84,7 +88,7 @@ export const TEXT_MAX = 500;
 export const REASON_MAX = 120;
 /** How many actions one round performs; the rest wait for the next. */
 export const BATCH = 8;
-export const KINDS = new Set(['fix', 'bump', 'rerun_gate', 'resume_plan', 'skip_gate', 'tidy', 'rebind']);
+export const KINDS = new Set(['fix', 'bump', 'rerun_gate', 'resume_plan', 'skip_gate', 'tidy', 'rebind', 'pin']);
 
 // --- the developer's say ------------------------------------------------
 
@@ -561,6 +565,11 @@ export async function perform(action, {
   const by = oneLine(action.by, 80) || 'a lead';
   if (!KINDS.has(kind)) return { ...said('refused', `unknown action kind ${kind}`) };
   if (kind === 'rebind') return rebind(action, { config, local, at, state });
+  if (kind === 'pin') {
+    const { applyPin } = await import('./pin.mjs');
+    const got = applyPin(action, { config, local, at });
+    return said(got.outcome, got.reason);
+  }
 
   const mine = bound === key ? localFor(local, key) : undefined;
   const gone = lapsed(action, mine);

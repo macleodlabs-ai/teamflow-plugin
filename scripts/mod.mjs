@@ -6,14 +6,14 @@
 // Claude Code: a band above the prompt and panes. The mod itself is
 // `plugin/hooks/teamflow-mod.mjs`. It has no Node.js of its own, so it
 // draws only what this file prints: `teamflow mod snapshot` runs here,
-// reads the board and the tracks on this machine, and prints JSON.
+// reads the board and this session's project on this machine, and prints JSON.
 //
 // What the mod shows (MACLEOD-953):
 //   - one line above the prompt: this session's ticket and its gate, the
 //     last check, its plan's progress, the agents' marks and the Your turn
 //     count, shrunk to the width;
 //   - a pane (`/teamflow-turn`) with five tabs: Your turn with each
-//     question and its options, Plans and tracks, Agents, This ticket and
+//     question and its options, Plans and projects, Agents, This ticket and
 //     Lately (the receipt line).
 // Every number comes from `modFromBundle` in progress-core.mjs, which is
 // the app's own code, so the terminal and the page cannot disagree.
@@ -30,15 +30,15 @@
 // reopens: those are links too. The session's own questions are answered
 // where Claude Code asks them, so the pane leaves them out.
 //
-// What it reads stays here: the tracks are grouped on this machine
-// (tracks.mjs) and nothing new is reported. Nothing received is ever
+// What it reads stays here: the session's project and threads are this
+// machine's own (pin.mjs) and nothing new is reported. Nothing received is ever
 // passed to a shell: the mod runs one fixed command, this one.
 import path from 'node:path';
 import * as core from './core.mjs';
 import { fetchState, serviceUrl } from './core.mjs';
 import { modFromBundle, statusLineFromBundle } from './progress-core.mjs';
 import { request as needsRequest } from './needs.mjs';
-import { readTracks, reportable } from './tracks.mjs';
+import { cachedProjects, openThreads, recentPins } from './pin.mjs';
 import { bandText } from '../hooks/teamflow-mod.mjs';
 
 export const MOD_USAGE = 'Usage: teamflow mod on|off|status';
@@ -46,7 +46,6 @@ export const MOD_USAGE = 'Usage: teamflow mod on|off|status';
 export const KEEP_MS = 45_000;
 export const ROWS_MAX = 20;
 const SESSION = /^[A-Za-z0-9_-]{1,80}$/;
-const STATE_WORDS = { active: 'working', quiet: 'quiet', ended: 'done' };
 const CACHE_VERSION = 3;
 const DAY_MS = 24 * 60 * 60_000;
 
@@ -72,26 +71,34 @@ export function modLine(held = modSwitch()) {
 
 // --- what the mod draws ---------------------------------------------------
 
-const trackRow = (t) => ({
-  id: t.id,
-  name: t.name,
-  state: STATE_WORDS[t.state] || 'quiet',
-  threads: (t.members || []).length,
-  keys: (t.keys || []).slice(0, 5),
-});
-
-/** This person's tracks on this machine, live ones first, and the one this session is in. */
-export function tracksFor(held, sessionId) {
-  const all = Object.values(held?.tracks || {}).filter((t) => reportable(t) && t.state !== 'ended');
-  all.sort((a, b) => String(b.lastAt || '').localeCompare(String(a.lastAt || '')));
-  const mine = sessionId ? all.find((t) => (t.members || []).includes(sessionId)) : undefined;
-  return { track: mine ? trackRow(mine) : undefined, tracks: all.slice(0, ROWS_MAX).map(trackRow) };
+/**
+ * This session's project and thread (MACLEOD-982), and the projects this
+ * computer worked in lately, each with its open threads. Local files only.
+ */
+export function projectsFor(sessionId, config = {}, now = Date.now()) {
+  const held = sessionId ? core.readJson(core.sessionPath(sessionId), undefined) : undefined;
+  const pin = held?.project?.id ? held.project : undefined;
+  const names = new Map((cachedProjects(config).projects || []).map((p) => [p.id, p.name]));
+  const project = pin ? {
+    id: pin.id,
+    name: String(names.get(pin.id) || pin.name || pin.id),
+    ...(held.thread?.name ? { thread: String(held.thread.name) } : {}),
+  } : undefined;
+  const seen = new Set();
+  const projects = [];
+  for (const e of [...(pin ? [{ project: pin.id, name: pin.name }] : []), ...recentPins()]) {
+    if (seen.has(e.project)) continue;
+    seen.add(e.project);
+    const threads = openThreads(e.project, { config, now });
+    projects.push({ id: e.project, name: String(names.get(e.project) || e.name || e.project), threads: threads.length, names: threads.slice(0, 3).map((t) => t.name) });
+  }
+  return { project, projects: projects.slice(0, ROWS_MAX) };
 }
 
-/** The status line's words with this session's track before them: the line an older mod draws. */
-export function bandLine(track, base) {
-  if (!track) return base || '';
-  const mine = `TF ${track.name}, ${track.state}`;
+/** The status line's words with this session's project before them: the line an older mod draws. */
+export function bandLine(project, base) {
+  if (!project) return base || '';
+  const mine = `TF ${project.name}${project.thread ? `, ${project.thread}` : ''}`;
   return base ? base.replace(/^TF /, `${mine} · `) : mine;
 }
 
@@ -189,13 +196,13 @@ export function askRows(asks = []) {
 
 /**
  * What the mod draws, as JSON. Off: `{on: false}` and nothing is read.
- * `ctx.read`, `ctx.needs`, `ctx.held`, `ctx.now`, `ctx.cache` and `ctx.facts` are for tests.
+ * `ctx.read`, `ctx.needs`, `ctx.now`, `ctx.cache` and `ctx.facts` are for tests.
  */
 export async function snapshot({ sessionId, config = {}, fresh = false } = {}, ctx = {}) {
   if (!(ctx.on ?? modSwitch().on)) return { on: false };
   const now = ctx.now ?? Date.now();
   const id = typeof sessionId === 'string' && SESSION.test(sessionId) ? sessionId : undefined;
-  const { track, tracks } = tracksFor(ctx.held || readTracks(config), id);
+  const { project, projects } = projectsFor(id, config, now);
   const facts = ctx.facts ?? sessionFacts(id);
   let board;
   try {
@@ -203,8 +210,8 @@ export async function snapshot({ sessionId, config = {}, fresh = false } = {}, c
   } catch { board = undefined; }
   const snap = {
     on: true,
-    track,
-    tracks,
+    project,
+    projects,
     turn: board?.turn,
     /* This session's own questions are answered where Claude Code asks them. */
     asks: (board?.asks || []).filter((a) => !id || a.session !== core.digest(id)),
@@ -216,7 +223,7 @@ export async function snapshot({ sessionId, config = {}, fresh = false } = {}, c
     offline: !board,
   };
   /* `line` is for a mod from before MACLEOD-953, which draws it as it is: fitted to 120 columns. */
-  return { ...snap, line: board ? bandText(snap, 120) : bandLine(track, undefined) };
+  return { ...snap, line: board ? bandText(snap, 120) : bandLine(project, undefined) };
 }
 
 /** `teamflow mod on|off|status|snapshot [--session <id>]`. Returns the exit code. */

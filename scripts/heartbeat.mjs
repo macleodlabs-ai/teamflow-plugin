@@ -857,6 +857,11 @@ export function buildBeat(sessionId, { at = new Date().toISOString(), alive = tr
   if (bound) beat.boundKey = bound;
   const team = teamOf(sessionId);
   if (team) beat.team = team;
+  // The session's pinned project and its thread (MACLEOD-982): ids only.
+  if (/^prj-[0-9a-f]{8}$/.test(String(main?.project?.id || ''))) {
+    beat.project = main.project.id;
+    if (/^th-[0-9a-f]{8}$/.test(String(main.thread?.id || ''))) beat.thread = main.thread.id;
+  }
   // So the service can count its repairs by plugin version (MACLEOD-846).
   const version = core.pluginVersion();
   if (version) beat.pluginVersion = version;

@@ -83,7 +83,7 @@ import { REVIEW_NEXT_MS, batchSize, changesFiles, reviewStartOf, stripMark, team
 import {
   boundToTeamflow, closeDispatched, dispatchOf, launchesOf, planLaunch, publishOwed, replanUnbound, settle, withMint,
 } from './dispatch.mjs';
-import { isTaskLine, noIssueLine, taskCommand } from './task-line.mjs';
+import { inheritPin, isThreadLine, noIssueLine } from './pin-line.mjs';
 import { BY_ID } from './tools.mjs';
 
 /*
@@ -265,14 +265,13 @@ export function claudeContext(event, state, justBound, stale = staleBuildNotice(
   const soft = event === 'SessionStart' ? sessionSoftRefusal(state) : undefined;
   if (soft) credential.push(`TeamFlow: reporting is paused — ${soft.reason}`);
   if (!state.binding?.key) {
-    // MACLEOD-970: the task line and this one ask the same thing, so a
-    // session with no ticket gets one short line that offers both.
-    const asked = fixes.some(isTaskLine);
-    const first = asked ? noIssueLine(taskCommand()) : NO_ISSUE;
+    // MACLEOD-982: the thread line already says how to start other work,
+    // so a session with no ticket gets the short form of this one.
+    const first = fixes.some(isThreadLine) ? noIssueLine() : NO_ISSUE;
     return JSON.stringify({
       hookSpecificOutput: {
         hookEventName: event,
-        additionalContext: [...fixes.filter((line) => !isTaskLine(line)), ...credential, first, ...(named ? [named] : []), ...notice].join(' '),
+        additionalContext: [...fixes, ...credential, first, ...(named ? [named] : []), ...notice].join(' '),
       },
     });
   }
@@ -405,6 +404,11 @@ export function withAgentIdentity(event, input, state, sessionId, agentKey, laun
     };
   } else if (input.agent_id) {
     state = withOwnLaunch(state, sessionId);
+  }
+  // An agent works in its parent's project (MACLEOD-982): the pin and the
+  // thread are copied from the session's own file, once.
+  if (!state.project) {
+    try { state = inheritPin(state, readJson(sessionPath(sessionId))); } catch { /* no parent pin */ }
   }
   if (event === 'SubagentStop') {
     // The agent's end ends the actor (MACLEOD-641, audit K3): `ended` as
@@ -1345,23 +1349,29 @@ export async function handleEvent(input = {}) {
       if (move && recordMove(move)) noteDirection(sessionId, agentKey, { kind: 'note', text: moveLine(move) });
     } catch { /* the trailer still names the bound ticket */ }
   }
-  // What this thread changed, for tracks (MACLEOD-936): hashed file
-  // names and a Claude Code Project id, kept on this machine only.
-  if (event === 'PostToolUse' || input.project_id) {
+  /*
+   * The session pin (MACLEOD-982, docs/PROJECTS.md section 3). On every
+   * SessionStart, and on the first event of a session whose tool has no
+   * SessionStart, a session with no pin takes the worktree's pin or the
+   * last pin for this person and repository, while that project is open.
+   * An agent with none takes a worktree's. Local files only.
+   */
+  if (event === 'SessionStart' || !state.pinChecked) {
     try {
-      const { noteTrackSignals } = await import('./tracks.mjs');
-      noteTrackSignals(state, input);
-    } catch { /* a track misses one signal; the others still join it */ }
+      const { reconnect } = await import('./pin.mjs');
+      const line = reconnect(state, { cwd, config, event, agent: Boolean(agentKey) });
+      if (line) state.pinNotice = line;
+      state.pinChecked = true;
+    } catch { /* no pin this session; the prompt line offers one */ }
   }
-  // The task this work belongs to (MACLEOD-970): started by the first
-  // edit, dispatch or commit after a prompt, sorted into a project. The
-  // main session only; keyed on the session id, never the account.
+  // The thread this work belongs to (MACLEOD-982): work in a project with
+  // no current thread starts one, named from the card. The main session
+  // only; an agent's thread is its parent's.
   if (event === 'PostToolUse' && !agentKey && claudeEnvelope(input)) {
     try {
-      const { noteTaskWork } = await import('./tasks.mjs');
-      const task = noteTaskWork(sessionId, input, { config, state, repository: info?.repository });
-      if (task?.releasedCard && state.binding?.key === task.releasedCard) delete state.binding;
-    } catch { /* the task misses one piece of work; the next one sorts it */ }
+      const { noteThreadWork } = await import('./pin.mjs');
+      noteThreadWork(state, input, { config, repository: info?.repository });
+    } catch { /* the next piece of work starts it */ }
   }
   saveSession(state);
 
@@ -1508,11 +1518,14 @@ export async function handleEvent(input = {}) {
    * the tool is waiting — it does no network at all: it closes runs
    * that have gone silent with file writes and posts nothing.
    */
-  // Tracks (MACLEOD-936): the main session groups this machine's threads
-  // and sends the tracks that changed, at most every two minutes.
+  // Threads made on this machine reach the service, and the old task
+  // files are rewritten once (MACLEOD-982). The main session only.
   if (event === 'Stop' && !agentKey) {
-    const { tracksOnStop } = await import('./tracks.mjs');
-    await tracksOnStop(config, { cwd });
+    try {
+      const { migrateTasks, syncThreads } = await import('./pin.mjs');
+      await syncThreads(config);
+      await migrateTasks(config);
+    } catch { /* tried again at the next stop */ }
   }
   if (event === 'Stop' || event === 'SessionStart') {
     const { reconcileOnHook } = await import('./reconcile.mjs');
@@ -1646,14 +1659,19 @@ export async function handleEvent(input = {}) {
   // never blocked. Local files only; the heartbeat keeps the service's word.
   if (FAST.includes(event) && (!input.reporter_tool || input.reporter_context)) {
     try { notices = [...notices, ...sessionLines(sessionId, cwd)]; } catch { /* nothing to say */ }
-    // Which project this prompt's work goes in (MACLEOD-970): one line,
-    // once per prompt, never for a slash command or a one-word reply. The
-    // prompt is read here and never kept. Local files only.
+    // The project and its threads (MACLEOD-982): said once a session
+    // continues a project, then one line per prompt, never for a slash
+    // command or a one-word reply. The prompt is read here and never kept.
+    if (state.pinNotice && !agentKey) {
+      notices = [...notices, state.pinNotice];
+      delete state.pinNotice;
+      saveSession(state);
+    }
     if (event === 'UserPromptSubmit' && !agentKey) {
       try {
-        const line = (await import('./tasks.mjs')).onPrompt(sessionId, input.prompt, { config });
+        const line = (await import('./pin.mjs')).promptLine(state, input.prompt, { config, repository: info?.repository });
         if (line) notices = [...notices, line];
-      } catch { /* the task keeps the session's last project */ }
+      } catch { /* no line this prompt */ }
     }
     // Where each running agent's work is, by the board's column names
     // (MACLEOD-773), so the model can say without asking. Kept copies only.
@@ -1715,7 +1733,9 @@ export async function handleEvent(input = {}) {
   // CLI's because a tool is waiting on this event: a service that does
   // not answer in a second and a half is answered as "unknown", which
   // prints nothing and costs the session nothing.
-  const project = event === 'SessionStart'
+  // A pinned session hears "continuing project" instead (MACLEOD-982).
+  const pinned = state.project?.id && state.project.by !== 'repo';
+  const project = event === 'SessionStart' && !pinned
     ? await resolveProject(info?.repository, config, { timeoutMs: 1500 })
     : undefined;
 

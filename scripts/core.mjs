@@ -1349,6 +1349,10 @@ export function runPlace(where) {
   if (where.sessionId) place.session = String(where.sessionId);
   if (repo) place.repo = repo;
   if (typeof where.project === 'string' && where.project.trim()) place.project = where.project.trim();
+  // The session's pin (MACLEOD-982): a plan made here is a thread of it.
+  if (/^prj-[0-9a-f]{8}$/.test(String(where.pin?.project || ''))) {
+    place.pin = { project: where.pin.project, ...(/^th-[0-9a-f]{8}$/.test(String(where.pin.thread || '')) ? { thread: where.pin.thread } : {}) };
+  }
   return Object.keys(place).length ? place : undefined;
 }
 
@@ -4862,6 +4866,9 @@ export function issuePayload(state, config, info) {
     jiraStatus: state.jira?.status,
     parentKeys: state.jira?.parentKeys,
     project: issueProject(key, tracker),
+    // The session's pinned project (MACLEOD-982): an id only. The service
+    // counts the card there unless a project that links its tracker owns it.
+    ...(/^prj-[0-9a-f]{8}$/.test(String(state.project?.id || '')) ? { projectId: state.project.id } : {}),
     actor: act.displayName,
     repository: info.repository,
     branch: info.branch,
@@ -5024,7 +5031,8 @@ export function sanitizePayload(value, { kind = 'issue' } = {}) {
   const reviewOnly = new Set(['lens', 'result', 'round', 'findings', 'high', 'medium', 'low', 'stated']);
   // `asks` (MACLEOD-845): what the session waits for a person to answer.
   // `testFirst` and `risk` (MACLEOD-968): a word and area names.
-  const issueRoot = new Set(['actions', 'asks', 'spend', 'testFirst', 'risk']);
+  // `projectId` (MACLEOD-982): the session's pinned project, an id only.
+  const issueRoot = new Set(['actions', 'asks', 'spend', 'testFirst', 'risk', 'projectId']);
   // MACLEOD-882: what the model used, as numbers and a model id. Nothing else.
   const spendOnly = new Set(['id', 'model', 'input', 'output', 'cacheRead', 'cacheWrite', 'usd']);
   // Its kind and, for a permission, a built-in tool's name. Never the

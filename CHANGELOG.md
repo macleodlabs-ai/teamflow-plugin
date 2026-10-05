@@ -3,6 +3,30 @@
 What changed in each published version of the TeamFlow plugin, newest first.
 Only what a person using it would notice.
 
+## 0.3.68
+
+- **One kind of project.** A project is a project. It shows its tracker
+  when it has one, such as "Payments (Linear)". Anyone can make one,
+  unless an owner turned that off.
+- **Make and link in one line.** `teamflow project create "Payments v2"
+  --link linear:"Payments" --link github:acme/pay`. `project use`, `link`,
+  `unlink` and `end` do the rest. `/teamflow:project` shows a picker.
+- **Your session stays in its project.** It stays until `teamflow project
+  end`. A ticket key does not move it.
+- **A restart continues where you were.** A new session in the same
+  repository goes back to your last project and says so.
+- **Agents and worktrees follow.** Work they do counts in their parent's
+  project.
+- **Threads.** Each purpose inside a project is a thread. Claude starts
+  one with `teamflow thread new` when a prompt starts new work.
+- **Move to project from the app.** When someone moves your session,
+  your computer follows it and tells the session.
+- **Put a plan in a project.** `teamflow workflow create "<name>" --in
+  <project>` puts it there. Without `--in`, it goes in your session's project.
+- **`teamflow status` shows the project and the thread.**
+- **Old commands still work.** `teamflow task new` and `task in` now run
+  `project create` and `project use`, and say so. `teamflow track` is gone.
+
 ## 0.3.67
 
 - **Work goes to the right ticket.** A finished ticket takes no new work.

@@ -59,11 +59,38 @@ allow. See "Reporting from anything else" below.
 - `/teamflow:sync`
 - `/teamflow:doctor`
 - `/teamflow:org` (which organisation this machine reports to; `org switch <id>` changes it)
+- `/teamflow:project` (choose the project this session works in, or make one, from a picker)
 - `/teamflow:adhoc` (work with no ticket: mint an `ADHOC-` key, bind to it, and end it when the work is done)
 - `/teamflow:build` (run a plan: a pool of tickets in priority order, on the board as one run with its phases)
 - `/teamflow:admin-code` (superadmins only: `admin code create --email owner@acme.com --seats 5 --days 365`, `admin code list`, `admin code revoke TF-XXXX-XXXX`)
 
 The agent may run `/teamflow:next`, `/teamflow:adhoc` and `/teamflow:build` by itself. A session with no ticket is told to run `/teamflow:next` before it starts editing. The rest are manual-only.
+
+### Projects and threads
+
+A session works in one project until `teamflow project end`. Choose it
+with `/teamflow:project`, or from a shell:
+
+```bash
+teamflow project create "Payments v2" --link linear:"Payments" --link github:acme/pay
+teamflow project use Payments
+teamflow project            # which project, and its threads
+teamflow project end        # leave it; --close also closes it
+```
+
+A restart, a resume or a compaction in the same repository continues the
+last project. Agents and worktrees the session starts work in it too.
+Anyone in the organisation can make a project unless an owner turned that
+off. A project shows its tracker, such as "Payments (Linear)".
+
+Inside a project, each purpose is a thread. On each prompt Claude reads
+one line with the project and its open threads. When a prompt starts a
+different purpose, Claude runs `teamflow thread new "<purpose>"`; when it
+goes back to one, `teamflow thread <id>`. Most prompts need neither. The
+prompt itself never leaves your computer: only ids and the thread's name do.
+
+`teamflow task new` and `task in` still work for two versions; they are
+now `project create` and `project use`.
 
 ## Configuration
 
@@ -191,8 +218,8 @@ TeamFlow yet.
 
 | | Claude Code | Cursor | Codex | GitHub Copilot | Kiro |
 | --- | --- | --- | --- | --- | --- |
-| Ticket and lead notes at session start | Yes | Yes | Yes | Yes | Yes |
-| Ticket and project with each prompt | Yes | No | Yes | No | Yes |
+| Ticket, project and lead notes at session start | Yes | Yes | Yes | Yes | Yes |
+| Ticket, project and threads with each prompt | Yes | No | Yes | No | Yes |
 | Allow or Deny from TeamFlow | Yes | No | Yes | Copilot CLI only | No |
 | Plan goes on when a turn ends | Yes | Yes | Yes | Helper agents only | Yes |
 | Helper agents and session end on the board | Yes | Yes | Yes | Partly | Partly |

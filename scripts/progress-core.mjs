@@ -2650,6 +2650,10 @@ function stripLabel(gateLabel, parts) {
 
 // src/lib/dataSource.ts
 var CUSTOM_GATE_SLOT = /^(?:sonarqube|check-[a-z0-9][a-z0-9-]{0,39})$/;
+function isPlanDocument(run) {
+  const doc = run ?? {};
+  return !doc.track && doc.origin !== "track" && !doc.migratedTo;
+}
 var LEGACY_STAGES = { JIRA: "BACKLOG", READY_PROD: "DONE" };
 function canonicalStage(value) {
   return typeof value === "string" ? LEGACY_STAGES[value] ?? value : value;
@@ -3053,7 +3057,7 @@ function dashboardFromBundle(index, orgName) {
       index.criteria?.[key]
     ) : void 0;
   }).filter((value) => Boolean(value));
-  const workflows = Object.values(index.documents.workflows ?? {}).sort((a, b) => String(a.createdAt).localeCompare(String(b.createdAt)));
+  const workflows = Object.values(index.documents.workflows ?? {}).filter(isPlanDocument).sort((a, b) => String(a.createdAt).localeCompare(String(b.createdAt)));
   const settled = foldConverted(tickets, index.documents.issues, index.documents.aliases).map((ticket) => settleTicket(ticket, workflows));
   const stableTickets = retainUnchanged(settled);
   const service = readServiceState(index);
@@ -4328,7 +4332,7 @@ function workingOf(tickets, now, liveness) {
   return { agents: count2, tickets: keys.size };
 }
 
-// src/lib/plansAndTracks.ts
+// src/lib/planRows.ts
 var DAY_MS9 = 24 * 60 * 6e4;
 var ENDED_SHOWN_MS = 7 * DAY_MS9;
 function time15(value) {
@@ -4336,24 +4340,17 @@ function time15(value) {
   return Number.isFinite(at) ? at : 0;
 }
 var LIVE2 = /* @__PURE__ */ new Set(["running", "blocked", "stalled", "planning"]);
-function isTrack(run) {
-  return run.origin === "track" || Boolean(run.track);
-}
 function shownRuns(workflows = [], now) {
   return workflows.filter((run) => {
-    if (run.track?.mergedInto) return false;
-    if (LIVE2.has(run.status) && run.track?.state !== "ended") return true;
-    const ended2 = time15(run.ended?.at) || time15(run.track?.endedAt) || time15(run.updatedAt);
-    return now - ended2 <= ENDED_SHOWN_MS;
+    if (LIVE2.has(run.status)) return true;
+    const ended = time15(run.ended?.at) || time15(run.updatedAt);
+    return now - ended <= ENDED_SHOWN_MS;
   });
 }
 var weekday = (at) => new Date(at).toLocaleDateString("en-GB", { weekday: "short" });
 var dayMonth = (at) => new Date(at).toLocaleDateString("en-GB", { day: "numeric", month: "short" });
 function whenWords(at, now) {
   return at - now < 6 * DAY_MS9 ? weekday(at) : dayMonth(at);
-}
-function ended(run, live) {
-  return !live || run.track?.state === "ended";
 }
 function waitingWords2(row) {
   if (row.need?.plan) return "Waiting on a person: decide if it ends.";
@@ -4362,7 +4359,7 @@ function waitingWords2(row) {
 function forecastOf(input) {
   const { run, live, done, total, finishAt, waiting, stopped, now } = input;
   if (run.ended?.words) return run.ended.words;
-  if (ended(run, live)) {
+  if (!live) {
     const left = total - done;
     return left > 0 ? `Ended, ${left} not done.` : "All done.";
   }
@@ -4380,8 +4377,7 @@ function endsOf(run, live, now) {
     const what = run.ended.why === "finished" ? "It ended when the last item finished." : run.ended.why === "cancelled" ? "A person cancelled it. It is no longer needed." : "TeamFlow ended it.";
     return until > now ? `${what} You can undo this until ${whenWords(until, now)}.` : what;
   }
-  if (ended(run, live)) return run.status === "cancelled" ? "A person ended it." : "It ended when the last item finished.";
-  if (isTrack(run)) return "It ends by itself when its work goes quiet.";
+  if (!live) return run.status === "cancelled" ? "A person ended it." : "It ended when the last item finished.";
   return run.scope?.deploy ? "It ends when the last item is deployed." : "It ends when the last item is done.";
 }
 function slipOf(run, rows, live) {
@@ -4427,7 +4423,7 @@ function mineOf(run, tickets, me, index) {
   return tickets.some((ticket) => keys.has(ticket.jiraKey) && isMine(ticket, me));
 }
 var ORDER2 = { "Needs you": 0, Slips: 1, "On track": 2, "Not started": 3, Done: 4, Ended: 5 };
-function plansAndTracks(input) {
+function planRows(input) {
   const now = input.now ?? input.accounting.now;
   const runs = shownRuns(input.workflows, now);
   if (!runs.length) return [];
@@ -4437,7 +4433,7 @@ function plansAndTracks(input) {
   const asks = needYou(input.accounting.attention, now);
   const index = aliasIndex(input.tickets);
   const rows = runs.map((run) => {
-    const live = LIVE2.has(run.status) && run.track?.state !== "ended";
+    const live = LIVE2.has(run.status);
     const group = groups.get(run.id);
     const checklist = group?.rows ?? [];
     const counted2 = checklist.filter((row) => row.state !== "gone");
@@ -4453,7 +4449,6 @@ function plansAndTracks(input) {
     return {
       id: run.id,
       name: run.name,
-      kind: isTrack(run) ? "track" : "plan",
       state: rowWord,
       done,
       total,
@@ -4472,7 +4467,7 @@ function plansAndTracks(input) {
   return rows.sort((a, b) => ORDER2[a.state] - ORDER2[b.state] || a.name.localeCompare(b.name));
 }
 function finishedAtOf(run, live, checklist) {
-  if (!live) return time15(run.ended?.at) || time15(run.track?.endedAt) || time15(run.updatedAt);
+  if (!live) return time15(run.ended?.at) || time15(run.updatedAt);
   const shipped = Math.max(0, ...checklist.map((row) => row.shippedAt ?? row.lastActivity ?? 0));
   return shipped || time15(run.updatedAt);
 }
@@ -4964,13 +4959,13 @@ function modFromBundle(bundle, now, extra = {}) {
   }));
   const key = extra.key && accounting.cards.has(extra.key) ? extra.key : extra.session ? roster.find((row) => row.session === extra.session && row.agent === "main")?.key : void 0;
   const card = key ? accounting.cards.get(key) : void 0;
-  const live = groupPlans(plansAndTracks({ tickets: data.tickets, workflows: data.workflows, accounting, now }), now).live;
+  const live = groupPlans(planRows({ tickets: data.tickets, workflows: data.workflows, accounting, now }), now).live;
   const plans = live.map((row) => {
     const next = row.checklist.find((one) => one.state !== "done" && one.state !== "gone");
     return {
       id: row.id,
       name: row.name,
-      kind: row.kind,
+      kind: "plan",
       state: row.state,
       done: row.done,
       total: row.total,

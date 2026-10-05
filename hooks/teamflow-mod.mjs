@@ -7,7 +7,7 @@
 //
 // On, it draws one line above the prompt (this session's ticket and gate,
 // the last check, its plan, the agents and Your turn) and adds
-// `/teamflow-turn`, a pane with five tabs: Your turn, Plans and tracks,
+// `/teamflow-turn`, a pane with five tabs: Your turn, Plans and projects,
 // Agents, This ticket and Lately. Keys 1 to 5 switch the tab.
 //
 // It answers for this computer's own person (MACLEOD-954, the owner,
@@ -182,7 +182,7 @@ export function lineParts(s = snap) {
   }
   const plan = (s.plans || []).find((p) => p.holds);
   if (plan) parts.push({ order: 4, rank: 7, text: `${cut(plan.name, 22)} ${plan.done} of ${plan.total}` });
-  else if (s.track) parts.push({ order: 4, rank: 7, text: `${cut(s.track.name, 22)}, ${s.track.state}` });
+  else if (s.project) parts.push({ order: 4, rank: 7, text: s.project.thread ? `${cut(s.project.name, 18)}, ${cut(s.project.thread, 18)}` : cut(s.project.name, 22) });
   const n = s.agents?.counts || {};
   if (n.waits) parts.push({ order: 5, rank: 3, group: 'agents', text: `✻ ${n.waits} ${n.waits === 1 ? 'waits' : 'wait'} on you` });
   if (n.working) parts.push({ order: 6, rank: 8, group: 'agents', text: `✽ ${n.working} working` });
@@ -272,16 +272,17 @@ function planRows(s, columns) {
   const cells = Math.max(10, Math.min(30, columns - 24));
   if (!s.plans?.length) rows.push({ text: 'No plan runs now.' });
   for (const p of s.plans || []) {
-    rows.push({ text: `${p.name} (${p.kind === 'track' ? 'track' : 'plan'}) · ${p.state}${p.holds ? ' · this session' : ''}`, bold: true, gap: true });
+    rows.push({ text: `${p.name} (plan) · ${p.state}${p.holds ? ' · this session' : ''}`, bold: true, gap: true });
     rows.push({ text: `${bar(p.done, p.total, cells)} ${p.done} of ${p.total}` });
     rows.push({ text: p.forecast });
     if (p.next) rows.push({ text: `Next: ${p.next.key} ${p.next.title}, at ${p.next.step}`, dim: true });
   }
   rows.push({ head: 'On this computer', gap: true });
-  if (!s.tracks?.length) rows.push({ text: 'No tracks yet. A track starts when two of your sessions work on one thing.' });
-  for (const t of s.tracks || []) {
-    const threads = t.threads === 1 ? '1 thread' : `${t.threads} threads`;
-    rows.push({ text: `${t.name}: ${t.state}, ${threads}${t.keys?.length ? ` (${t.keys.join(', ')})` : ''}` });
+  if (!s.projects?.length) rows.push({ text: 'No project yet. Type /teamflow:project to choose one or make one.' });
+  for (const p of s.projects || []) {
+    const threads = p.threads === 1 ? '1 open thread' : `${p.threads} open threads`;
+    const mine = s.project?.id === p.id ? ' · this session' : '';
+    rows.push({ text: `${p.name}: ${threads}${p.names?.length ? ` (${p.names.join(', ')})` : ''}${mine}` });
   }
   if (s.app) rows.push({ link: `${s.app}#plans`, label: 'Open Plans in TeamFlow', gap: true });
   return rows;
