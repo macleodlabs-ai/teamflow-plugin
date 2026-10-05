@@ -78,7 +78,7 @@ import { step } from './words.mjs';
 import { markSent, mergedFacts, sendInBatches } from './merged.mjs';
 import { readLines, sayPrompt } from './say.mjs';
 import {
-  GATE_SLOTS, gateDeadlinesOf, gateReports, gateSaid, hygieneRow, load, move, publish, ready, restall, save, undepend,
+  GATE_SLOTS, TEST_SKIP_WAIT, gateDeadlinesOf, gateReports, gateSaid, hygieneRow, load, move, publish, ready, restall, save, undepend,
 } from './workflow.mjs';
 import { bounded, budgetUntil, remainingMs, settle } from './selfheal.mjs';
 
@@ -617,12 +617,20 @@ export async function perform(action, {
     if (!reason) return { ...said('refused', 'The skip needs a reason') };
     const cycle = cycleFor(gate);
     if (!cycle) return { ...said('refused', `This run has no ${gate} check`) };
-    if (ticket.cycle !== cycle) return { ...said('refused', `${key} is not at the ${cycle} check`) };
+    // MACLEOD-983: a ticket held for a person's skip of the test step
+    // stands before it (at build), not at it.
+    const heldForSkip = cycle === 'test' && ticket.wait?.for === TEST_SKIP_WAIT;
+    if (ticket.cycle !== cycle && !heldForSkip) return { ...said('refused', `${key} is not at the ${cycle} check`) };
     // The gate reads `idle` with the person's words from now on -- never
     // `success`, which only a run earns -- and the run records who.
     ticket.skipped = { ...(ticket.skipped || {}), [cycle]: { by, reason, at } };
     if (ticket.gateRetry) delete ticket.gateRetry[cycle];
-    move(workflow, key, { state: 'running', cycle: NEXT_CYCLE[cycle] });
+    if (heldForSkip) {
+      delete ticket.wait;
+      ticket.updatedAt = at;
+    }
+    // Held before the step, the session moves it on; the skip only lets it pass.
+    if (ticket.cycle === cycle) move(workflow, key, { state: 'running', cycle: NEXT_CYCLE[cycle] });
     hygieneRow(workflow, 'skipped', by, `${by} skipped the ${cycle} check on ${key}: ${reason}`, at);
     await sayGates(workflow, ticket, config, { at, deadlines, budget });
     await settleAndPublish();

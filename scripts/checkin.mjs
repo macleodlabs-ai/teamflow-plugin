@@ -46,6 +46,7 @@ import { keyOf, pauseOf } from './heartbeat.mjs';
 import { mergedFacts, prCheck } from './merged.mjs';
 import { inUse, statusOf, tidy as tidyWorktrees, worktreesOf } from './worktree.mjs';
 import { questionAnswer, twoWaySwitch, validAskId } from './two-way.mjs';
+import { TEST_SKIP_WAIT } from './workflow.mjs';
 
 export const CHECKIN_AFTER_MS = 60_000;
 // A plan item's agent is sent again at most once an hour.
@@ -155,6 +156,9 @@ export async function todoOf(sessionId, {
   for (const actor of mine) {
     const key = keyOf(actor.binding.key);
     const node = nodes.get(key);
+    // Held for a person's skip of the test step (MACLEOD-983): theirs, in
+    // Needs you. Asking the session again only meets the same refusal.
+    if (node?.wait?.for === TEST_SKIP_WAIT && !DONE.has(node.state)) continue;
     const ended = Boolean(actor.ended || actor.agent?.endedAt);
     const lost = !ended && now - (Date.parse(actor.updatedAt) || 0) > LOST_AFTER_MS;
     const finished = DONE.has(node?.state) || proven.has(key);

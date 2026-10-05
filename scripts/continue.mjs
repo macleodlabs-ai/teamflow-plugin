@@ -42,7 +42,7 @@ import { launchesOf } from './dispatch.mjs';
 import { drivenBy } from './driven.mjs';
 import { keyOf, pauseOf } from './heartbeat.mjs';
 import { STEP } from './resume.mjs';
-import { BRANCH } from './workflow.mjs';
+import { BRANCH, TEST_SKIP_WAIT } from './workflow.mjs';
 
 export const STREAK_MAX = 5;
 // A person who typed this recently is at the keyboard and drives.
@@ -159,7 +159,9 @@ export function directionFor(actor, { runs = [], steps = {}, subagent = false, s
     return { kind: 'points', key, run, reason: `TeamFlow: next, fix ${count(open, 'open point', 'open points')} on ${key} from its last check. teamflow status lists them. When you fix one, mark it done in the plan.` };
   }
   if (subagent || !run) return undefined;
-  if (node && (node.state === 'running' || node.state === 'rework')) {
+  // Held for a person's skip of the test step (MACLEOD-983): not the session's to finish.
+  const held = node?.wait?.for === TEST_SKIP_WAIT;
+  if (node && !held && (node.state === 'running' || node.state === 'rework')) {
     const step = stepOf(steps[key] || actor.stage);
     return { kind: 'finish', key, run, reason: `TeamFlow: carry on with ${key}${step ? ` at ${step}` : ''}. Its item in the plan '${plan}' is not done. When it is done, mark it done in the plan. ${itemsLeft(leftOf(run))}` };
   }

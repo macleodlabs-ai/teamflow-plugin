@@ -956,6 +956,7 @@ var SEVERITY_OF = {
   asks_you: "blocked",
   for_you: "blocked",
   plan_wait: "blocked",
+  test_skip: "blocked",
   usage_limit: "idle"
 };
 function severityRank(rule) {
@@ -1025,7 +1026,10 @@ function rowsFor(card, ctx) {
   });
   const out = [];
   const plan = card.run ? ` \xB7 it holds up the ${card.run.name} plan` : "";
-  if (card.flags.finished || card.flags.done) return doneRows(card, row, now);
+  const held = card.run?.tickets.find((t) => t.key === card.key)?.wait;
+  const heldRow = held?.for === "test_skip" ? [row("test_skip", Math.max(0, now - time3(held.since)), `${card.key} has no failing test from before its code change \xB7 ${owner}${plan}`, "skip_gate")] : [];
+  if (card.flags.finished || card.flags.done) return [...heldRow.map((held2) => followUpOf(held2, card, now, ctx.carryOn)), ...doneRows(card, row, now)];
+  out.push(...heldRow);
   if (card.delayed) {
     const { gate, retry, since } = card.delayed;
     const sentence2 = `${possessive(owner)} ${gateWords(card.delayed.run, gate)} on ${card.key} \xB7 ${delayedSentence(retry, since, now, ctx.timeZone)}${plan}`;
@@ -1103,7 +1107,7 @@ function rowsFor(card, ctx) {
     out.push(row("audit_no_review", silentFor, `${card.key} passed its audit and the code is pushed. Nobody has reviewed it for ${ageLabel(silentFor)} \xB7 ${owner}`, "open_card"));
   }
   const frozen = (card.ticket.attention ?? []).some((mark) => mark.kind === "autonomy_off");
-  return autonomyRows(card, out, row, now).map((held) => followUpOf(frozen ? { ...held, frozen } : held, card, now, ctx.carryOn));
+  return autonomyRows(card, out, row, now).map((held2) => followUpOf(frozen ? { ...held2, frozen } : held2, card, now, ctx.carryOn));
 }
 var NEED_WORDS = { check: "a check", decision: "a decision", approval: "an approval" };
 function needRows(cards, ctx) {
@@ -1140,7 +1144,7 @@ var OLDER_AFTER_MS = 48 * 60 * 6e4;
 var PASSIVE = /* @__PURE__ */ new Set(["idle", "unfinished", "agent_offline", "audit_no_review", "blocked", "mutual"]);
 var AUTOMATIC = /* @__PURE__ */ new Set(["rework", "delayed", "silent", "unfinished", "agent_crashed", "agent_hung", "agent_offline"]);
 var STOPPED_WORK = /* @__PURE__ */ new Set(["silent", "unfinished", "agent_crashed", "agent_hung", "agent_offline"]);
-var HUMAN_INPUT = /* @__PURE__ */ new Set(["asks_you", "for_you", "audit_no_review", "teamflow_stopped", "plan_wait"]);
+var HUMAN_INPUT = /* @__PURE__ */ new Set(["asks_you", "for_you", "audit_no_review", "teamflow_stopped", "plan_wait", "test_skip"]);
 var CARRY_ON_TRIES = 2;
 var PARK_AFTER_MS = 48 * 60 * 6e4;
 var CARRY_ON_DEFAULTS = { enabled: true, tries: CARRY_ON_TRIES, parkHours: PARK_AFTER_MS / 36e5 };
@@ -2250,6 +2254,7 @@ var TRACKERS = Object.keys(TRACKER_NAMES).filter((tracker) => tracker !== "teamf
 // src/lib/planCompletion.ts
 function plannedShipped(planned, board) {
   if (planned.state === "done") return true;
+  if (planned.wait?.for === "test_skip") return false;
   const card = board.get(planned.key);
   return card ? isFinishedStage(card.stage) : false;
 }
@@ -2411,6 +2416,8 @@ function mattersOf(row, card) {
       return "An agent waits for your answer";
     case "plan_wait":
       return "The plan waits for your approval";
+    case "test_skip":
+      return "The card cannot pass its test step";
     default:
       return "No work is happening";
   }
@@ -3292,7 +3299,18 @@ function offeredAction(row, card, me) {
     };
   }
   if (row.primary === "bump") return bumpOffer(row, me);
+  if (row.primary === "skip_gate") return skipTestOffer(row, me);
   return fixOffer(row, card, me);
+}
+var SKIP_TEST = "Skip the test step";
+function skipTestOffer(row, me) {
+  return {
+    kind: "skip_gate",
+    label: SKIP_TEST,
+    args: { gate: "test", rule: row.rule },
+    write: `Queue: skip the test step on ${row.key}, on ${possessive2(row.ownerLabel)} machine \xB7 ${me.name ?? me.email ?? "you"}`,
+    disabled: onTeamPlan(me) ? void 0 : PLAN_SENTENCE
+  };
 }
 var DAY_MS3 = 24 * 60 * 6e4;
 var SNOOZE_KEY = "teamflow-snooze";

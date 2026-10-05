@@ -3,6 +3,15 @@
 What changed in each published version of the TeamFlow plugin, newest first.
 Only what a person using it would notice.
 
+## 0.3.69
+
+- **Skip the test step from the card.** When a ticket has no failing test
+  from before its code change, its card now says "Skip the test step".
+  Its developer or a lead gives a reason, and the ticket moves on.
+- **The check-in asks once.** A step that waits on a person shows under
+  Needs you. The check-in no longer asks the session about it every
+  minute.
+
 ## 0.3.68
 
 - **One kind of project.** A project is a project. It shows its tracker

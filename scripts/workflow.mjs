@@ -73,6 +73,13 @@ export const CYCLES = ['build', 'test', 'audit', 'status', 'deploy', 'verified',
 // (MACLEOD-885): planfile.mjs holds the lists, so a plan file and the
 // command agree.
 export { EDGE_RULES, RULE_WORDS, WAIT_KINDS };
+/**
+ * The plugin's own wait (MACLEOD-983): the ticket has no test-first proof,
+ * and only a person's skip lets it past the test step. Never typed by
+ * hand or in a plan file, so it is not in WAIT_KINDS.
+ */
+export const TEST_SKIP_WAIT = 'test_skip';
+
 // The weights an audit counts its findings in (MACLEOD-885). Counts only.
 export const FINDING_WEIGHTS = ['blocking', 'should'];
 const FINDING_COUNT_MAX = 9999;
@@ -1401,11 +1408,29 @@ export function auditNeed(workflow, key, facts = readTicketFacts) {
 }
 
 /**
+ * The test-first proof a move past the test step lacks (`none` or `red`),
+ * or '' when it may pass: no rule, a person's skip, or proof. Only a
+ * person can clear this one, so it holds the ticket for them (MACLEOD-983).
+ */
+export function testFirstMissing(workflow, ticket, { state, cycle } = {}, facts = readTicketFacts) {
+  if (workflow?.process?.tdd !== 'proved' || !ticket || ticket.skipped?.test) return '';
+  const toState = state ?? ticket.state;
+  if (!['running', 'done'].includes(toState)) return '';
+  const from = position(ticket.state, ticket.cycle);
+  const to = position(toState, cycle ?? ticket.cycle);
+  if (!(from <= TEST_AT && to > TEST_AT)) return '';
+  let proof = 'none';
+  try { proof = facts(ticket.key)?.testFirst || 'none'; } catch { proof = 'none'; }
+  // A ticket whose work changed no code has nothing to test first (owner, 2026-10-03).
+  return proof === 'proved' || proof === 'not_needed' ? '' : proof === 'red' ? 'red' : 'none';
+}
+
+/**
  * Why the run's process will not let this move happen, in plain words, or
  * '' when it may. Only a move that carries the ticket past its test step
  * or past its audit step is ever refused; going back never is.
  */
-export function processRefusal(workflow, ticket, { state, cycle } = {}, facts = readTicketFacts) {
+export function processRefusal(workflow, ticket, { state, cycle, onBoard = false } = {}, facts = readTicketFacts) {
   const process = workflow?.process;
   if (!process?.id || !ticket) return '';
   const toState = state ?? ticket.state;
@@ -1414,19 +1439,18 @@ export function processRefusal(workflow, ticket, { state, cycle } = {}, facts = 
   const to = position(toState, cycle ?? ticket.cycle);
   const key = ticket.key;
 
-  if (process.tdd === 'proved' && from <= TEST_AT && to > TEST_AT && !ticket.skipped?.test) {
-    let proof = 'none';
-    try { proof = facts(key)?.testFirst || 'none'; } catch { proof = 'none'; }
-    // A ticket whose work changed no code has nothing to test first (owner, 2026-10-03).
-    if (proof !== 'proved' && proof !== 'not_needed') {
-      return [
-        proof === 'red'
-          ? `${key} has a failing test, but no passing run after the code change.`
-          : `${key} has no failing test from before its code change.`,
-        'Write the test first and run it, then write the code and run it again.',
-        'Or a person can skip the test step with a reason, from the card on the board.',
-      ].join(' ');
-    }
+  const proof = testFirstMissing(workflow, ticket, { state, cycle }, facts);
+  if (proof) {
+    return [
+      proof === 'red'
+        ? `${key} has a failing test, but no passing run after the code change.`
+        : `${key} has no failing test from before its code change.`,
+      'Write the test first and run it, then write the code and run it again.',
+      // MACLEOD-983: name the button only when the board shows it.
+      onBoard
+        ? 'Or press "Skip the test step" on its card on the board, and give a reason.'
+        : 'Its developer or an organisation admin can skip the test step, with a reason.',
+    ].join(' ');
   }
 
   if (from <= AUDIT_AT && to > AUDIT_AT && !ticket.skipped?.audit) {
@@ -1616,6 +1640,8 @@ export function closeActors(key, config = {}, at = now()) {
 
 // --- printing --------------------------------------------------------
 
+const HELD_WORDS = { pr_approved: 'an approval', [TEST_SKIP_WAIT]: 'a person to skip its test step' };
+
 function line(ticket, workflow) {
   const waits = (workflow.dependencies || [])
     .filter((d) => d.from === ticket.key)
@@ -1623,7 +1649,7 @@ function line(ticket, workflow) {
   const where = ticket.cycle ? `${ticket.state}/${ticket.cycle}` : ticket.state;
   const on = waits.length ? `  waits on ${waits.join(', ')}` : '';
   const how = ticket.addedBy === 'dispatch' ? '  (dispatched)' : '';
-  const held = ticket.wait?.for ? `  waits for ${ticket.wait.for === 'pr_approved' ? 'an approval' : 'the deploy window'}` : '';
+  const held = ticket.wait?.for ? `  waits for ${HELD_WORDS[ticket.wait.for] || 'the deploy window'}` : '';
   return `    ${String(ticket.rank).padStart(3)}. ${ticket.key}  ${where}${on}${held}${how}`;
 }
 
@@ -1708,6 +1734,8 @@ export async function main(args, {
   facts: factsOf, loadProcesses,
   // The team's projects, for `create --in` (MACLEOD-982). Passed in by tests.
   listProjects,
+  // How a run reaches the board; passed in by tests (MACLEOD-983).
+  publishRun = publish,
 } = {}) {
   const facts = factsOf || ((key) => readTicketFacts(key, { config, cwd }));
   const [sub = 'show', ...rest] = args;
@@ -2164,7 +2192,23 @@ export async function main(args, {
      * without it. Refused before anything is written or sent.
      */
     const before = (target.tickets || []).find((t) => t.key === String(key || '').trim());
-    const refusal = processRefusal(target, before, { state: flag(rest, 'state'), cycle: flag(rest, 'cycle') }, facts);
+    const asked = { state: flag(rest, 'state'), cycle: flag(rest, 'cycle') };
+    let onBoard = false;
+    if (testFirstMissing(target, before, asked, facts)) {
+      /*
+       * Only a person can clear this step (MACLEOD-983). Hold the ticket
+       * for them, so the board shows "Skip the test step" and Needs you,
+       * and the check-in stops asking the session to mark it done.
+       */
+      if (before.wait?.for !== TEST_SKIP_WAIT) {
+        before.wait = { for: TEST_SKIP_WAIT, since: now() };
+        before.updatedAt = before.wait.since;
+        save(state, config);
+      }
+      const sent = await publishRun(target, config).catch(() => ({ ok: false }));
+      onBoard = Boolean(sent?.ok || sent?.queued);
+    }
+    const refusal = processRefusal(target, before, { ...asked, onBoard }, facts);
     if (refusal) {
       print(refusal);
       return 1;
@@ -2594,9 +2638,9 @@ export function setWait(workflow, key, { kind, deadline, clear = false, at = new
   return wait;
 }
 
-/** Whether a wait needs a person (MACLEOD-885). Only an approval does. */
+/** Whether a wait needs a person (MACLEOD-885): an approval, or a skip of the test step. */
 export function waitNeedsPerson(wait) {
-  return wait?.for === 'pr_approved';
+  return wait?.for === 'pr_approved' || wait?.for === TEST_SKIP_WAIT;
 }
 
 /** The wait in plain words, with its deadline. Never a command. */
@@ -2607,6 +2651,7 @@ export function waitLine({ key, wait }, now = Date.now()) {
   if (wait.for === 'pr_approved') {
     return `${key} waits for a person to approve its pull request${when ? `, by ${when} UTC` : ''}.${late}`;
   }
+  if (wait.for === TEST_SKIP_WAIT) return `${key} waits for a person to skip its test step.`;
   return `${key} waits for the deploy window${when ? `, by ${when} UTC` : ''}.${late}`;
 }
 
