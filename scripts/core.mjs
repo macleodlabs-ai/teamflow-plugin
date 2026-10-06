@@ -68,7 +68,8 @@ export function isAdHocKey(value) {
 // (adapters/teamflow/schema.py), which are vocabularies of what a key
 // can say about itself.
 const TRACKERS = new Set(['jira', 'linear', 'github']);
-const TEST_RE = /(?:^|\s)(?:npm|pnpm|yarn|bun)?\s*(?:run\s+)?(?:test|vitest|jest|pytest|playwright|cypress)(?:\s|$)|\bgo test\b|\bcargo test\b|\bmvn(?:w)?\s+test\b|\bgradle(?:w)?\s+test\b/i;
+// `node --test` and mocha too (MACLEOD-984): the plugin's own suite runs on node --test.
+const TEST_RE = /(?:^|\s)(?:npm|pnpm|yarn|bun)?\s*(?:run\s+)?(?:test|vitest|jest|pytest|playwright|cypress|mocha)(?:\s|$)|\bnode\s+--test\b|\bgo test\b|\bcargo test\b|\bmvn(?:w)?\s+test\b|\bgradle(?:w)?\s+test\b/i;
 const DEV_TEST_RE = /\b(?:smoke|acceptance|e2e|integration)[-_: ]?(?:dev|staging)|\b(?:dev|staging)[-_: ]?(?:smoke|acceptance|e2e|integration)\b/i;
 const MERGE_RE = /\bgh\s+pr\s+merge\b|\bgit\s+merge\b/i;
 const PR_MERGE_RE = /\bgh\s+pr\s+merge\b/i;
@@ -3989,8 +3990,9 @@ export async function ensureIssueTitle(state, config = {}, info = {}) {
 export function extractTestEvidence(value) {
   const text = typeof value === 'string' ? value : JSON.stringify(value ?? '');
   const evidence = [];
-  const passed = text.match(/(\d+)\s+(?:passed|passing)\b/i);
-  const failed = text.match(/(\d+)\s+(?:failed|failing)\b/i);
+  // `# pass 11` and `# fail 1` are node --test's own counts (MACLEOD-984).
+  const passed = text.match(/(\d+)\s+(?:passed|passing)\b/i) || text.match(/(?:^|\\n|\n)# pass (\d+)/);
+  const failed = text.match(/(\d+)\s+(?:failed|failing)\b/i) || text.match(/(?:^|\\n|\n)# fail (\d+)/);
   if (passed) evidence.push({ label: 'passed', value: passed[1], status: 'success' });
   if (failed) evidence.push({ label: 'failed', value: failed[1], status: Number(failed[1]) > 0 ? 'failed' : 'success' });
   return evidence.slice(0, 4);
@@ -4088,11 +4090,28 @@ export function readOnlyCommand(command) {
   });
 }
 
+/*
+ * Whether a test run's own output says tests failed (MACLEOD-984). A run
+ * piped into tail, grep or head returns the exit code of its last command,
+ * so Claude Code reports success while tests failed; every red of both
+ * agents of 2026-10-05 read as a pass and test-first could never be proved.
+ * Only a count above zero or a failing-test line says so; output that says
+ * nothing leaves the exit code's answer.
+ */
+export function outputSaysFailed(value) {
+  const text = typeof value === 'string' ? value
+    : [value?.stdout, value?.stderr, value?.output].filter((part) => typeof part === 'string').join('\n');
+  if (!text) return false;
+  return /\b[1-9]\d*\s+(?:failed|failing)\b/i.test(text)
+    || /^# fail [1-9]\d*\s*$/m.test(text)
+    || /^FAILED\s+\S+::/m.test(text);
+}
+
 export function classifyTool(input, state, config) {
   const event = input.hook_event_name;
   const tool = input.tool_name || '';
   const command = commandOf(input);
-  const failed = event === 'PostToolUseFailure';
+  const exitFailed = event === 'PostToolUseFailure';
   // Reading never runs a test or a build.
   const readOnly = readOnlyCommand(command);
   const customDevTest = config.devTestPattern ? new RegExp(config.devTestPattern, 'i') : undefined;
@@ -4107,6 +4126,8 @@ export function classifyTool(input, state, config) {
   // `make check` project report LOCAL_TEST at all.
   const isLocalTest = !readOnly && (TEST_RE.test(command)
     || Boolean(config.testCommand && command.includes(String(config.testCommand).trim())));
+  // A test run's output can say what its exit code hides (MACLEOD-984).
+  const failed = exitFailed || (isLocalTest && event === 'PostToolUse' && outputSaysFailed(input.tool_response));
 
   if (event === 'SubagentStart') return { summary: 'Agent started', heartbeat: true };
   if (event === 'SubagentStop') return { summary: 'Agent finished', heartbeat: true };

@@ -3,6 +3,14 @@
 What changed in each published version of the TeamFlow plugin, newest first.
 Only what a person using it would notice.
 
+## 0.3.70
+
+- **A failing test counts, even through a pipe.** A test run piped into
+  tail, grep or head used to read as a pass. Now the run's own output
+  decides. Writing the test first is now recorded for agents too.
+- **`node --test` and mocha are test runs.** Their results now move the
+  card and count toward the test-first proof.
+
 ## 0.3.69
 
 - **Skip the test step from the card.** When a ticket has no failing test
