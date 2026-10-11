@@ -3221,7 +3221,8 @@ var KIND_LABEL = {
   nudge: "Nudge the agent now",
   close: "Close: it is done",
   cancel: "Cancel: no longer needed",
-  reopen: "Open it again"
+  reopen: "Open it again",
+  work_on: "Work on"
 };
 var PREPARED_FIXES = [
   "re-run the failing test and read its output first",

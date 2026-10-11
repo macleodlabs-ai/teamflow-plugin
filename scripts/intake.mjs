@@ -36,6 +36,11 @@
 //                thread? }`. Ids only, for one of this machine's own
 //                sessions; only that session's pin changes, and it reads
 //                one plain line at its next prompt. See pin.mjs `applyPin`.
+//   start        Work on (MACLEOD-990): `{ key }`. A free session here (no
+//                ticket, the same one, or a finished one; never an agent)
+//                binds to the key and reads one plain line asking it to
+//                start. A busy session is never pulled off its work: the
+//                action waits for a free one. See `start` below.
 //
 // Four rules decide the shape of this.
 //
@@ -72,7 +77,7 @@ import { fileURLToPath } from 'node:url';
 import {
   STAGE_ORDER, accountName, believable, candidate, credential, dataDir, globalConfigPath, isAdHocKey, isWorktree,
   knownPrefixes, machineId, readJson, readKeyAliases, reportScope, repositoryRoot, saveSession, sendReport, serviceUrl,
-  requestBeat, sessionPath, trackerOf, writeJson,
+  requestBeat, sessionPath, takesNoWork, trackerOf, writeJson,
 } from './core.mjs';
 import { step } from './words.mjs';
 import { markSent, mergedFacts, sendInBatches } from './merged.mjs';
@@ -88,7 +93,7 @@ export const TEXT_MAX = 500;
 export const REASON_MAX = 120;
 /** How many actions one round performs; the rest wait for the next. */
 export const BATCH = 8;
-export const KINDS = new Set(['fix', 'bump', 'rerun_gate', 'resume_plan', 'skip_gate', 'tidy', 'rebind', 'pin']);
+export const KINDS = new Set(['fix', 'bump', 'rerun_gate', 'resume_plan', 'skip_gate', 'tidy', 'rebind', 'pin', 'start']);
 
 // --- the developer's say ------------------------------------------------
 
@@ -545,6 +550,41 @@ export function rebind(action = {}, { config = {}, local, at = new Date().toISOS
   return said('done', `${by} moved the session to ${key}`);
 }
 
+// --- start: "Work on" ------------------------------------------------------------
+
+export function startLine(key, by) {
+  return `${by} asked you to start ${key}. Read the ticket and begin the work.`;
+}
+
+/*
+ * `start` (MACLEOD-990) is the machine half of Work on. The key is checked
+ * as `rebind` checks it. Only the session running this round may take it,
+ * and only when it is free: not an agent, and holding no ticket, this one,
+ * or one that finished. Otherwise it waits (`hold`) for a free session.
+ */
+export function start(action = {}, { config = {}, local, bound, at = new Date().toISOString(), state } = {}) {
+  const key = String(action.key ?? '').trim().toUpperCase();
+  const by = oneLine(action.by, 80) || 'A lead';
+  if (!REBIND_KEY.test(key)) return said('refused', 'Work on names no ticket key');
+  if (!isAdHocKey(key)) {
+    const seen = [local?.binding?.key];
+    for (const wf of Object.values(state?.workflows || {})) for (const t of wf.tickets || []) seen.push(t.key);
+    const known = knownPrefixes(config, seen);
+    if (!known || !believable(key, known)) return said('refused', `This machine does not know tickets like ${key}`);
+  }
+  const free = local?.sessionId && !local.agentKey
+    && (!local.binding?.key || bound === key || local.binding.key === key || takesNoWork(local.binding));
+  if (!free) return { hold: true };
+  const tracker = isAdHocKey(key) ? 'teamflow' : trackerOf(config);
+  local.binding = { ...candidate(key, 1000, 'moved', { tracker, boundAt: at, ...(local.binding?.account ? { account: local.binding.account } : {}) }), sticky: true };
+  local.jira = { key };
+  local.intakePending = [...(local.intakePending || []), startLine(key, by)].slice(-8);
+  local.updatedAt = at;
+  saveSession(local);
+  requestBeat(local.sessionId);
+  return said('done', `a session on this machine started ${key}`);
+}
+
 /** A held action this old is dropped here; the service gives it its outcome (MACLEOD-726). */
 export const HOLD_MAX_MS = 24 * 60 * 60 * 1000;
 
@@ -565,6 +605,7 @@ export async function perform(action, {
   const by = oneLine(action.by, 80) || 'a lead';
   if (!KINDS.has(kind)) return { ...said('refused', `unknown action kind ${kind}`) };
   if (kind === 'rebind') return rebind(action, { config, local, at, state });
+  if (kind === 'start') return start(action, { config, local, bound, at, state });
   if (kind === 'pin') {
     const { applyPin } = await import('./pin.mjs');
     const got = applyPin(action, { config, local, at });

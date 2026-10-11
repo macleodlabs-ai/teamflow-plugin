@@ -3,6 +3,12 @@
 What changed in each published version of the TeamFlow plugin, newest first.
 Only what a person using it would notice.
 
+## 0.3.71
+
+- **Work on, from TeamFlow.** When someone presses Work on for a card, your
+  next free session takes it. It binds to the ticket and asks you to start.
+  A session busy on another ticket keeps its work.
+
 ## 0.3.70
 
 - **A failing test counts, even through a pipe.** A test run piped into
